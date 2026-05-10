@@ -1,0 +1,10 @@
+name = "diff-reviewer"
+version = "0.1.0"
+defaultTargets = ["diff-reviewer"]
+
+[[lean_lib]]
+name = "DiffReviewer"
+
+[[lean_exe]]
+name = "diff-reviewer"
+root = "Main"
