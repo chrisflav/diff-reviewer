@@ -9,9 +9,11 @@ USAGE:
   diff-reviewer render   <review.json>
       Generate a read-only HTML page next to the JSON file.
 
-  diff-reviewer github   <owner/repo> <pr-number> <review.json>
+  diff-reviewer github   <owner/repo> <pr-number> <review.json> [--submit]
       Submit the review to a GitHub pull request via the gh CLI.
       Requires gh to be authenticated (gh auth login).
+      By default the review is saved as a pending (draft) review.
+      Pass --submit to publish it immediately.
 
   diff-reviewer from-git <git-range>
       Parse commits in <git-range> (e.g. main..HEAD) and print a
@@ -32,7 +34,8 @@ private def cmdRender (jsonPath : String) : IO Unit := do
     IO.FS.writeFile htmlPath html
     IO.println s!"Written: {htmlPath}"
 
-private def cmdGitHub (repo : String) (prStr : String) (jsonPath : String) : IO Unit := do
+private def cmdGitHub (repo : String) (prStr : String) (jsonPath : String)
+    (pending : Bool) : IO Unit := do
   let prNumber := prStr.toNat?.getD 0
   if prNumber == 0 then
     IO.eprintln s!"error: invalid PR number '{prStr}'"
@@ -43,8 +46,9 @@ private def cmdGitHub (repo : String) (prStr : String) (jsonPath : String) : IO 
     IO.eprintln s!"error: could not parse review from {jsonPath}: {e}"
     IO.Process.exit 1
   | .ok review =>
-    match ← submitReview repo prNumber review with
-    | .ok ()   => IO.println "Review submitted successfully."
+    match ← submitReview repo prNumber review pending with
+    | .ok ()   =>
+      IO.println (if pending then "Review saved as pending." else "Review submitted successfully.")
     | .error e =>
       IO.eprintln s!"error: {e}"
       IO.Process.exit 1
@@ -60,7 +64,8 @@ private def cmdFromGit (range : String) : IO Unit := do
 def main (args : List String) : IO Unit := do
   match args with
   | ["render", jsonPath]                 => cmdRender jsonPath
-  | ["github", repo, prNumber, jsonPath] => cmdGitHub repo prNumber jsonPath
+  | ["github", repo, prNumber, jsonPath]             => cmdGitHub repo prNumber jsonPath true
+  | ["github", repo, prNumber, jsonPath, "--submit"] => cmdGitHub repo prNumber jsonPath false
   | ["from-git", range]                  => cmdFromGit range
   | _ =>
     IO.print usage

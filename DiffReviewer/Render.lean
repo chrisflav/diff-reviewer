@@ -29,10 +29,11 @@ private def renderComment (c : InlineComment) : String :=
   let suggestion := match c.suggestion with
     | none   => ""
     | some s => renderSuggestion s
-  s!"<div class=\"inline-comment\">
+  let body := if c.body.isEmpty then ""
+    else s!"<div class=\"comment-body\">{htmlEscape c.body}</div>\n"
+  s!"{body}<div class=\"inline-comment\">
   <div class=\"comment-location\">{htmlEscape c.file} \
 line {c.range.startLine}–{c.range.endLine}</div>
-  <div class=\"comment-body\">{htmlEscape c.body}</div>
   {suggestion}
 </div>"
 
@@ -58,7 +59,7 @@ h2 { font-size: 1.1rem; margin-top: 32px; }
 .comment-location { background: #f1f8ff; border-bottom: 1px solid #c8e1ff;
                     padding: 8px 16px; font-size: 0.85rem;
                     font-family: monospace; color: #0366d6; }
-.comment-body { padding: 12px 16px; white-space: pre-wrap; }
+.comment-body { padding: 4px 0 8px 0; white-space: pre-wrap; font-weight: 600; }
 .suggestion { margin: 0; background: #f6f8fa; border-top: 1px solid #e1e4e8;
               padding: 12px 16px; overflow-x: auto; }
 .suggestion code { font-family: 'SFMono-Regular', Consolas, monospace;
