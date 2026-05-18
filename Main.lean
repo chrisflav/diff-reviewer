@@ -6,9 +6,6 @@ private def usage : String :=
 "diff-reviewer — code review tool
 
 USAGE:
-  diff-reviewer render   <review.json>
-      Generate a read-only HTML page next to the JSON file.
-
   diff-reviewer github   <owner/repo> <pr-number> <review.json> [--submit]
       Submit the review to a GitHub pull request via the gh CLI.
       Requires gh to be authenticated (gh auth login).
@@ -19,20 +16,6 @@ USAGE:
       Parse commits in <git-range> (e.g. main..HEAD) and print a
       Review JSON to stdout.
 "
-
-private def cmdRender (jsonPath : String) : IO Unit := do
-  let contents ← IO.FS.readFile jsonPath
-  match Review.ofJsonString contents with
-  | .error e =>
-    IO.eprintln s!"error: could not parse review from {jsonPath}: {e}"
-    IO.Process.exit 1
-  | .ok review =>
-    let html     := review.toHtml
-    let htmlPath :=
-      if jsonPath.endsWith ".json" then (jsonPath.dropEnd 5).toString ++ ".html"
-      else jsonPath ++ ".html"
-    IO.FS.writeFile htmlPath html
-    IO.println s!"Written: {htmlPath}"
 
 private def cmdGitHub (repo : String) (prStr : String) (jsonPath : String)
     (pending : Bool) : IO Unit := do
@@ -63,7 +46,6 @@ private def cmdFromGit (range : String) : IO Unit := do
 
 def main (args : List String) : IO Unit := do
   match args with
-  | ["render", jsonPath]                 => cmdRender jsonPath
   | ["github", repo, prNumber, jsonPath]             => cmdGitHub repo prNumber jsonPath true
   | ["github", repo, prNumber, jsonPath, "--submit"] => cmdGitHub repo prNumber jsonPath false
   | ["from-git", range]                  => cmdFromGit range
