@@ -1,10 +1,25 @@
 name = "diff-reviewer"
 version = "0.1.0"
 defaultTargets = ["diff-reviewer"]
+testDriver = "diffReviewerTest"
+
+# The database layer: the SQLite backend is part of `Db` and needs nothing on the machine but a C
+# compiler. Pinned to the revision orchestra uses.
+[[require]]
+name = "db"
+git = "https://github.com/chrisflav/db"
+rev = "f2c288850706028b79c964b70bf44b3cae15023c"
 
 [[lean_lib]]
 name = "DiffReviewer"
 
+[[lean_lib]]
+name = "DiffReviewerTest"
+
 [[lean_exe]]
 name = "diff-reviewer"
 root = "Main"
+
+[[lean_exe]]
+name = "diffReviewerTest"
+root = "TestDriver"

@@ -1,0 +1,309 @@
+/*
+ * diff-reviewer.
+ *
+ * A review tool reads like a diff: system sans for what the interface says, monospace for what
+ * the code and the machine said (paths, line numbers, commits, ids). Colour is spent only on
+ * state, and each status keeps one hue in both themes.
+ */
+
+:root {
+  --page: #f7f7f5;
+  --raised: #ffffff;
+  --rule: #dedcd6;
+  --text: #1b1c1a;
+  --mute: #5f625c;
+  --accent: #2f6f4f;
+  --accent-text: #ffffff;
+  --danger: #b4322b;
+  --warn: #9a6a00;
+  --info: #3657b5;
+
+  --ui: system-ui, -apple-system, "Segoe UI", sans-serif;
+  --data: ui-monospace, "SFMono-Regular", Menlo, monospace;
+  --measure: 1040px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --page: #141513;
+    --raised: #1c1d1b;
+    --rule: #33352f;
+    --text: #e8e8e3;
+    --mute: #a0a39a;
+    --accent: #5fb38a;
+    --accent-text: #0d1a13;
+    --danger: #f07a72;
+    --warn: #e0b04a;
+    --info: #8ea6f0;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--page);
+  color: var(--text);
+  font: 15px/1.5 var(--ui);
+}
+
+a {
+  color: var(--accent);
+}
+
+.data {
+  font-family: var(--data);
+  font-size: 0.92em;
+}
+
+.mute {
+  color: var(--mute);
+}
+
+.error {
+  color: var(--danger);
+}
+
+.center {
+  display: grid;
+  place-items: center;
+  min-height: 100vh;
+}
+
+.bar {
+  display: flex;
+  align-items: center;
+  gap: 24px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--rule);
+  background: var(--raised);
+}
+
+.bar nav {
+  display: flex;
+  gap: 16px;
+  flex: 1;
+}
+
+.bar nav a {
+  color: var(--mute);
+  text-decoration: none;
+}
+
+.bar nav a.active {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.wordmark {
+  font-family: var(--data);
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+
+main {
+  max-width: var(--measure);
+  margin: 0 auto;
+  padding: 24px 16px 64px;
+}
+
+h1 {
+  font-size: 1.5rem;
+  margin: 0 0 16px;
+}
+
+h2 {
+  font-size: 1.1rem;
+  margin: 32px 0 8px;
+}
+
+button {
+  font: inherit;
+  padding: 6px 14px;
+  border-radius: 6px;
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  color: var(--accent-text);
+  cursor: pointer;
+}
+
+button.ghost {
+  background: transparent;
+  color: var(--text);
+  border-color: var(--rule);
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+input,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
+  background: var(--raised);
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  padding: 6px 10px;
+}
+
+textarea {
+  width: 100%;
+  display: block;
+  margin: 8px 0;
+}
+
+form.inline {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+form.login {
+  max-width: 320px;
+  margin: 18vh auto 0;
+  padding: 0 16px;
+  display: grid;
+  gap: 12px;
+}
+
+form.login label {
+  display: grid;
+  gap: 4px;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+th,
+td {
+  text-align: left;
+  padding: 8px 6px;
+  border-bottom: 1px solid var(--rule);
+  vertical-align: top;
+}
+
+th {
+  font-weight: 500;
+  color: var(--mute);
+  font-size: 0.9em;
+}
+
+td.right {
+  text-align: right;
+}
+
+.status {
+  font-family: var(--data);
+  font-size: 0.82em;
+  padding: 1px 8px;
+  border-radius: 999px;
+  border: 1px solid currentColor;
+  vertical-align: middle;
+}
+
+.s-pending,
+.s-queued,
+.s-stale {
+  color: var(--mute);
+}
+
+.s-running {
+  color: var(--info);
+}
+
+.s-draft {
+  color: var(--warn);
+}
+
+.s-approved,
+.s-posted {
+  color: var(--accent);
+}
+
+.s-rejected {
+  color: var(--danger);
+}
+
+.crumbs {
+  margin: 0 0 4px;
+  font-size: 0.9em;
+}
+
+dl.facts {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 2px 16px;
+  margin: 0 0 16px;
+}
+
+dl.facts dt {
+  color: var(--mute);
+}
+
+dl.facts dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.decision {
+  font-weight: 600;
+}
+
+.d-approve {
+  color: var(--accent);
+}
+
+.d-request_changes {
+  color: var(--danger);
+}
+
+.review .body {
+  white-space: pre-wrap;
+}
+
+ol.comments {
+  list-style: none;
+  padding: 0;
+}
+
+ol.comments li {
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  background: var(--raised);
+  padding: 8px 12px;
+  margin-bottom: 8px;
+}
+
+.where {
+  color: var(--mute);
+}
+
+pre.suggestion {
+  font-family: var(--data);
+  background: var(--page);
+  border-left: 3px solid var(--accent);
+  padding: 8px;
+  overflow-x: auto;
+}
+
+details {
+  margin-top: 24px;
+}
+
+summary {
+  cursor: pointer;
+}

@@ -1,0 +1,673 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "diff-reviewer platform API",
+    "version": "0.1.0",
+    "description": "The review platform: the repositories whose pull requests it reviews, and one review job per review. A job moves `pending → queued → running → draft → approved → posted`; `rejected` is a discarded draft and `stale` a draft whose pull request has moved on.\n\nEvery route under `/api/v1/` needs the platform's secret, as `Authorization: Bearer <secret>` or the session cookie `POST /api/login` sets. Every write must be `application/json` (`415` otherwise). Collections answer `{\"items\": [...]}`. Instants are RFC 3339 in UTC; an absent value is `null`."
+  },
+  "security": [
+    {
+      "bearerAuth": []
+    },
+    {
+      "sessionCookie": []
+    }
+  ],
+  "paths": {
+    "/api/login": {
+      "post": {
+        "summary": "Exchange the secret for a session cookie",
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "password"
+                ],
+                "properties": {
+                  "password": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Signed in; sets the session cookie."
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/logout": {
+      "post": {
+        "summary": "End the session",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Signed out."
+          }
+        }
+      }
+    },
+    "/api/session": {
+      "get": {
+        "summary": "Whether the caller is signed in",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "The answer.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "authenticated"
+                  ],
+                  "properties": {
+                    "authenticated": {
+                      "type": "boolean"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/openapi.json": {
+      "get": {
+        "summary": "This document",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "The spec."
+          }
+        }
+      }
+    },
+    "/api/v1/repos": {
+      "get": {
+        "summary": "Registered repositories",
+        "operationId": "listRepos",
+        "responses": {
+          "200": {
+            "description": "Every repository, by owner and name.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "items"
+                  ],
+                  "properties": {
+                    "items": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Repo"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/v1/repos/{owner}/{name}": {
+      "parameters": [
+        {
+          "name": "owner",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "name",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "put": {
+        "summary": "Register or update a repository",
+        "operationId": "putRepo",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "mode": {
+                    "type": "string",
+                    "enum": [
+                      "staged",
+                      "direct"
+                    ],
+                    "description": "`staged` (default): a person approves each review before it is posted. `direct`: posted as soon as the agent submits it."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Repo"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "Registered.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Repo"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "415": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Unregister a repository",
+        "description": "Its jobs are kept: they are the record of reviews that happened.",
+        "operationId": "deleteRepo",
+        "responses": {
+          "204": {
+            "description": "Unregistered."
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/v1/jobs": {
+      "get": {
+        "summary": "Review jobs, newest first",
+        "operationId": "listJobs",
+        "responses": {
+          "200": {
+            "description": "Every job.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "items"
+                  ],
+                  "properties": {
+                    "items": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Job"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "post": {
+        "summary": "Ask for a review of a pull request",
+        "operationId": "createJob",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "owner",
+                  "name",
+                  "prNumber"
+                ],
+                "properties": {
+                  "owner": {
+                    "type": "string"
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "prNumber": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "headSha": {
+                    "type": "string",
+                    "description": "The head commit the review is for."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "The new job, `pending`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Job"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "description": "The repository is not registered.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "415": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/v1/jobs/{id}": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "get": {
+        "summary": "One job",
+        "operationId": "getJob",
+        "responses": {
+          "200": {
+            "description": "The job.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Job"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/v1/jobs/{id}/review": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "put": {
+        "summary": "Replace a job's review",
+        "description": "Makes the job a `draft` again: an approval was of the review as it was. A `posted` review is history and is not edited (`409`).",
+        "operationId": "putReview",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Review"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The job.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Job"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "415": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/v1/jobs/{id}/status": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "post": {
+        "summary": "Move a job on",
+        "description": "The moves a person makes: `draft → approved | rejected | stale`, `approved → draft | posted`, `rejected → draft`, and the run's own `pending → queued → running → draft`. Any other move is a `409`, and so is approving a job with no review.",
+        "operationId": "setJobStatus",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "status"
+                ],
+                "properties": {
+                  "status": {
+                    "$ref": "#/components/schemas/JobStatus"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The job.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Job"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "415": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "The platform's secret ($DIFF_REVIEWER_PASSWORD)."
+      },
+      "sessionCookie": {
+        "type": "apiKey",
+        "in": "cookie",
+        "name": "diff_reviewer_session",
+        "description": "Set by `POST /api/login`; `HttpOnly`, `SameSite=Strict`."
+      }
+    },
+    "responses": {
+      "Error": {
+        "description": "The request was refused; `error` says why.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "Error": {
+        "type": "object",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "string"
+          }
+        }
+      },
+      "Repo": {
+        "type": "object",
+        "required": [
+          "owner",
+          "name",
+          "mode",
+          "createdAt"
+        ],
+        "properties": {
+          "owner": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "staged",
+              "direct"
+            ]
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "JobStatus": {
+        "type": "string",
+        "enum": [
+          "pending",
+          "queued",
+          "running",
+          "draft",
+          "approved",
+          "posted",
+          "rejected",
+          "stale"
+        ]
+      },
+      "Job": {
+        "type": "object",
+        "required": [
+          "id",
+          "owner",
+          "name",
+          "prNumber",
+          "headSha",
+          "status",
+          "queueEntry",
+          "review",
+          "createdAt",
+          "updatedAt"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "owner": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "prNumber": {
+            "type": "integer"
+          },
+          "headSha": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "$ref": "#/components/schemas/JobStatus"
+          },
+          "queueEntry": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The orchestra queue entry running the review, once queued."
+          },
+          "review": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Review"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updatedAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "Review": {
+        "type": "object",
+        "required": [
+          "decision",
+          "body",
+          "comments"
+        ],
+        "properties": {
+          "decision": {
+            "type": "string",
+            "enum": [
+              "comment",
+              "approve",
+              "request_changes"
+            ]
+          },
+          "body": {
+            "type": "string",
+            "description": "The review's summary comment."
+          },
+          "comments": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/InlineComment"
+            }
+          }
+        }
+      },
+      "InlineComment": {
+        "type": "object",
+        "required": [
+          "file",
+          "start_line",
+          "end_line",
+          "body"
+        ],
+        "properties": {
+          "file": {
+            "type": "string"
+          },
+          "start_line": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "end_line": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "body": {
+            "type": "string"
+          },
+          "suggestion": {
+            "type": "string",
+            "description": "Replacement text for the lines, posted as a GitHub suggestion."
+          }
+        }
+      }
+    }
+  }
+}
