@@ -30,6 +30,12 @@ structure RepoRow where
   /-- Whether the platform finds the repository's pull requests itself (`0002`); a row written
       before has none, which is `false`. -/
   auto_review : Option Bool
+  /-- The GitHub logins whose reviews calibration learns from, as a JSON array of strings
+      (`0004`); a row written before has none, which is nobody. -/
+  trusted_reviewers : Option String
+  /-- Incremented by every write of the repository's settings (`0004`); a row written before has
+      none, which is 1. -/
+  version : Option Int
   deriving Repr
 
 /-- One review of one pull request at one head commit: queued, run, drafted, approved, posted. -/
@@ -83,6 +89,14 @@ structure JobRow where
       post the platform may make again once the claim is settled as not having reached GitHub
       (`0003`); none is `false`. -/
   post_direct : Option Bool
+  /-- What the job is for: none (or `review`) is a review of a pull request, posted once a person
+      approves it; `calibration` is a review of a past commit, scored against a person's review
+      of it and never posted (`0004`). -/
+  kind : Option String
+  /-- The calibration sample a `calibration` job reviews, and the run that asked for it
+      (`0004`). -/
+  sample_id : Option String
+  run_id : Option String
   deriving Repr
 
 /-- The diff of a pull request at one head commit, as GitHub gave it. A commit's diff never
@@ -121,8 +135,133 @@ structure RevisionRow where
   created_at : String
   deriving Repr
 
+/-- What one trusted reviewer said of one commit of a pull request — every review they submitted
+    of it, merged — kept to score the agent's review of the same commit against (`0004`). An import
+    that finds another review of the group adds it; deleting the sample sets `deleted_at`, and the
+    row stays, so that importing again neither brings it back nor adds to it. -/
+@[model (dbName := "calibration_sample") (primaryKey := ["id"]) reviewdb]
+structure SampleRow where
+  id : String
+  owner : String
+  name : String
+  pr_number : Int
+  /-- GitHub's ids of the reviews merged into it, as a JSON array. -/
+  review_ids : String
+  reviewer : String
+  /-- The strongest `state` of its reviews, as GitHub gave it: `CHANGES_REQUESTED`, then
+      `APPROVED`, then `COMMENTED`. -/
+  state : String
+  body : String
+  /-- The commit the review was of, and the base the pull request's diff had there. -/
+  commit_id : String
+  base_sha : String
+  title : String
+  pr_body : String
+  /-- The review's inline comments on the new side of the diff, as a JSON array. -/
+  comments : String
+  /-- The review's comments that were not kept: on the old side, not on a line of the review's
+      commit, or replies in a thread. -/
+  dropped_left : Int
+  dropped_outdated : Int
+  dropped_replies : Int
+  /-- What it is scored for: `full`; `partial`, when comments were dropped and its comments are
+      not the whole of what was said, so that only its decision counts; `decision`, an approval or
+      a request for changes that says nothing else. -/
+  scope : String
+  submitted_at : Option String
+  imported_at : String
+  updated_at : String
+  deleted_at : Option String
+  deriving Repr
+
+/-- Every review an import has looked at and what became of it (`0004`): what makes importing
+    idempotent by GitHub's review id — a review in here is never looked at again, whether it
+    went into a sample or was dropped — so that importing again neither adds nor counts it. -/
+@[model (dbName := "calibration_review") (primaryKey := ["owner", "name", "review_id"]) reviewdb]
+structure ReviewSeenRow where
+  owner : String
+  name : String
+  review_id : Int
+  /-- `sample` (it went into `sample_id`), `empty`, `unreachable` or `deleted` (its group's
+      sample had been deleted). -/
+  outcome : String
+  sample_id : Option String
+  seen_at : String
+  deriving Repr
+
+/-- One calibration job's claim on its repository's daily cap (`0004`): one when a run makes it,
+    and one each time a person runs it again. -/
+@[model (dbName := "calibration_charge") (primaryKey := ["id"]) reviewdb]
+structure ChargeRow where
+  id : String
+  owner : String
+  name : String
+  job_id : String
+  charged_at : String
+  deriving Repr
+
+/-- A request to import the samples of a repository's recent closed pull requests, and how far
+    the workers have got with it (`0004`). -/
+@[model (dbName := "calibration_import") (primaryKey := ["id"]) reviewdb]
+structure ImportRow where
+  id : String
+  owner : String
+  name : String
+  /-- How many recent closed pull requests to read. -/
+  pull_limit : Int
+  /-- `queued`, `running`, `done`, `failed` or `cancelled`. -/
+  status : String
+  /-- The pull requests to read, as a JSON array, once they have been listed. -/
+  pulls : Option String
+  /-- How many of `pulls` have been read. -/
+  next_index : Int
+  /-- How many times reading the next of them has failed; past 3 it is skipped. -/
+  failures : Int
+  /-- What was found so far, as a JSON object of counts. -/
+  stats : String
+  error : Option String
+  requested_at : String
+  updated_at : String
+  deriving Repr
+
+/-- A set of calibration jobs asked for together (`0004`). -/
+@[model (dbName := "calibration_run") (primaryKey := ["id"]) reviewdb]
+structure RunRow where
+  id : String
+  owner : String
+  name : String
+  /-- The samples it reviews, as a JSON array of ids. -/
+  sample_ids : String
+  created_at : String
+  deriving Repr
+
+/-- The score of one calibration job's review against its sample, by one version of the matcher
+    (`0004`). A better matcher writes rows of its own version beside the old ones rather than over
+    them. -/
+@[model (dbName := "calibration_score") (primaryKey := ["job_id", "matcher_version"]) reviewdb]
+structure ScoreRow where
+  job_id : String
+  matcher_version : Int
+  run_id : Option String
+  sample_id : String
+  owner : String
+  name : String
+  rubric_version : Option Int
+  /-- The score, as `Score.toJson`. -/
+  score : String
+  created_at : String
+  /-- Whether the sample has grown since — a later review of its commit by its reviewer joined
+      it — so that the score is of a sample that is no longer the whole of it. The score itself is
+      left as it was; aggregates leave a stale one out unless asked. None is `false`. -/
+  stale : Option Bool
+  deriving Repr
+
+/-- Calibration's jobs are found by their kind, among every review the platform has made. -/
+def jobKindIndex : TableIndex String :=
+  { name := "idx_review_job_kind", keys := [{ column := "kind" }] }
+
 def target : DatabaseRecipe :=
-  (%database reviewdb).recipe
+  (%database reviewdb).recipe.withIndexes "review_job" [jobKindIndex]
 
 /-- `0001_initial`: the repositories and the review jobs. -/
 def migration0001 : Db.Migration.Migration where
@@ -205,8 +344,101 @@ def migration0003 : Db.Migration.Migration where
            ("created_at", { type := .text, nullable := false })],
         primaryKey := ["job_id", "version"] }]
 
+/-- `0004_m3`: calibration — a repository's trusted reviewers and the version of its settings, a
+    job's kind with its sample and run (and an index on the kind), and the samples, the reviews
+    imports have seen, imports, runs, charges on the daily cap and scores. The new columns
+    are nullable: a repository written before has no trusted reviewers and is at version 1, and a
+    job written before is a review. -/
+def migration0004 : Db.Migration.Migration where
+  name := "0004_m3"
+  steps := [
+    .addColumn "repo" "trusted_reviewers" { type := .text, nullable := true },
+    .addColumn "repo" "version" { type := .int, nullable := true },
+    .addColumn "review_job" "kind" { type := .text, nullable := true },
+    .addColumn "review_job" "sample_id" { type := .text, nullable := true },
+    .addColumn "review_job" "run_id" { type := .text, nullable := true },
+    .createTable "calibration_sample"
+      { columns := .ofList
+          [("id", { type := .text, nullable := false }),
+           ("owner", { type := .text, nullable := false }),
+           ("name", { type := .text, nullable := false }),
+           ("pr_number", { type := .int, nullable := false }),
+           ("review_ids", { type := .text, nullable := false }),
+           ("reviewer", { type := .text, nullable := false }),
+           ("state", { type := .text, nullable := false }),
+           ("body", { type := .text, nullable := false }),
+           ("commit_id", { type := .text, nullable := false }),
+           ("base_sha", { type := .text, nullable := false }),
+           ("title", { type := .text, nullable := false }),
+           ("pr_body", { type := .text, nullable := false }),
+           ("comments", { type := .text, nullable := false }),
+           ("dropped_left", { type := .int, nullable := false }),
+           ("dropped_outdated", { type := .int, nullable := false }),
+           ("dropped_replies", { type := .int, nullable := false }),
+           ("scope", { type := .text, nullable := false }),
+           ("submitted_at", { type := .text, nullable := true }),
+           ("imported_at", { type := .text, nullable := false }),
+           ("updated_at", { type := .text, nullable := false }),
+           ("deleted_at", { type := .text, nullable := true })],
+        primaryKey := ["id"] },
+    .createTable "calibration_review"
+      { columns := .ofList
+          [("owner", { type := .text, nullable := false }),
+           ("name", { type := .text, nullable := false }),
+           ("review_id", { type := .int, nullable := false }),
+           ("outcome", { type := .text, nullable := false }),
+           ("sample_id", { type := .text, nullable := true }),
+           ("seen_at", { type := .text, nullable := false })],
+        primaryKey := ["owner", "name", "review_id"] },
+    .createTable "calibration_charge"
+      { columns := .ofList
+          [("id", { type := .text, nullable := false }),
+           ("owner", { type := .text, nullable := false }),
+           ("name", { type := .text, nullable := false }),
+           ("job_id", { type := .text, nullable := false }),
+           ("charged_at", { type := .text, nullable := false })],
+        primaryKey := ["id"] },
+    .createTable "calibration_import"
+      { columns := .ofList
+          [("id", { type := .text, nullable := false }),
+           ("owner", { type := .text, nullable := false }),
+           ("name", { type := .text, nullable := false }),
+           ("pull_limit", { type := .int, nullable := false }),
+           ("status", { type := .text, nullable := false }),
+           ("pulls", { type := .text, nullable := true }),
+           ("next_index", { type := .int, nullable := false }),
+           ("failures", { type := .int, nullable := false }),
+           ("stats", { type := .text, nullable := false }),
+           ("error", { type := .text, nullable := true }),
+           ("requested_at", { type := .text, nullable := false }),
+           ("updated_at", { type := .text, nullable := false })],
+        primaryKey := ["id"] },
+    .createTable "calibration_run"
+      { columns := .ofList
+          [("id", { type := .text, nullable := false }),
+           ("owner", { type := .text, nullable := false }),
+           ("name", { type := .text, nullable := false }),
+           ("sample_ids", { type := .text, nullable := false }),
+           ("created_at", { type := .text, nullable := false })],
+        primaryKey := ["id"] },
+    .createTable "calibration_score"
+      { columns := .ofList
+          [("job_id", { type := .text, nullable := false }),
+           ("matcher_version", { type := .int, nullable := false }),
+           ("run_id", { type := .text, nullable := true }),
+           ("sample_id", { type := .text, nullable := false }),
+           ("owner", { type := .text, nullable := false }),
+           ("name", { type := .text, nullable := false }),
+           ("rubric_version", { type := .int, nullable := true }),
+           ("score", { type := .text, nullable := false }),
+           ("created_at", { type := .text, nullable := false }),
+           ("stale", { type := .bool, nullable := true })],
+        primaryKey := ["job_id", "matcher_version"] },
+    .createIndex "review_job" jobKindIndex]
+
 /-- The migrations, in the order they are applied. Appended to, never edited. -/
-def migrations : List Db.Migration.Migration := [migration0001, migration0002, migration0003]
+def migrations : List Db.Migration.Migration :=
+  [migration0001, migration0002, migration0003, migration0004]
 
 /-- Where the database is. Set once at start-up (`serve --db`), and by the tests. -/
 initialize pathRef : IO.Ref System.FilePath ← IO.mkRef (System.FilePath.mk "diff-reviewer.db")

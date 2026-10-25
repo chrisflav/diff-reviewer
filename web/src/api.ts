@@ -50,7 +50,23 @@ export interface Repo {
   mode: PostingMode;
   /** Whether the platform finds the repository's open pull requests itself. */
   autoReview: boolean;
+  /** The GitHub logins, in lower case, whose past reviews calibration scores the agent against. */
+  trustedReviewers: string[];
+  /** Incremented by every write of the settings; sent back to have a stale write refused (409). */
+  version: number;
   createdAt: string;
+}
+
+/**
+ * A write of a repository's settings. `mode` and `autoReview` fall back to their defaults when
+ * left out; `trustedReviewers` is kept. `version` (0 for a repository not registered) makes a
+ * stale write a 409; left out, it is not checked.
+ */
+export interface RepoSettings {
+  mode?: PostingMode;
+  autoReview?: boolean;
+  trustedReviewers?: string[];
+  version?: number;
 }
 
 /**
@@ -166,6 +182,210 @@ export interface Job {
   directPosts: number;
   /** Whether the last post was the platform's own, which it may post again. */
   postDirect: boolean;
+  /**
+   * `review`, or `calibration`: a review of a past commit, scored against a trusted reviewer's
+   * review and never approved, edited or posted. A kind a newer build wrote is never posted.
+   * Absent from a server older than API 0.5.0, whose jobs are all reviews.
+   */
+  kind?: JobKind | string;
+  /** The calibration sample and run of a `calibration` job. */
+  sampleId?: string | null;
+  runId?: string | null;
+}
+
+export type JobKind = "review" | "calibration";
+
+/** A trusted reviewer's inline comment, on the new side of the diff at the review's commit. */
+export interface HumanComment {
+  /** GitHub's id of the comment. */
+  id: number;
+  path: string;
+  start_line: number;
+  line: number;
+  body: string;
+}
+
+/**
+ * What one trusted reviewer said of one commit of a closed pull request: every review they
+ * submitted of it, merged.
+ */
+export interface CalibrationSample {
+  id: string;
+  owner: string;
+  name: string;
+  prNumber: number;
+  /** GitHub's ids of the reviews merged into it. */
+  reviewIds: number[];
+  reviewer: string;
+  /** The strongest state of its reviews: `CHANGES_REQUESTED`, then `APPROVED`, then `COMMENTED`. */
+  state: string;
+  body: string;
+  /** The commit reviewed, and the base the pull request's diff had there. */
+  commitId: string;
+  baseSha: string;
+  title: string;
+  /**
+   * What it is scored for: everything, or (`partial`: comments were dropped; `decision`: it says
+   * nothing but its state) its decision only.
+   */
+  scope: CalibrationScope | string;
+  comments: HumanComment[];
+  /** Comments not kept: on the old side, not anchored to a line of `commitId`, replies. */
+  dropped: { left: number; outdated: number; replies: number };
+  submittedAt: string | null;
+  importedAt: string;
+  /** When a review was last merged into it. */
+  updatedAt: string;
+}
+
+export type CalibrationScope = "full" | "partial" | "decision";
+
+export type CalibrationImportStatus = "queued" | "running" | "done" | "failed" | "cancelled";
+
+export interface CalibrationImport {
+  id: string;
+  owner: string;
+  name: string;
+  limit: number;
+  status: CalibrationImportStatus | string;
+  /** The closed pull requests found, once listed. */
+  pullsListed: number | null;
+  pullsRead: number;
+  /** How many times reading the next pull request has failed; at 3 it is skipped. */
+  failures: number;
+  /**
+   * `pulls`, `reviews`, `imported`, `merged`, `known`, `deleted`, `empty`, `unreachable`,
+   * `unreadable`, `droppedLeft`, `droppedOutdated`, `droppedReplies`.
+   */
+  stats: Record<string, number>;
+  /**
+   * Why the last pass stopped short (GitHub's rate limit, a pause under the reserve until it
+   * resets, an error to retry), or why it failed.
+   */
+  error: string | null;
+  requestedAt: string;
+  updatedAt: string;
+}
+
+/** The agent's comments of one category or severity, and how many were matched. */
+export interface CalibrationTally {
+  comments: number;
+  matched: number;
+  /** To four decimals; null with no comments. */
+  precision: number | null;
+}
+
+/** One of the agent's comments, as drafted. */
+export interface AgentComment {
+  id: string | null;
+  file: string;
+  start_line: number;
+  end_line: number;
+  body: string;
+  category: string | null;
+  severity: Severity | null;
+}
+
+/** A calibration job's draft against its sample. Matching is by place only. */
+export interface CalibrationScore {
+  /** Scores of different matcher versions are not compared. */
+  matcherVersion: number;
+  /** Only a `full` sample has a precision and recall; the others count for their decision. */
+  scope: CalibrationScope | string;
+  agentComments: number;
+  humanComments: number;
+  matched: number;
+  /** matched / agentComments; null when the agent wrote none, or the sample is not `full`. */
+  precision: number | null;
+  /** matched / humanComments; null when the person wrote none, or the sample is not `full`. */
+  recall: number | null;
+  byCategory: (CalibrationTally & { category: string | null })[];
+  bySeverity: (CalibrationTally & { severity: Severity | null })[];
+  /** `agree` is null when the person's state stands for no decision (`DISMISSED`). */
+  decision: { agent: Decision; human: string; agree: boolean | null };
+  /** `key` is `<agent comment id>:<GitHub comment id>`; `gap` the lines between the ranges. */
+  pairs: { key: string; gap: number; agent: AgentComment; human: HumanComment }[];
+  unmatchedAgent: AgentComment[];
+  unmatchedHuman: HumanComment[];
+}
+
+/** A draft that could not be scored, and why; left out of aggregates. */
+export interface CalibrationUnscorable {
+  matcherVersion: number;
+  unscorable: string;
+}
+
+/**
+ * Scores of samples not deleted, added up as counts; every ratio is computed from the sums.
+ * Comment counts and ratios are of `full` samples (`commentsScored`); decisions of all.
+ */
+export interface CalibrationAggregate {
+  matcherVersion: number;
+  scored: number;
+  commentsScored: number;
+  /** Stale scores in scope, and whether they are counted (`?stale=include`). */
+  staleScores: number;
+  staleIncluded: boolean;
+  agentComments: number;
+  humanComments: number;
+  matched: number;
+  precision: number | null;
+  recall: number | null;
+  byCategory: (CalibrationTally & { category: string | null })[];
+  bySeverity: (CalibrationTally & { severity: Severity | null })[];
+  decisions: {
+    compared: number;
+    agreed: number;
+    agreement: number | null;
+    matrix: { agent: string; human: string; count: number }[];
+  };
+}
+
+export interface CalibrationRunResult {
+  jobId: string;
+  status: JobStatus | string;
+  error: string | null;
+  rubricVersion: number | null;
+  prType: string | null;
+  sample: {
+    id: string;
+    prNumber: number;
+    reviewer: string;
+    state: string;
+    commitId: string;
+    title: string;
+    scope: CalibrationScope | string;
+    comments: number;
+    /** A deleted sample's score is shown here and left out of every aggregate. */
+    deleted: boolean;
+  } | null;
+  /** Null until the job's draft is scored. */
+  score: CalibrationScore | CalibrationUnscorable | null;
+  /** A review joined the sample after the score was made; the score is kept as it was. */
+  scoreStale: boolean;
+}
+
+export interface CalibrationRun {
+  id: string;
+  owner: string;
+  name: string;
+  createdAt: string;
+  samples: number;
+  /** Its jobs by status. */
+  jobs: Record<string, number>;
+  aggregate: CalibrationAggregate;
+  /** Only in the answer for one run. */
+  results?: CalibrationRunResult[];
+}
+
+export interface CalibrationSummary {
+  owner: string;
+  name: string;
+  runs: number;
+  samples: number;
+  overall: CalibrationAggregate;
+  /** Newest rubric version first; 0 is no rubric. */
+  byRubricVersion: { rubricVersion: number | null; aggregate: CalibrationAggregate }[];
 }
 
 export interface JobDiff {
@@ -223,13 +443,21 @@ export const api = {
   logout: () => request<{ authenticated: boolean }>("POST", "/api/logout"),
 
   repos: () => request<{ items: Repo[] }>("GET", "/api/v1/repos").then((r) => r.items),
-  /** Replaces the settings: both are sent, since an omitted one would fall back to its default. */
+  /**
+   * Replaces the mode and autoReview: both are sent, since an omitted one would fall back to its
+   * default. The trusted reviewers are kept.
+   */
   putRepo: (owner: string, name: string, mode: PostingMode, autoReview: boolean) =>
     request<Repo>("PUT", `/api/v1/repos/${seg(owner)}/${seg(name)}`, { mode, autoReview }),
+  /** Write the settings named; see `RepoSettings` for what an omitted one does. */
+  putRepoSettings: (owner: string, name: string, settings: RepoSettings) =>
+    request<Repo>("PUT", `/api/v1/repos/${seg(owner)}/${seg(name)}`, settings),
   deleteRepo: (owner: string, name: string) =>
     request<void>("DELETE", `/api/v1/repos/${seg(owner)}/${seg(name)}`),
 
-  jobs: () => request<{ items: Job[] }>("GET", "/api/v1/jobs").then((r) => r.items),
+  /** Review jobs, unless `kind` asks for calibration jobs or all. */
+  jobs: (kind: JobKind | "all" = "review") =>
+    request<{ items: Job[] }>("GET", `/api/v1/jobs?kind=${kind}`).then((r) => r.items),
   job: (id: string) => request<Job>("GET", `/api/v1/jobs/${seg(id)}`),
   createJob: (owner: string, name: string, prNumber: number, headSha: string | null) =>
     request<Job>(
@@ -294,7 +522,60 @@ export const api = {
     }
     throw new ApiError(404, `${owner}/${name} has no rubric version ${version}`);
   },
+
+  /** Queue an import of the `limit` (default 50, at most 200) most recent closed pull requests. */
+  importCalibration: (owner: string, name: string, limit?: number) =>
+    request<CalibrationImport>(
+      "POST",
+      `${calibration(owner, name)}/import`,
+      limit === undefined ? {} : { limit },
+    ),
+  /** Stop a queued or running import; what it stored stays. */
+  cancelCalibrationImport: (owner: string, name: string, id: string) =>
+    request<CalibrationImport>("POST", `${calibration(owner, name)}/import/${seg(id)}/cancel`, {}),
+  /** One page of the repository's imports, newest first. */
+  calibrationImports: (owner: string, name: string, limit = 50, offset = 0) =>
+    request<Page<CalibrationImport>>(
+      "GET",
+      `${calibration(owner, name)}/import?${pageQuery(limit, offset)}`,
+    ),
+  /** One page of the samples, most recently reviewed first. */
+  calibrationSamples: (owner: string, name: string, limit = 50, offset = 0) =>
+    request<Page<CalibrationSample>>(
+      "GET",
+      `${calibration(owner, name)}/samples?${pageQuery(limit, offset)}`,
+    ),
+  calibrationSample: (owner: string, name: string, id: string) =>
+    request<CalibrationSample>("GET", `${calibration(owner, name)}/samples/${seg(id)}`),
+  /** Delete a sample; importing again neither brings it back nor adds to it. */
+  deleteCalibrationSample: (owner: string, name: string, id: string) =>
+    request<void>("DELETE", `${calibration(owner, name)}/samples/${seg(id)}`),
+  /**
+   * Run the agent on the samples named, or on `count` of those run least; at most 20. A sample a
+   * live job is reviewing is refused (409); past the daily cap, 429.
+   */
+  createCalibrationRun: (
+    owner: string,
+    name: string,
+    which: { samples: string[] } | { count: number },
+  ) => request<CalibrationRun>("POST", `${calibration(owner, name)}/runs`, which),
+  /** One page of the runs, newest first, each with its aggregate. */
+  calibrationRuns: (owner: string, name: string, limit = 50, offset = 0) =>
+    request<Page<CalibrationRun>>(
+      "GET",
+      `${calibration(owner, name)}/runs?${pageQuery(limit, offset)}`,
+    ),
+  /** One run, with each sample's result. */
+  calibrationRun: (owner: string, name: string, id: string) =>
+    request<CalibrationRun>("GET", `${calibration(owner, name)}/runs/${seg(id)}`),
+  /** The aggregate over every run, and by rubric version. */
+  calibrationSummary: (owner: string, name: string) =>
+    request<CalibrationSummary>("GET", `${calibration(owner, name)}/summary`),
 };
+
+function calibration(owner: string, name: string): string {
+  return `/api/v1/repos/${seg(owner)}/${seg(name)}/calibration`;
+}
 
 /** One page of a history; `nextOffset` is null on the last. */
 export interface Page<T> {

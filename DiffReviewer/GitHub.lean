@@ -8,7 +8,10 @@ open Lean (Json)
 # GitHub
 
 What the platform needs of GitHub's REST API: the open pull requests of a repository (discovery),
-one pull request's title, body, base and head, its diff, and posting a review.
+one pull request's title, body, base and head, its diff, and posting a review; and for
+calibration, the recent closed pull requests, their reviews and inline review comments, and the
+merge base a commit of one had. Every path is under `/repos/{owner}/{name}/`, which is what kleis's
+`diff-reviewer-poster` grant allows.
 
 `Client` is a record of functions rather than a module of them, so that the workers and the
 server can be run against a fake in the suite; `Client.curl` is the real one. It sends
@@ -58,6 +61,10 @@ structure PostedReview where
   /-- What GitHub says the review is: `APPROVED`, `CHANGES_REQUESTED`, `COMMENTED`, … ; empty
       when it did not say. -/
   state  : String := ""
+  /-- The commit the review was written against; empty when GitHub did not say. -/
+  commitId : String := ""
+  /-- When it was submitted; `none` for a pending review. -/
+  submittedAt : Option String := none
   deriving Repr, BEq
 
 def PostedReview.ofJson (j : Json) : Except String PostedReview := do
@@ -66,7 +73,9 @@ def PostedReview.ofJson (j : Json) : Except String PostedReview := do
   let url := (j.getObjValAs? String "html_url").toOption.getD ""
   let author := ((j.getObjVal? "user").bind (·.getObjValAs? String "login")).toOption.getD ""
   let state := (j.getObjValAs? String "state").toOption.getD ""
-  return { id, body, url, author, state }
+  let commitId := ((j.getObjValAs? String "commit_id").toOption.getD "").toLower
+  let submittedAt := (j.getObjValAs? String "submitted_at").toOption
+  return { id, body, url, author, state, commitId, submittedAt }
 
 /-- The decision a review GitHub holds is, by its `state`, when that is one. -/
 def PostedReview.decision? (r : PostedReview) : Option Decision :=
@@ -79,6 +88,36 @@ def PostedReview.decision? (r : PostedReview) : Option Decision :=
 def PostedReview.toJson (r : PostedReview) : Json :=
   .mkObj [("id", r.id), ("url", r.url), ("body", r.body)]
 
+/-- An inline comment of a review, as `GET /repos/{o}/{n}/pulls/{pr}/comments` gives it. The
+    `original*` fields place it on the commit it was written against (`originalCommitId`); the
+    others on the pull request's head now, and are `none` once the code it was on has changed —
+    GitHub's "outdated". -/
+structure ReviewComment where
+  id : Nat
+  /-- The review it belongs to. -/
+  reviewId : Option Nat := none
+  path : String
+  body : String := ""
+  /-- `RIGHT` (the new side) or `LEFT` (the old); `none` for a comment on the whole file. -/
+  side : Option String := none
+  startSide : Option String := none
+  originalLine : Option Nat := none
+  originalStartLine : Option Nat := none
+  originalCommitId : String := ""
+  /-- The comment it answers, when it is a reply in a thread. -/
+  inReplyTo : Option Nat := none
+  deriving Repr, BEq
+
+def ReviewComment.ofJson (j : Json) : Except String ReviewComment := do
+  let id ← j.getObjValAs? Nat "id"
+  let path ← j.getObjValAs? String "path"
+  let nat? (k : String) : Option Nat := (j.getObjValAs? Nat k).toOption
+  let str? (k : String) : Option String := (j.getObjValAs? String k).toOption
+  return { id, path, reviewId := nat? "pull_request_review_id", body := (str? "body").getD ""
+         , side := str? "side", startSide := str? "start_side"
+         , originalLine := nat? "original_line", originalStartLine := nat? "original_start_line"
+         , originalCommitId := ((str? "original_commit_id").getD "").toLower
+         , inReplyTo := nat? "in_reply_to_id" }
 /-- Seconds before a request to GitHub is given up. -/
 def requestTimeout : Nat := 60
 
@@ -92,10 +131,13 @@ inductive Error where
   | indefinite (why : String)
   /-- The diff is larger than the platform takes. -/
   | tooLarge (limit : Nat)
+  /-- GitHub refused for its rate limit (a `429`, or a `403` that says so): nothing was done, and
+      asking again before the limit resets is refused too. -/
+  | rateLimited (why : String)
   deriving Repr, BEq
 
 def Error.message : Error → String
-  | .definite why | .indefinite why => why
+  | .definite why | .indefinite why | .rateLimited why => why
   | .tooLarge limit => s!"the diff is larger than {limit} bytes, the most the platform reviews"
 
 /-- GitHub's name for a decision, as a review's `event`. -/
@@ -128,6 +170,24 @@ def reviewRequestBody (r : Review) (commitId : Option String) (event : Option De
     | none => fields
     | some e => fields ++ [("event", (Decision.toEvent e : Json))])
 
+/-- What GitHub last said of the token's rate limit: the requests left, and when the window
+    resets (epoch seconds). -/
+structure RateLimit where
+  remaining : Nat
+  resetAt   : Int
+  deriving Repr, BEq
+
+/-- The rate limit an answer's `X-RateLimit-Remaining` and `X-RateLimit-Reset` give, if both are
+    there. -/
+def RateLimit.ofResponse? (r : Http.Response) : Option RateLimit := do
+  let remaining ← (← r.header? "x-ratelimit-remaining").toNat?
+  let resetAt ← (← r.header? "x-ratelimit-reset").toNat?
+  return { remaining, resetAt := resetAt }
+
+/-- The rate limit the curl client last saw. One per process: the platform holds one GitHub
+    token, and every request with it draws on one budget. -/
+initialize lastRateLimit : IO.Ref (Option RateLimit) ← IO.mkRef none
+
 /-- What the platform does on GitHub. Every operation answers an error rather than throwing:
     GitHub being unreachable is a state a worker records and retries, not a crash. -/
 structure Client where
@@ -142,6 +202,19 @@ structure Client where
   /-- Post a review as `event` (`none`: pending), with its body as given. -/
   postReview : (owner name : String) → (number : Nat) → (review : Review) →
     (commitId : Option String) → (event : Option Decision) → IO (Except Error PostedReview)
+  /-- The most recently updated closed pull requests of `owner/name`, at most `limit`. -/
+  listClosedPulls : (owner name : String) → (limit : Nat) → IO (Except Error (Array Pull)) :=
+    fun _ _ _ => return .error (.definite "listing closed pull requests is not supported")
+  /-- The inline review comments on a pull request, every page of them. -/
+  listReviewComments : (owner name : String) → (number : Nat) →
+      IO (Except Error (Array ReviewComment)) :=
+    fun _ _ _ => return .error (.definite "listing review comments is not supported")
+  /-- The merge base of `base` and `head`: the base a pull request whose base is `base` had at
+      `head`. -/
+  mergeBase : (owner name base head : String) → IO (Except Error String) :=
+    fun _ _ _ _ => return .error (.definite "comparing commits is not supported")
+  /-- What GitHub last said of the rate limit, if it has said anything. -/
+  rateLimit : IO (Option RateLimit) := pure none
 
 /-- The API's root, `https://api.github.com` unless `DIFF_REVIEWER_GITHUB_API` names another. -/
 def defaultApi : IO String := do
@@ -151,6 +224,11 @@ def defaultApi : IO String := do
 private def errorOf (r : Http.Response) : String :=
   let msg := ((Json.parse r.body).toOption.bind (·.getObjValAs? String "message" |>.toOption))
   s!"GitHub answered {r.status}{(msg.map (": " ++ ·)).getD ""}"
+
+/-- Whether `r` is GitHub refusing for its rate limit: a `429`, or a `403` whose message says so
+    (GitHub answers both, for its primary and its secondary limits). -/
+def rateLimited (r : Http.Response) : Bool :=
+  r.status == 429 || (r.status == 403 && ((errorOf r).toLower.splitOn "rate limit").length > 1)
 
 /-- The most pages of 100 a listing reads: 1000 open pull requests, or reviews on one. -/
 def maxPages : Nat := 10
@@ -188,7 +266,9 @@ def Client.curl (token : String) (api : String) (maxDiffBytes : Nat := defaultMa
     | .error (.noAnswer _ 63) => return .error (.tooLarge maxDiffBytes)
     | .error (.noAnswer why _) => return .error (.indefinite why)
     | .ok r =>
+      if let some l := RateLimit.ofResponse? r then lastRateLimit.set (some l)
       if 200 ≤ r.status && r.status < 300 then return .ok r
+      else if rateLimited r then return .error (.rateLimited (errorOf r))
       else if r.status < 500 then return .error (.definite (errorOf r))
       else return .error (.indefinite (errorOf r))
   let parse {α : Type} (f : Json → Except String α) (r : Http.Response) : Except Error α :=
@@ -219,7 +299,25 @@ def Client.curl (token : String) (api : String) (maxDiffBytes : Nat := defaultMa
     postReview := fun owner name number review commitId event => do
       return (← call "POST" s!"/repos/{owner}/{name}/pulls/{number}/reviews"
           (body := some (reviewRequestBody review commitId event))).bind
-        (parse PostedReview.ofJson) }
+        (parse PostedReview.ofJson)
+    listClosedPulls := fun owner name limit => do
+      let path := s!"/repos/{owner}/{name}/pulls?state=closed&sort=updated&direction=desc&"
+      let mut all := #[]
+      for page in [1:(limit + 99) / 100 + 1] do
+        match (← call "GET" s!"{path}per_page=100&page={page}").bind
+            (parse fun j => do (← j.getArr?).mapM Pull.ofJson) with
+        | .error e => return .error e
+        | .ok xs =>
+          all := all ++ xs
+          if xs.size < 100 then break
+      return .ok (all.extract 0 limit)
+    listReviewComments := fun owner name number =>
+      pages s!"/repos/{owner}/{name}/pulls/{number}/comments?" ReviewComment.ofJson
+    mergeBase := fun owner name base head => do
+      return (← call "GET" s!"/repos/{owner}/{name}/compare/{base}...{head}?per_page=1").bind
+        (parse fun j => do
+          return (← (← j.getObjVal? "merge_base_commit").getObjValAs? String "sha").toLower)
+    rateLimit := lastRateLimit.get }
 
 /-- The client configured by the environment: the token in `DIFF_REVIEWER_GITHUB_TOKEN_FILE`, or
     `none` when it is unset. -/

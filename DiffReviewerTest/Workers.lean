@@ -26,6 +26,8 @@ inductive PostOutcome where
   | lostAnswer
   /-- A `502`, and nothing posted. -/
   | failedUnposted
+  /-- A `403` for the rate limit, and nothing posted. -/
+  | rateLimited
   deriving BEq
 
 structure FakeGitHub where
@@ -82,6 +84,8 @@ def FakeGitHub.client (f : FakeGitHub) : GitHub.Client where
     match ← f.outcome.get with
     | .refused => return .error (.definite "GitHub answered 422: Unprocessable Entity")
     | .failedUnposted => return .error (.indefinite "GitHub answered 502")
+    | .rateLimited =>
+      return .error (.rateLimited "GitHub answered 403: API rate limit exceeded for user ID 1.")
     | .lostAnswer =>
       let _ ← record
       return .error (.indefinite "curl: (28) Operation timed out")
@@ -243,6 +247,8 @@ def anAgentReviewsAndItIsPosted : Test := withTempDb do
     ++ checkEq q.externalId id "the external id is the job's"
     ++ checkEq q.upstream "acme/widgets" "the upstream"
     ++ checkEq q.issueNumber 7 "the pull request"
+    ++ checkEq q.kleisNarrow [] "a review's token is not narrowed"
+    ++ check (!(q.toJson.getObjVal? "kleis_narrow" |>.isOk)) "nor does its request say so"
     ++ check ((q.prompt.splitOn "diff-reviewer agent show acme/widgets 7").length > 1)
       "the prompt says to run agent show"
     ++ checkStatus early 409 "a submission before the first read"

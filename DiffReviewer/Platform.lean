@@ -15,6 +15,11 @@ a run that ended without a review. The moves a person may make are here (`person
 platform's own — queueing, following the run, the agent's submission, posting — are made by
 `DiffReviewer.Workers` and the agent API, each with the check of the state it expects.
 
+A job is of a **kind** (`JobKind`): a `review` of a pull request, posted once a person approves
+it, or a `calibration` — a review of a past commit, scored against a trusted reviewer's review of
+it (`DiffReviewer.Calibration`) and never approved, claimed or posted. A kind this build does not
+know is treated as one that is never posted.
+
 Beside them, two histories that are only ever appended to: the versions of each repository's
 rubric document (`putRubric`), and the **revisions** of each job's review — every write of it, by
 the agent, a person or (once posted) GitHub, with what it said. The agent's draft beside what was
@@ -83,6 +88,12 @@ structure Repo where
   /-- Whether the platform finds the open pull requests itself and makes a job for each new head,
       rather than reviewing only what it is asked to. -/
   autoReview : Bool := false
+  /-- The GitHub logins, in lower case, whose reviews of the repository's pull requests
+      calibration imports and scores the agent against. -/
+  trustedReviewers : List String := []
+  /-- Incremented by every write of the settings, so that a stale page is refused (`409`) rather
+      than overwriting what it never saw. -/
+  version    : Nat := 1
   createdAt  : String
   deriving Repr
 
@@ -90,12 +101,31 @@ def Repo.slug (r : Repo) : String := s!"{r.owner}/{r.name}"
 
 def Repo.toJson (r : Repo) : Json :=
   .mkObj [("owner", r.owner), ("name", r.name), ("mode", r.mode.toString),
-          ("autoReview", r.autoReview), ("createdAt", r.createdAt)]
+          ("autoReview", r.autoReview),
+          ("trustedReviewers", .arr (r.trustedReviewers.map Json.str).toArray),
+          ("version", r.version), ("createdAt", r.createdAt)]
+
+/-- The logins a `trusted_reviewers` column holds; anything but an array of strings is none. -/
+private def trustedOfRaw (raw : Option String) : List String :=
+  match raw.map Json.parse with
+  | some (.ok (.arr xs)) => xs.toList.filterMap (·.getStr?.toOption)
+  | _ => []
 
 private def Repo.ofRow (row : Store.RepoRow) : Repo :=
   { owner := row.owner, name := row.name, createdAt := row.created_at
   , mode := (PostingMode.ofString? row.mode).getD .staged
-  , autoReview := row.auto_review.getD false }
+  , autoReview := row.auto_review.getD false
+  , trustedReviewers := trustedOfRaw row.trusted_reviewers
+  , version := (row.version.getD 1).toNat }
+
+/-- Whether `s` can be a GitHub login: 1 to 39 letters, digits and single hyphens, not starting or
+    ending with one. -/
+def validLogin (s : String) : Bool :=
+  !s.isEmpty && s.length ≤ 39 && !s.startsWith "-" && !s.endsWith "-" &&
+    (s.splitOn "--").length == 1 && s.all fun c => c.isAlphanum || c == '-'
+
+/-- The most trusted reviewers a repository names. -/
+def maxTrustedReviewers : Nat := 50
 
 /-- Whether `s` can be one half of a GitHub `owner/name`: letters, digits, `-`, `_` and `.`, not
     starting with a dot. Checked because both halves end up in URLs and, later, clone paths. -/
@@ -147,6 +177,24 @@ def JobStatus.personCanEdit : JobStatus → Bool
   | .pending | .draft | .approved | .rejected => true
   | _ => false
 
+/-- What a job is for. -/
+inductive JobKind where
+  /-- A review of a pull request, posted once a person approves it. -/
+  | review
+  /-- A review of a past commit of a closed pull request, scored against a trusted reviewer's
+      review of the same commit. Never posted, never approved, never made `stale` by discovery. -/
+  | calibration
+  deriving Repr, BEq, DecidableEq
+
+def JobKind.toString : JobKind → String
+  | .review      => "review"
+  | .calibration => "calibration"
+
+def JobKind.ofString? : String → Option JobKind
+  | "review"      => some .review
+  | "calibration" => some .calibration
+  | _             => none
+
 /-- One review job.
 
     The status and the review are kept as the strings the row holds, and parsed when read: a value
@@ -193,8 +241,28 @@ structure Job where
   directPosts : Nat := 0
   /-- Whether the last claim to post was the platform's own, which it may make again. -/
   postDirect : Bool := false
+  /-- What the job is for, as stored: `none` is a review (`JobKind`). -/
+  kindRaw    : Option String := none
+  /-- The calibration sample a `calibration` job reviews, and the run that asked for it. -/
+  sampleId   : Option String := none
+  runId      : Option String := none
 
 def Job.status? (j : Job) : Option JobStatus := JobStatus.ofString? j.statusRaw
+
+/-- The job's kind; `none` for a kind this build does not know. -/
+def Job.kind? (j : Job) : Option JobKind :=
+  match j.kindRaw with
+  | none   => some .review
+  | some k => JobKind.ofString? k
+
+/-- Whether the job is a review to post: of the kind `review`. A job of any other kind — a
+    calibration, or a kind a newer build wrote — is never approved, claimed or posted. -/
+def Job.isReview (j : Job) : Bool := j.kind? == some .review
+
+/-- Why job `j` is not one to approve, claim or post, if it is not one: anything but a review. -/
+def Job.notPostable (j : Job) : Option String :=
+  if j.isReview then none
+  else s!"job {j.id} is a {j.kindRaw.getD "review"} job; it is never approved or posted"
 
 /-- The review, `none` when there is none, and an error when the stored one does not parse. -/
 def Job.review? (j : Job) : Option (Except String Review) :=
@@ -231,9 +299,11 @@ def Job.toJson (j : Job) : Json :=
     ("postNote", optStr j.postNote),
     ("postedReview", (j.postedReview.bind (Json.parse · |>.toOption)).getD .null),
     ("rubricVersion", (j.rubricVersion.map fun v => (v : Json)).getD .null),
-    ("directPosts", j.directPosts), ("postDirect", j.postDirect)]
+    ("directPosts", j.directPosts), ("postDirect", j.postDirect),
+    ("kind", j.kindRaw.getD JobKind.review.toString), ("sampleId", optStr j.sampleId),
+    ("runId", optStr j.runId)]
 
-private def Job.ofRow (row : Store.JobRow) : Job :=
+def Job.ofRow (row : Store.JobRow) : Job :=
   { id := row.id, owner := row.owner, name := row.name, prNumber := row.pr_number.toNat
   , headSha := row.head_sha, statusRaw := row.status, queueEntry := row.queue_entry
   , reviewRaw := row.review, version := row.version.toNat
@@ -242,9 +312,10 @@ private def Job.ofRow (row : Store.JobRow) : Job :=
   , prType := row.pr_type, attempts := (row.attempts.getD 0).toNat
   , postStartedAt := row.post_started_at, postedUrl := row.posted_url, postNote := row.post_note
   , postedReview := row.posted_review, rubricVersion := row.rubric_version.map (·.toNat)
-  , directPosts := (row.direct_posts.getD 0).toNat, postDirect := row.post_direct.getD false }
+  , directPosts := (row.direct_posts.getD 0).toNat, postDirect := row.post_direct.getD false
+  , kindRaw := row.kind, sampleId := row.sample_id, runId := row.run_id }
 
-private def Job.toRow (j : Job) : Store.JobRow :=
+def Job.toRow (j : Job) : Store.JobRow :=
   { id := j.id, owner := j.owner, name := j.name, pr_number := j.prNumber
   , head_sha := j.headSha, status := j.statusRaw, queue_entry := j.queueEntry
   , review := j.reviewRaw, version := j.version
@@ -253,7 +324,8 @@ private def Job.toRow (j : Job) : Store.JobRow :=
   , pr_type := j.prType, attempts := some j.attempts
   , post_started_at := j.postStartedAt, posted_url := j.postedUrl, post_note := j.postNote
   , posted_review := j.postedReview, rubric_version := j.rubricVersion.map Int.ofNat
-  , direct_posts := some j.directPosts, post_direct := some j.postDirect }
+  , direct_posts := some j.directPosts, post_direct := some j.postDirect
+  , kind := j.kindRaw, sample_id := j.sampleId, run_id := j.runId }
 
 /-- The largest pull request number accepted: what fits a 32-bit column with room to spare. -/
 def maxPrNumber : Nat := 2147483647
@@ -366,19 +438,49 @@ def findRepo (owner name : String) : IO (Option Repo) := do
     select r
   return rows[0]?.map Repo.ofRow
 
-/-- Create or replace a repository. Answers whether it existed before. Names are stored in lower
-    case, as GitHub compares them, so `Acme/Widgets` and `acme/widgets` are one repository. -/
-def putRepo (owner name : String) (mode : PostingMode) (autoReview : Bool := false) : IO Bool := do
+/-- What a write of a repository's settings changes. A field left `none` keeps the current value
+    — or, for a repository not yet registered, the default — so that a client that does not know
+    a setting cannot wipe it. -/
+structure RepoUpdate where
+  mode             : Option PostingMode := none
+  autoReview       : Option Bool := none
+  trustedReviewers : Option (List String) := none
+  /-- The version of the settings the client last read (0 for a repository not yet registered);
+      `none` writes whatever is there. -/
+  expected         : Option Nat := none
+
+/-- Create or update a repository: a versioned write, the check and the write in one transaction.
+    Answers whether it existed before, and the repository as written. Names are stored in lower
+    case, as GitHub compares them, so `Acme/Widgets` and `acme/widgets` are one repository; so are
+    the trusted reviewers' logins. -/
+def putRepo (owner name : String) (u : RepoUpdate) : IO (Except String (Bool × Repo)) := do
   let owner := owner.toLower
   let name := name.toLower
-  let existing ← findRepo owner name
-  let createdAt ← match existing with
-    | some r => pure r.createdAt
-    | none   => nowIso
-  Store.run <| HasModel.save
-    ({ owner, name, mode := mode.toString, created_at := createdAt
-     , auto_review := some autoReview } : Store.RepoRow)
-  return existing.isSome
+  let now ← nowIso
+  Store.transact do
+    let rows ← HasModel.fetch <| query% do
+      let r ← from Store.RepoRow
+      guard r.owner = owner
+      guard r.name = name
+      select r
+    let existing := rows[0]?.map Repo.ofRow
+    let current := (existing.map (·.version)).getD 0
+    if let some v := u.expected then
+      unless v == current do
+        return .error s!"the settings of {owner}/{name} have changed since they were read \
+(version {v}, now {current}); reload them"
+    let old : Repo := existing.getD { owner, name, createdAt := now, version := 0 }
+    let trusted := (u.trustedReviewers.map (·.map String.toLower |>.eraseDups)).getD
+      old.trustedReviewers
+    let repo : Repo :=
+      { old with mode := u.mode.getD old.mode, autoReview := u.autoReview.getD old.autoReview
+                 trustedReviewers := trusted, version := current + 1 }
+    HasModel.save
+      ({ owner, name, mode := repo.mode.toString, created_at := repo.createdAt
+       , auto_review := some repo.autoReview
+       , trusted_reviewers := some (Json.arr (trusted.map Json.str).toArray).compress
+       , version := some repo.version } : Store.RepoRow)
+    return .ok (existing.isSome, repo)
 
 /-- Delete a repository. Its jobs are kept: they are the record of reviews that happened. So are
     its rubric versions, which those jobs name (`rubricVersion`): registering the repository again
@@ -397,7 +499,7 @@ def listJobs : IO (Array Job) := do
     order_by_desc j.id
   return rows.map Job.ofRow
 
-private def fetchJob (id : String) : Sqlite.M (Option Job) := do
+def fetchJob (id : String) : Sqlite.M (Option Job) := do
   let rows ← HasModel.fetch <| query% do
     let j ← from Store.JobRow
     guard j.id = id
@@ -433,9 +535,10 @@ def jobsWithStatus (statuses : List JobStatus) : IO (Array Job) := do
   let names := statuses.map (·.toString)
   return ((← listJobs).filter (names.contains ·.statusRaw)).reverse
 
-/-- A new job for a pull request at head `headSha`, unless one already exists for that head: one
-    review per commit. The check and the write are one transaction, so discovery running twice
-    over the same head makes one job. Answers the job made, if one was. -/
+/-- A new job for a pull request at head `headSha`, unless a review job already exists for that
+    head: one review per commit, whatever calibration jobs there are of it. The check and the
+    write are one transaction, so discovery running twice over the same head makes one job.
+    Answers the job made, if one was. -/
 def createJobForHead (repo : Repo) (prNumber : Nat) (headSha : String)
     (baseSha title body : Option String) : IO (Option Job) := do
   let now ← nowIso
@@ -450,19 +553,24 @@ def createJobForHead (repo : Repo) (prNumber : Nat) (headSha : String)
       guard j.name = repo.name
       guard j.pr_number = (prNumber : Int)
       select j
-    if rows.any (·.head_sha == some headSha) then return none
+    if rows.any fun r => r.head_sha == some headSha && (Job.ofRow r).isReview then return none
     HasModel.save job.toRow
     return some job
 
-/-- How many jobs of `owner/name` were made at or after `since` (RFC 3339, so that the strings
-    compare as the instants do). -/
-def jobsSince (owner name since : String) : IO Nat := do
-  let rows ← Store.run <| HasModel.fetch <| query% do
+/-- The jobs of `owner/name` of kind `kind` made at or after `since` (RFC 3339, so that the
+    strings compare as the instants do): what the daily caps count. A job of a kind this build
+    does not know counts as neither. -/
+def jobsSinceIn (owner name since : String) (kind : JobKind) : Sqlite.M Nat := do
+  let rows ← HasModel.fetch <| query% do
     let j ← from Store.JobRow
     guard j.owner = owner
     guard j.name = name
     select j
-  return (rows.filter (·.created_at ≥ since)).size
+  return (rows.filter fun r => r.created_at ≥ since && (Job.ofRow r).kind? == some kind).size
+
+/-- How many review jobs of `owner/name` were made at or after `since`. -/
+def jobsSince (owner name since : String) : IO Nat :=
+  Store.run (jobsSinceIn owner name since .review)
 
 /-- The statuses in which a job still has a use for its diff. -/
 def liveStatuses : List JobStatus := [.pending, .queued, .running, .draft, .approved]

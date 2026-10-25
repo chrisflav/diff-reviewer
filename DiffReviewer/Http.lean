@@ -10,9 +10,10 @@ platform itself — makes, and it is on every machine the binary runs on.
 The request's options and headers are handed to curl as a config file on its standard input
 (`--config -`), never on its command line: a bearer token on `argv` is readable by every process on
 the machine. `-q` comes first, so that no `~/.curlrc` adds to it. A body goes through a temporary
-file (`data-binary = @file`) rather than into the config. A header value holding a line break is
-refused, and so is plain `http` to anything but loopback: nothing the platform sends may be read
-on the way.
+file (`data-binary = @file`) rather than into the config, and the answer's headers come back through
+another (`dump-header`), which every curl the binary meets understands. A header value holding a
+line break is refused, and so is plain `http` to anything but loopback: nothing the platform sends
+may be read on the way.
 -/
 
 namespace DiffReviewer.Http
@@ -32,8 +33,28 @@ structure Request where
 
 /-- What the server answered. -/
 structure Response where
-  status : Nat
-  body   : String
+  status  : Nat
+  body    : String
+  /-- The answer's headers, their names in lower case, in the order sent. -/
+  headers : List (String × String) := []
+
+/-- Header `name` of `r`, in any case. -/
+def Response.header? (r : Response) (name : String) : Option String :=
+  r.headers.lookup name.toLower
+
+/-- The headers of the last answer in what curl dumped (`dump-header`): a request through a proxy,
+    or one answered `100 Continue` or redirected, dumps a block per answer, and only the last is
+    the server's answer to the request. -/
+def parseHeaders (dump : String) : List (String × String) :=
+  let lines := (dump.splitOn "\n").map fun l => (l.dropEndWhile (· == '\r')).toString
+  -- A block starts at its status line.
+  let last := lines.foldl (init := []) fun acc l =>
+    if l.startsWith "HTTP/" then [] else acc ++ [l]
+  last.filterMap fun l => match l.splitOn ":" with
+    | k :: v@(_ :: _) =>
+      if k.isEmpty || k.contains ' ' then none
+      else some (k.toLower, (":".intercalate v).trimAscii.toString)
+    | _ => none
 
 /-- Why a request has no `Response`. -/
 inductive Failure where
@@ -76,8 +97,10 @@ def allowedUrl (url : String) : Bool :=
 /-- The marker that separates the body from the status curl writes after it. -/
 private def statusMarker : String := "\n--diff-reviewer-status:"
 
-/-- The config file `request` is sent as, its body (if any) read from `bodyFile`. -/
-def config (r : Request) (bodyFile : Option System.FilePath := none) : String :=
+/-- The config file `request` is sent as, its body (if any) read from `bodyFile`, the answer's
+    headers dumped into `headerFile`. -/
+def config (r : Request) (bodyFile : Option System.FilePath := none)
+    (headerFile : Option System.FilePath := none) : String :=
   let lines := [
     s!"url = {quote r.url}",
     s!"request = {quote r.method}",
@@ -87,7 +110,8 @@ def config (r : Request) (bodyFile : Option System.FilePath := none) : String :=
     (r.maxBytes.map (s!"max-filesize = {·}")).toList ++
     (r.noproxy.map (s!"noproxy = {quote ·}")).toList ++
     r.headers.map (fun (k, v) => s!"header = {quote s!"{k}: {v}"}") ++
-    (bodyFile.map (fun f => s!"data-binary = {quote ("@" ++ f.toString)}")).toList
+    (bodyFile.map (fun f => s!"data-binary = {quote ("@" ++ f.toString)}")).toList ++
+    (headerFile.map (fun f => s!"dump-header = {quote f.toString}")).toList
   "\n".intercalate lines ++ "\n"
 
 /-- Why `r` is not a request to make, if it is not. -/
@@ -100,21 +124,28 @@ def check (r : Request) : Option String :=
 /-- Run `request`. Any answer, `4xx` and `5xx` included, is a `Response`. -/
 def send (request : Request) : IO (Except Failure Response) := do
   if let some why := check request then return .error (.refused why)
+  let (hh, headerFile) ← IO.FS.createTempFile
+  hh.flush
   let run (bodyFile : Option System.FilePath) : IO (Except Failure IO.Process.Output) := do
     try
       return .ok (← IO.Process.output { cmd := "curl", args := #["-q", "--config", "-"] }
-        (some (config request bodyFile)))
+        (some (config request bodyFile (some headerFile))))
     catch e => return .error (.refused s!"curl could not be run: {e}")
-  let out ← match request.body with
-    | none => run none
-    | some b =>
-      let (h, path) ← IO.FS.createTempFile
-      try
-        h.putStr b
-        h.flush
-        run (some path)
-      finally
-        try IO.FS.removeFile path catch _ => pure ()
+  let (out, dump) ← try
+      let out ← match request.body with
+        | none => run none
+        | some b =>
+          let (h, path) ← IO.FS.createTempFile
+          try
+            h.putStr b
+            h.flush
+            run (some path)
+          finally
+            try IO.FS.removeFile path catch _ => pure ()
+      let dump ← try IO.FS.readFile headerFile catch _ => pure ""
+      pure (out, dump)
+    finally
+      try IO.FS.removeFile headerFile catch _ => pure ()
   let out ← match out with
     | .ok o => pure o
     | .error e => return .error e
@@ -126,7 +157,7 @@ def send (request : Request) : IO (Except Failure Response) := do
   let some code := parts.getLast?.bind (·.trimAscii.toString.toNat?)
     | return .error (.noAnswer s!"{request.method} {request.url}: curl did not report a status" 0)
   let body := statusMarker.intercalate (parts.dropLast)
-  return .ok { status := code, body }
+  return .ok { status := code, body, headers := parseHeaders dump }
 
 /-- A file's contents, trimmed: how every token the platform reads from disk is stored. -/
 def readTokenFile (path : System.FilePath) : IO String := do
