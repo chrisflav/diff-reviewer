@@ -205,29 +205,42 @@ export interface HumanComment {
   body: string;
 }
 
-/** One review a trusted reviewer wrote of one commit of a closed pull request. */
+/**
+ * What one trusted reviewer said of one commit of a closed pull request: every review they
+ * submitted of it, merged.
+ */
 export interface CalibrationSample {
   id: string;
   owner: string;
   name: string;
   prNumber: number;
-  reviewId: number;
+  /** GitHub's ids of the reviews merged into it. */
+  reviewIds: number[];
   reviewer: string;
-  /** GitHub's state, as given: `APPROVED`, `CHANGES_REQUESTED`, `COMMENTED`, `DISMISSED`. */
+  /** The strongest state of its reviews: `CHANGES_REQUESTED`, then `APPROVED`, then `COMMENTED`. */
   state: string;
   body: string;
   /** The commit reviewed, and the base the pull request's diff had there. */
   commitId: string;
   baseSha: string;
   title: string;
+  /**
+   * What it is scored for: everything, or (`partial`: comments were dropped; `decision`: it says
+   * nothing but its state) its decision only.
+   */
+  scope: CalibrationScope | string;
   comments: HumanComment[];
-  /** Comments not kept: on the old side, not on a line of `commitId`, replies. */
+  /** Comments not kept: on the old side, not anchored to a line of `commitId`, replies. */
   dropped: { left: number; outdated: number; replies: number };
   submittedAt: string | null;
   importedAt: string;
+  /** When a review was last merged into it. */
+  updatedAt: string;
 }
 
-export type CalibrationImportStatus = "queued" | "running" | "done" | "failed";
+export type CalibrationScope = "full" | "partial" | "decision";
+
+export type CalibrationImportStatus = "queued" | "running" | "done" | "failed" | "cancelled";
 
 export interface CalibrationImport {
   id: string;
@@ -238,9 +251,17 @@ export interface CalibrationImport {
   /** The closed pull requests found, once listed. */
   pullsListed: number | null;
   pullsRead: number;
-  /** `pulls`, `reviews`, `imported`, `known`, `empty`, `unreachable`, `unreadable`, `dropped…`. */
+  /** How many times reading the next pull request has failed; at 3 it is skipped. */
+  failures: number;
+  /**
+   * `pulls`, `reviews`, `imported`, `merged`, `known`, `deleted`, `empty`, `unreachable`,
+   * `unreadable`, `droppedLeft`, `droppedOutdated`, `droppedReplies`.
+   */
   stats: Record<string, number>;
-  /** Why the last pass stopped short (GitHub's rate limit, an error to retry), or why it failed. */
+  /**
+   * Why the last pass stopped short (GitHub's rate limit, a pause under the reserve until it
+   * resets, an error to retry), or why it failed.
+   */
   error: string | null;
   requestedAt: string;
   updatedAt: string;
@@ -269,12 +290,14 @@ export interface AgentComment {
 export interface CalibrationScore {
   /** Scores of different matcher versions are not compared. */
   matcherVersion: number;
+  /** Only a `full` sample has a precision and recall; the others count for their decision. */
+  scope: CalibrationScope | string;
   agentComments: number;
   humanComments: number;
   matched: number;
-  /** matched / agentComments; null when the agent wrote none. */
+  /** matched / agentComments; null when the agent wrote none, or the sample is not `full`. */
   precision: number | null;
-  /** matched / humanComments; null when the person wrote none. */
+  /** matched / humanComments; null when the person wrote none, or the sample is not `full`. */
   recall: number | null;
   byCategory: (CalibrationTally & { category: string | null })[];
   bySeverity: (CalibrationTally & { severity: Severity | null })[];
@@ -286,10 +309,20 @@ export interface CalibrationScore {
   unmatchedHuman: HumanComment[];
 }
 
-/** Scores added up as counts; every ratio is computed from the sums. */
+/** A draft that could not be scored, and why; left out of aggregates. */
+export interface CalibrationUnscorable {
+  matcherVersion: number;
+  unscorable: string;
+}
+
+/**
+ * Scores of samples not deleted, added up as counts; every ratio is computed from the sums.
+ * Comment counts and ratios are of `full` samples (`commentsScored`); decisions of all.
+ */
 export interface CalibrationAggregate {
   matcherVersion: number;
   scored: number;
+  commentsScored: number;
   agentComments: number;
   humanComments: number;
   matched: number;
@@ -318,11 +351,13 @@ export interface CalibrationRunResult {
     state: string;
     commitId: string;
     title: string;
+    scope: CalibrationScope | string;
     comments: number;
+    /** A deleted sample's score is shown here and left out of every aggregate. */
     deleted: boolean;
   } | null;
   /** Null until the job's draft is scored. */
-  score: CalibrationScore | null;
+  score: CalibrationScore | CalibrationUnscorable | null;
 }
 
 export interface CalibrationRun {
@@ -490,6 +525,9 @@ export const api = {
       `${calibration(owner, name)}/import`,
       limit === undefined ? {} : { limit },
     ),
+  /** Stop a queued or running import; what it stored stays. */
+  cancelCalibrationImport: (owner: string, name: string, id: string) =>
+    request<CalibrationImport>("POST", `${calibration(owner, name)}/import/${seg(id)}/cancel`, {}),
   /** One page of the repository's imports, newest first. */
   calibrationImports: (owner: string, name: string, limit = 50, offset = 0) =>
     request<Page<CalibrationImport>>(
@@ -504,10 +542,13 @@ export const api = {
     ),
   calibrationSample: (owner: string, name: string, id: string) =>
     request<CalibrationSample>("GET", `${calibration(owner, name)}/samples/${seg(id)}`),
-  /** Delete a sample; importing again does not bring it back. */
+  /** Delete a sample; importing again neither brings it back nor adds to it. */
   deleteCalibrationSample: (owner: string, name: string, id: string) =>
     request<void>("DELETE", `${calibration(owner, name)}/samples/${seg(id)}`),
-  /** Run the agent on the samples named, or on `count` of those run least; at most 20. */
+  /**
+   * Run the agent on the samples named, or on `count` of those run least; at most 20. A sample a
+   * live job is reviewing is refused (409); past the daily cap, 429.
+   */
   createCalibrationRun: (
     owner: string,
     name: string,
