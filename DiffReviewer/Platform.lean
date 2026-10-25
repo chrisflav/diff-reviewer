@@ -91,6 +91,10 @@ structure Repo where
   /-- The GitHub logins, in lower case, whose reviews of the repository's pull requests
       calibration imports and scores the agent against. -/
   trustedReviewers : List String := []
+  /-- What the operator says of how the repository's reviews are written — tone, length, what to
+      leave out — in markdown, at most `maxStyleNotesBytes`. The agent's instructions carry it
+      after the rubric. -/
+  styleNotes : String := ""
   /-- Incremented by every write of the settings, so that a stale page is refused (`409`) rather
       than overwriting what it never saw. -/
   version    : Nat := 1
@@ -103,7 +107,7 @@ def Repo.toJson (r : Repo) : Json :=
   .mkObj [("owner", r.owner), ("name", r.name), ("mode", r.mode.toString),
           ("autoReview", r.autoReview),
           ("trustedReviewers", .arr (r.trustedReviewers.map Json.str).toArray),
-          ("version", r.version), ("createdAt", r.createdAt)]
+          ("styleNotes", r.styleNotes), ("version", r.version), ("createdAt", r.createdAt)]
 
 /-- The logins a `trusted_reviewers` column holds; anything but an array of strings is none. -/
 private def trustedOfRaw (raw : Option String) : List String :=
@@ -116,7 +120,15 @@ private def Repo.ofRow (row : Store.RepoRow) : Repo :=
   , mode := (PostingMode.ofString? row.mode).getD .staged
   , autoReview := row.auto_review.getD false
   , trustedReviewers := trustedOfRaw row.trusted_reviewers
+  , styleNotes := row.style_notes.getD ""
   , version := (row.version.getD 1).toNat }
+
+/-- The repository as its row, for a write. -/
+private def Repo.toRow (r : Repo) : Store.RepoRow :=
+  { owner := r.owner, name := r.name, mode := r.mode.toString, created_at := r.createdAt
+  , auto_review := some r.autoReview
+  , trusted_reviewers := some (Json.arr (r.trustedReviewers.map Json.str).toArray).compress
+  , style_notes := some r.styleNotes, version := some r.version }
 
 /-- Whether `s` can be a GitHub login: 1 to 39 letters, digits and single hyphens, not starting or
     ending with one. -/
@@ -126,6 +138,9 @@ def validLogin (s : String) : Bool :=
 
 /-- The most trusted reviewers a repository names. -/
 def maxTrustedReviewers : Nat := 50
+
+/-- The longest style notes, in bytes: a page of guidance, not a second rubric. -/
+def maxStyleNotesBytes : Nat := 16384
 
 /-- Whether `s` can be one half of a GitHub `owner/name`: letters, digits, `-`, `_` and `.`, not
     starting with a dot. Checked because both halves end up in URLs and, later, clone paths. -/
@@ -184,15 +199,21 @@ inductive JobKind where
   /-- A review of a past commit of a closed pull request, scored against a trusted reviewer's
       review of the same commit. Never posted, never approved, never made `stale` by discovery. -/
   | calibration
+  /-- A rubric proposal: an agent reads the repository's calibration data and proposes a rubric
+      document, which a person accepts or rejects (`DiffReviewer.Proposal`). Of the repository,
+      not of a pull request (its `prNumber` is 0), and never posted. -/
+  | proposal
   deriving Repr, BEq, DecidableEq
 
 def JobKind.toString : JobKind → String
   | .review      => "review"
   | .calibration => "calibration"
+  | .proposal    => "proposal"
 
 def JobKind.ofString? : String → Option JobKind
   | "review"      => some .review
   | "calibration" => some .calibration
+  | "proposal"    => some .proposal
   | _             => none
 
 /-- One review job.
@@ -445,6 +466,7 @@ structure RepoUpdate where
   mode             : Option PostingMode := none
   autoReview       : Option Bool := none
   trustedReviewers : Option (List String) := none
+  styleNotes       : Option String := none
   /-- The version of the settings the client last read (0 for a repository not yet registered);
       `none` writes whatever is there. -/
   expected         : Option Nat := none
@@ -474,13 +496,26 @@ def putRepo (owner name : String) (u : RepoUpdate) : IO (Except String (Bool × 
       old.trustedReviewers
     let repo : Repo :=
       { old with mode := u.mode.getD old.mode, autoReview := u.autoReview.getD old.autoReview
-                 trustedReviewers := trusted, version := current + 1 }
-    HasModel.save
-      ({ owner, name, mode := repo.mode.toString, created_at := repo.createdAt
-       , auto_review := some repo.autoReview
-       , trusted_reviewers := some (Json.arr (trusted.map Json.str).toArray).compress
-       , version := some repo.version } : Store.RepoRow)
+                 trustedReviewers := trusted, styleNotes := u.styleNotes.getD old.styleNotes
+                 version := current + 1 }
+    HasModel.save repo.toRow
     return .ok (existing.isSome, repo)
+
+/-- Repository `owner/name` read inside a transaction, as `findRepo` reads it. -/
+def fetchRepo (owner name : String) : Sqlite.M (Option Repo) := do
+  let rows ← HasModel.fetch <| query% do
+    let r ← from Store.RepoRow
+    guard r.owner = owner
+    guard r.name = name
+    select r
+  return rows[0]?.map Repo.ofRow
+
+/-- Write `notes` as `repo`'s style notes, as the next version of its settings: for a write that
+    has made its own checks in the transaction it is part of (accepting a rubric proposal). -/
+def saveStyleNotes (repo : Repo) (notes : String) : Sqlite.M Repo := do
+  let repo := { repo with styleNotes := notes, version := repo.version + 1 }
+  HasModel.save repo.toRow
+  return repo
 
 /-- Delete a repository. Its jobs are kept: they are the record of reviews that happened. So are
     its rubric versions, which those jobs name (`rubricVersion`): registering the repository again
@@ -683,7 +718,7 @@ private def fetchRubrics (owner name : String) : Sqlite.M (Array RubricVersion) 
 def rubricHistory (owner name : String) : IO (Array RubricVersion) :=
   Store.run (fetchRubrics owner name)
 
-private def fetchCurrentRubric (owner name : String) : Sqlite.M (Option RubricVersion) := do
+def fetchCurrentRubric (owner name : String) : Sqlite.M (Option RubricVersion) := do
   let rows ← HasModel.fetch <| query% do
     let r ← from Store.RubricRow
     guard r.owner = owner
@@ -707,6 +742,24 @@ def rubricAt (owner name : String) (version : Nat) : IO (Option RubricVersion) :
     select r
   return rows[0]?.map RubricVersion.ofRow
 
+/-- `putRubric`'s check and write, inside a transaction the caller holds: for a write that changes
+    the rubric together with something else (accepting a rubric proposal). -/
+def putRubricIn (owner name : String) (expected : Nat) (doc : Rubric) (now : String) :
+    Sqlite.M (Except UpdateError RubricVersion) := do
+  let cur ← fetchCurrentRubric owner name
+  if let some c := cur then
+    if let .error e := c.rubric? then
+      return .error (.conflict s!"the rubric of {owner}/{name} (version {c.version}) cannot be \
+read by this build ({e}); it is left as it is")
+  let current := (cur.map (·.version)).getD 0
+  unless current == expected do
+    return .error (.conflict s!"the rubric of {owner}/{name} has changed since it was read \
+(version {expected}, now {current}); reload it")
+  let row : Store.RubricRow :=
+    { owner, name, version := current + 1, document := doc.toJson.compress, created_at := now }
+  HasModel.save row
+  return .ok (RubricVersion.ofRow row)
+
 /-- Write `doc` as the next version of `owner/name`'s rubric, if `expected` is the current
     version (0 for none yet): a versioned write, like a job's, so that two people editing the
     rubric cannot overwrite each other unseen. The check and the write are one transaction. A
@@ -715,20 +768,7 @@ def rubricAt (owner name : String) (version : Nat) : IO (Option RubricVersion) :
 def putRubric (owner name : String) (expected : Nat) (doc : Rubric) :
     IO (Except UpdateError RubricVersion) := do
   let now ← nowIso
-  Store.transact do
-    let cur ← fetchCurrentRubric owner name
-    if let some c := cur then
-      if let .error e := c.rubric? then
-        return .error (.conflict s!"the rubric of {owner}/{name} (version {c.version}) cannot be \
-read by this build ({e}); it is left as it is")
-    let current := (cur.map (·.version)).getD 0
-    unless current == expected do
-      return .error (.conflict s!"the rubric of {owner}/{name} has changed since it was read \
-(version {expected}, now {current}); reload it")
-    let row : Store.RubricRow :=
-      { owner, name, version := current + 1, document := doc.toJson.compress, created_at := now }
-    HasModel.save row
-    return .ok (RubricVersion.ofRow row)
+  Store.transact (putRubricIn owner name expected doc now)
 
 end Platform
 

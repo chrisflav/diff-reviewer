@@ -9,4 +9,7 @@ import DiffReviewer.GitHub
 import DiffReviewer.Git
 import DiffReviewer.Store
 import DiffReviewer.Platform
+import DiffReviewer.Calibration
+import DiffReviewer.Proposal
+import DiffReviewer.Style
 import DiffReviewer.Server

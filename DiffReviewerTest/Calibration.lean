@@ -487,10 +487,11 @@ def calibrationJobsAreNeverPosted : Test := withTempDb do
   let listedCal ← route st { req .get "/api/v1/jobs" with query := "kind=calibration" }
   let reviewPrompt := Workers.prompt { job with kindRaw := none }
   let withCheckout : Orchestra.QueueRequest :=
-    { prompt := "", goal := "", upstream := "acme/widgets", issueNumber := 13, externalId := "x"
+    { prompt := "", goal := "", upstream := "acme/widgets", issueNumber := some 13
+    , externalId := "x"
     , checkout := some jobHead }
   return checkStatus made 201 "the run"
-    ++ checkEq (queued.map (·.issueNumber)) #[13] "queued, though the pull request is closed"
+    ++ checkEq (queued.map (·.issueNumber)) #[some 13] "queued, though the pull request is closed"
     ++ checkEq (queued.map (·.kleisNarrow)) #[["github: only discover, fetch"]]
       "with its token narrowed to cloning and fetching from GitHub"
     ++ check ((queued[0]?.map (·.toJson.getObjVal? "kleis_narrow" |>.isOk)).getD false)

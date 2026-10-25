@@ -20,7 +20,7 @@ USAGE:
                       [--secure-cookie] [--interval <seconds>]
                       [--trusted-proxy <ip>] [--max-jobs-per-day <n>]
                       [--max-diff-bytes <n>] [--max-calibration-jobs-per-day <n>]
-                      [--github-reserve <n>]
+                      [--github-reserve <n>] [--max-proposals-per-day <n>]
       Run the review platform: the HTTP API, the front-end built into <dir>
       (web/dist), and the workers that find pull requests, queue reviews on
       orchestra and follow them, every --interval seconds. Configured by the
@@ -28,7 +28,8 @@ USAGE:
       --host 127.0.0.1, --port 8090, --interval 60, --max-jobs-per-day 50,
       --max-diff-bytes 5242880, --max-calibration-jobs-per-day 20,
       --github-reserve 500 (GitHub requests calibration imports leave for
-      discovery and posting). --trusted-proxy is the reverse proxy whose
+      discovery and posting), --max-proposals-per-day 2 (rubric proposals a
+      person may ask for per repository). --trusted-proxy is the reverse proxy whose
       X-Forwarded-For names the client, for the login rate limit.
 
   diff-reviewer agent show   <owner/repo> <pr-number> [--job <id>]
@@ -39,6 +40,12 @@ USAGE:
       ~/.config/diff-reviewer/agent.json ({\"url\": …, \"token\": …}), and
       $DIFF_REVIEWER_URL and $DIFF_REVIEWER_TOKEN override them. --job names
       the job the agent's prompt gave it.
+
+  diff-reviewer agent proposal show   <owner/repo> --job <id>
+  diff-reviewer agent proposal submit <owner/repo> <proposal.json | -> --job <id>
+      What a rubric proposal agent runs: what the proposal is written from (the
+      rubric, the style notes, calibration's results, people's edits), and
+      submitting the proposed rubric with its rationale.
 "
 
 private def cmdGitHub (repo : String) (prStr : String) (jsonPath : String)
@@ -122,6 +129,10 @@ private def serveFlags : List String → Except String (Server.Config → Server
     let some n := v.toNat? | .error s!"--max-calibration-jobs-per-day: '{v}' is not a number"
     let f ← serveFlags rest
     return fun c => f { c with limits.maxCalibrationJobsPerDay := n }
+  | "--max-proposals-per-day" :: v :: rest => do
+    let some n := v.toNat? | .error s!"--max-proposals-per-day: '{v}' is not a number"
+    let f ← serveFlags rest
+    return fun c => f { c with limits.maxProposalsPerDay := n }
   | "--github-reserve" :: v :: rest => do
     let some n := v.toNat? | .error s!"--github-reserve: '{v}' is not a number of requests"
     let f ← serveFlags rest
@@ -164,7 +175,11 @@ private def cmdServe (flags : List String) : IO Unit := do
   let github ← GitHub.Client.fromEnv cfg.limits.maxDiffBytes
   if github.isNone then
     log "no DIFF_REVIEWER_GITHUB_TOKEN_FILE: no discovery, no diffs, no posting"
-  let services ← Workers.Services.new github (← Orchestra.Client.fromEnv) log cfg.limits
+  let orchestra ← Orchestra.Client.fromEnv
+  let proposer ← Orchestra.Client.fromEnv "DIFF_REVIEWER_ORCHESTRA_PROPOSER_TOKEN_FILE"
+  if orchestra.isSome && proposer.isNone then
+    log "no DIFF_REVIEWER_ORCHESTRA_PROPOSER_TOKEN_FILE: rubric proposals stay pending"
+  let services ← Workers.Services.new github orchestra log cfg.limits proposer
   Store.setPath cfg.dbPath
   -- Open (and migrate) the database before listening, so a bad path fails at start-up.
   let _ ← Platform.listRepos
@@ -187,6 +202,10 @@ def main (args : List String) : IO Unit := do
   | "agent" :: "diff" :: repo :: pr :: rest =>
     let some job := Agent.jobFlag rest | IO.print usage; IO.Process.exit 1
     IO.Process.exit (← Agent.printDiff repo pr job).toUInt8
+  | ["agent", "proposal", "show", repo, "--job", job] =>
+    IO.Process.exit (← Agent.showProposal repo job).toUInt8
+  | ["agent", "proposal", "submit", repo, path, "--job", job] =>
+    IO.Process.exit (← Agent.submitProposal repo path job).toUInt8
   | "agent" :: "submit" :: repo :: pr :: path :: rest =>
     let some job := Agent.jobFlag rest | IO.print usage; IO.Process.exit 1
     IO.Process.exit (← Agent.submit repo pr path job).toUInt8

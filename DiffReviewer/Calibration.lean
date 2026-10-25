@@ -106,7 +106,8 @@ def Sample.toJson (s : Sample) : Json :=
           ("dropped", .mkObj [("left", s.droppedLeft), ("outdated", s.droppedOutdated),
                               ("replies", s.droppedReplies)]),
           ("submittedAt", optStr s.submittedAt), ("importedAt", s.importedAt),
-          ("updatedAt", s.updatedAt)]
+          ("updatedAt", s.updatedAt), ("deleted", s.deletedAt.isSome),
+          ("deletedAt", optStr s.deletedAt)]
 
 private def natsOfRaw (raw : String) : List Nat :=
   match Json.parse raw >>= (·.getArr?) with
@@ -140,12 +141,13 @@ private def fetchSamples (owner name : String) : Sqlite.M (Array Sample) := do
     select s
   return rows.map Sample.ofRow
 
-/-- The samples of `owner/name` not deleted, the most recently reviewed first. -/
-def listSamples (owner name : String) : IO (Array Sample) := do
+/-- The samples of `owner/name` not deleted — or, with `deleted`, all of them, the deleted ones
+    marked by their `deletedAt` — the most recently reviewed first. -/
+def listSamples (owner name : String) (deleted := false) : IO (Array Sample) := do
   let all ← Store.run (fetchSamples owner name)
   -- The id breaks ties between reviews submitted in the same second, so the order is total.
   let key (s : Sample) : String := s.submittedAt.getD s.importedAt
-  return (all.filter (·.deletedAt.isNone)).qsort fun a b =>
+  return (all.filter (deleted || ·.deletedAt.isNone)).qsort fun a b =>
     key a > key b || (key a == key b && a.id > b.id)
 
 /-- The ids of `owner/name`'s deleted samples. -/
@@ -230,6 +232,9 @@ structure Import where
   error      : Option String
   requestedAt : String
   updatedAt  : String
+  /-- When GitHub's rate limit resets, while the import waits for it: refused for the limit, or
+      paused under the reserve. -/
+  resetAt    : Option String := none
 
 def Import.stat (i : Import) (k : String) : Nat := ((i.stats.lookup k).getD 0)
 
@@ -239,8 +244,8 @@ def Import.toJson (i : Import) : Json :=
           ("pullsListed", (i.pulls.map fun ps => (ps.size : Json)).getD .null),
           ("pullsRead", i.nextIndex), ("failures", i.failures),
           ("stats", .mkObj (statKeys.map fun k => (k, (i.stat k : Json)))),
-          ("error", optStr i.error), ("requestedAt", i.requestedAt),
-          ("updatedAt", i.updatedAt)]
+          ("error", optStr i.error), ("resetAt", optStr i.resetAt),
+          ("requestedAt", i.requestedAt), ("updatedAt", i.updatedAt)]
 
 private def Import.ofRow (r : Store.ImportRow) : Import :=
   let pulls := r.pulls.bind fun raw =>
@@ -250,14 +255,16 @@ private def Import.ofRow (r : Store.ImportRow) : Import :=
     | .error _ => []
   { id := r.id, owner := r.owner, name := r.name, limit := r.pull_limit.toNat
   , status := r.status, pulls, nextIndex := r.next_index.toNat, failures := r.failures.toNat
-  , stats, error := r.error, requestedAt := r.requested_at, updatedAt := r.updated_at }
+  , stats, error := r.error, requestedAt := r.requested_at, updatedAt := r.updated_at
+  , resetAt := r.reset_at }
 
 private def Import.toRow (i : Import) : Store.ImportRow :=
   { id := i.id, owner := i.owner, name := i.name, pull_limit := i.limit, status := i.status
   , pulls := i.pulls.map fun ps => (Json.arr (ps.map PullRef.toJson)).compress
   , next_index := i.nextIndex, failures := i.failures
   , stats := (Json.mkObj (i.stats.map fun (k, v) => (k, (v : Json)))).compress
-  , error := i.error, requested_at := i.requestedAt, updated_at := i.updatedAt }
+  , error := i.error, requested_at := i.requestedAt, updated_at := i.updatedAt
+  , reset_at := i.resetAt }
 
 private def fetchImports : Sqlite.M (Array Import) := do
   let rows ← HasModel.fetch <| query% do
@@ -500,11 +507,16 @@ def importPull (gh : GitHub.Client) (repo : Repo) (p : PullRef) :
       | _ => [("known", parts.size)]
   return .ok stats
 
-/-- Record `why` as the import's error, unless it is the one recorded: a failure repeated on every
-    pass is written once. -/
-private def importFailed (i : Import) (why : String) (status := i.status) : IO Unit := do
-  if i.error == some why && i.status == status then return
-  let _ ← saveImport { i with error := some why, status }
+/-- Record `why` as the import's error, with when the rate limit it waits for resets, unless they
+    are the ones recorded: a failure repeated on every pass is written once. -/
+private def importFailed (i : Import) (why : String) (status := i.status)
+    (resetAt : Option String := none) : IO Unit := do
+  if i.error == some why && i.status == status && i.resetAt == resetAt then return
+  let _ ← saveImport { i with error := some why, status, resetAt }
+
+/-- When GitHub's rate limit resets, as its last answer said. -/
+private def resetOf (gh : GitHub.Client) : IO (Option String) := do
+  return (← gh.rateLimit).map (isoOfEpoch ·.resetAt)
 
 /-- Why GitHub is not to be asked anything more for imports now, if it is not: what it said last
     leaves fewer than `reserve` requests before its limit resets. The reserve is for discovery and
@@ -531,7 +543,7 @@ private def runImport (gh : GitHub.Client) (log : String → IO Unit) (reserve :
   let mut i := i
   let mut budget := budget
   if let some why ← pausedFor gh reserve then
-    importFailed i why
+    importFailed i why (resetAt := ← resetOf gh)
     return .stop
   let pulls ← match i.pulls with
     | some ps => pure ps
@@ -542,6 +554,7 @@ private def runImport (gh : GitHub.Client) (log : String → IO Unit) (reserve :
           ({ number := p.number, title := p.title, body := p.body, baseSha := p.baseSha }
             : PullRef)
         let listed : Import := { i with pulls := some ps, status := "running", error := none,
+                                        resetAt := none,
                                         stats := addStats i.stats [("pulls", ps.size)] }
         let some i' ← saveImport listed | return .next budget
         i := i'
@@ -549,6 +562,7 @@ private def runImport (gh : GitHub.Client) (log : String → IO Unit) (reserve :
         pure ps
       | .error (.rateLimited why) =>
         importFailed i s!"GitHub's rate limit ({why}); it goes on by itself"
+          (resetAt := ← resetOf gh)
         return .stop
       | .error (.definite why) =>
         importFailed i s!"listing the closed pull requests: {why}" "failed"
@@ -559,15 +573,16 @@ private def runImport (gh : GitHub.Client) (log : String → IO Unit) (reserve :
   while i.nextIndex < pulls.size && budget > 0 do
     let some p := pulls[i.nextIndex]? | break
     if let some why ← pausedFor gh reserve then
-      importFailed i why
+      importFailed i why (resetAt := ← resetOf gh)
       return .stop
     budget := budget - 1
     let next ← match ← importPull gh repo p with
       | .ok stats =>
         pure { i with nextIndex := i.nextIndex + 1, failures := 0,
-                      stats := addStats i.stats stats, error := none }
+                      stats := addStats i.stats stats, error := none, resetAt := none }
       | .error (.rateLimited why) =>
         importFailed i s!"GitHub's rate limit ({why}); it goes on by itself"
+          (resetAt := ← resetOf gh)
         return .stop
       | .error (.retry why) =>
         if i.failures + 1 ≥ maxPullFailures then

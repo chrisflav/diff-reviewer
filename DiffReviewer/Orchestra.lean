@@ -12,6 +12,13 @@ follows the entry with `GET /api/v1/queue/{id}`. The client file on orchestra's 
 backend, the budget, that the task is read-only and which kleis spec its credentials derive from —
 so a request here names only the prompt, the pull request and the platform's own id for the work.
 
+A rubric proposal is of a repository, not of a pull request: its request names no
+`issue_number`, which orchestra takes (a task with an upstream and no issue), and its task's
+token carries no `task_issue` fact. It is queued through a client of its own
+(`DIFF_REVIEWER_ORCHESTRA_PROPOSER_TOKEN_FILE`): a request cannot name its kleis spec — the client
+file's `kleis_spec` is every task's — and a proposal's spec (`rubric-proposer`) allows routes a
+review's (`reviewer`) must not.
+
 As with `GitHub.Client`, a record of functions, so that the workers can be run against a fake.
 -/
 
@@ -23,7 +30,8 @@ structure QueueRequest where
   goal        : String
   /-- `owner/name`. -/
   upstream    : String
-  issueNumber : Nat
+  /-- The pull request; `none` for a task of the repository, a rubric proposal. -/
+  issueNumber : Option Nat
   /-- The platform's id for the work. Orchestra answers an entry it already holds for it rather
       than queueing a second, so a request whose answer was lost can be repeated. -/
   externalId  : String
@@ -38,8 +46,9 @@ structure QueueRequest where
 
 def QueueRequest.toJson (r : QueueRequest) : Json :=
   let fields : List (String × Json) :=
-    [("prompt", r.prompt), ("goal", r.goal), ("upstream", r.upstream),
-     ("issue_number", r.issueNumber), ("external_id", r.externalId)]
+    [("prompt", (r.prompt : Json)), ("goal", r.goal), ("upstream", r.upstream)] ++
+    (r.issueNumber.map fun n => [("issue_number", (n : Json))]).getD [] ++
+    [("external_id", (r.externalId : Json))]
   let fields := if r.kleisNarrow.isEmpty then fields
     else fields ++ [("kleis_narrow", .arr (r.kleisNarrow.map Json.str).toArray)]
   .mkObj (match r.checkout with
@@ -98,11 +107,11 @@ def Client.curl (url token : String) : Client :=
     cancel := fun id => do
       return (← send "POST" s!"/api/v1/queue/{id}/cancel" (some (.mkObj []))).map fun _ => () }
 
-/-- The client configured by `DIFF_REVIEWER_ORCHESTRA_URL` and
-    `DIFF_REVIEWER_ORCHESTRA_TOKEN_FILE`, or `none` unless both are set. -/
-def Client.fromEnv : IO (Option Client) := do
+/-- The client configured by `DIFF_REVIEWER_ORCHESTRA_URL` and the token file `tokenVar` names
+    (`DIFF_REVIEWER_ORCHESTRA_TOKEN_FILE` unless it says), or `none` unless both are set. -/
+def Client.fromEnv (tokenVar := "DIFF_REVIEWER_ORCHESTRA_TOKEN_FILE") : IO (Option Client) := do
   let some url ← IO.getEnv "DIFF_REVIEWER_ORCHESTRA_URL" | return none
-  let some path ← IO.getEnv "DIFF_REVIEWER_ORCHESTRA_TOKEN_FILE" | return none
+  let some path ← IO.getEnv tokenVar | return none
   return some (Client.curl url (← Http.readTokenFile path))
 
 end DiffReviewer.Orchestra
