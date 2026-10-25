@@ -361,7 +361,8 @@ reviewed, without being shown that review, and the two are compared.
    discovery never makes it `stale`. Its repository's `--max-calibration-jobs-per-day` (20 by
    default, apart from `--max-jobs-per-day`) is charged once for each job a run makes and once
    for each time a person runs a failed one again (`failed → pending`); past it either is a
-   `429`. `GET /api/v1/jobs` lists review jobs unless asked `?kind=calibration` or `?kind=all`.
+   `429`. Running a failed job again is refused (`409`) while a newer run's job reviews its
+   sample: one sample is one live job. `GET /api/v1/jobs` lists review jobs unless asked `?kind=calibration` or `?kind=all`.
 4. **Read.** When the agent submits, its draft is scored against the sample, and kept with the
    job; a draft that cannot be scored is marked `unscorable`, with why, once.
    `GET …/calibration/runs/{id}` shows each sample's result and the run's aggregate,
@@ -421,7 +422,10 @@ to divide by.
   an agent could still name an active job of another commit of the same pull request. Closing
   that needs kleis to bind the job header to a fact of the task (its orchestra `external_id`).
 - **Groups are merged as they come.** A review of a commit imported after a run scored its sample
-  joins the sample; the earlier score stays as it was, against the sample as it was then.
+  joins the sample; the earlier score stays as it was, against the sample as it was then, and is
+  marked `stale` (`scoreStale` in the run's results). Aggregates leave stale scores out and say how
+  many there were (`staleScores`); `?stale=include` on `…/runs`, `…/runs/{id}` and `…/summary`
+  takes them in. A fresh score needs a fresh run of the sample.
 - **The base is reconstructed.** It is the merge base of the base the closed pull request has now
   and the reviewed commit, which is the base GitHub's diff showed for any history but a rewritten
   base branch. A reviewed commit that a force-push left unreferenced may be gone from GitHub: it

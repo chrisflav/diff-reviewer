@@ -43,8 +43,10 @@ repository trusts (`Repo.trustedReviewers`) wrote on its past pull requests:
     given names no sample and says nothing of the person's review.
   * **Scores** (`scoreJob`, and `scorePending` on every pass). When a calibration job's review is a
     draft, the agent's first draft is scored against its sample (`DiffReviewer.Score`) and kept per
-    job and matcher version; a draft that cannot be scored is marked so, once. Runs and the
-    repository are aggregates of the scores of samples not deleted (`runJson`, `summaryJson`).
+    job and matcher version; a draft that cannot be scored is marked so, once. A score whose sample
+    a later review has since joined is marked `stale`, and kept as it was. Runs and the repository
+    are aggregates of the scores of samples not deleted, stale ones left out unless asked
+    (`runJson`, `summaryJson`).
 -/
 
 namespace DiffReviewer.Calibration
@@ -424,6 +426,14 @@ private def storeGroup (repo : Repo) (p : PullRef) (base : String) (parts : List
                  scope := scopeOf comments body (left + outdated), submittedAt, updatedAt := now }
     HasModel.save s.toRow
     markSeen repo ids "sample" (some s.id)
+    -- A score of the sample as it was is no longer of the whole of it.
+    if existing.isSome then
+      let scores ← HasModel.fetch <| query% do
+        let r ← from Store.ScoreRow
+        guard r.sample_id = s.id
+        select r
+      for r in scores do
+        unless r.stale == some true do HasModel.save { r with stale := some true }
     return if existing.isSome then "merged" else "imported"
 
 /-- Read pull request `p` of `repo`, and store what each trusted reviewer said of each commit it
@@ -502,8 +512,9 @@ private def importFailed (i : Import) (why : String) (status := i.status) : IO U
 def pausedFor (gh : GitHub.Client) (reserve : Nat) : IO (Option String) := do
   let some l ← gh.rateLimit | return none
   if l.remaining < reserve && (← nowEpoch) < l.resetAt then
-    return some s!"paused until {isoOfEpoch l.resetAt}: GitHub has {l.remaining} requests left \
-before its limit resets, under the {reserve} kept for discovery and posting (--github-reserve)"
+    -- No count in the text: it is recorded once per window, not again on every pass.
+    return some s!"paused until {isoOfEpoch l.resetAt}: GitHub's requests left before its limit \
+resets are under the {reserve} kept for discovery and posting (--github-reserve)"
   return none
 
 /-- How one import's pass ended. -/
@@ -732,7 +743,8 @@ def createRun (repo : Repo) (sampleIds : List String) (cap : Nat) :
     return .ok (run, jobs)
 
 /-- A person's `failed → pending` of calibration job `id`, read at `version`: run it again, which
-    charges the repository's cap like a new job, checked in the same transaction. -/
+    charges the repository's cap like a new job. Refused while another live job reviews the same
+    sample, as `createRun` refuses it. Both checks are in the transaction of the write. -/
 def retryJob (id : String) (version : Nat) (cap : Nat) : IO (Except RunError Job) := do
   let now ← nowIso
   let since := isoOfEpoch ((← nowEpoch) - 86400)
@@ -744,6 +756,11 @@ def retryJob (id : String) (version : Nat) (cap : Nat) : IO (Except RunError Job
     unless job.status? == some .failed do
       return .error (.conflict s!"job {id} is {job.statusRaw} and cannot be made pending from \
 here")
+    -- One sample is one live job: a newer run may have picked it since this one failed.
+    if let some other := (← fetchKindedJobs).find? fun j =>
+        j.id != id && j.sampleId.isSome && j.sampleId == job.sampleId && isLive j then
+      return .error (.conflict s!"sample {job.sampleId.getD ""} is being reviewed by job \
+{other.id}; job {id} is not run again")
     let made ← chargesSince job.owner job.name since
     if made + 1 > cap then return .error (capError s!"{job.owner}/{job.name}" made 1 cap)
     let next := { job with statusRaw := JobStatus.pending.toString, queueEntry := none
@@ -779,7 +796,7 @@ private def saveScore (job : Job) (sampleId : String) (score : Json) : IO Unit :
     ({ job_id := job.id, matcher_version := Score.matcherVersion, run_id := job.runId
      , sample_id := sampleId, owner := job.owner, name := job.name
      , rubric_version := job.rubricVersion.map Int.ofNat, score := score.compress
-     , created_at := ← nowIso } : Store.ScoreRow)
+     , created_at := ← nowIso, stale := some false } : Store.ScoreRow)
 
 /-- Score calibration job `job` against its sample, by the current matcher, unless that is done:
     the agent's first draft — what it submitted, before anything a person did — against what the
@@ -816,35 +833,45 @@ def scorePending : IO Nat := do
 
 /-! ## What is read -/
 
-/-- The aggregate of `rows`, leaving out the scores of the samples in `deleted`. -/
-private def aggregateOf (rows : Array Store.ScoreRow) (deleted : List String) : Score.Aggregate :=
-  rows.foldl (init := {}) fun a r =>
-    if deleted.contains r.sample_id then a else
+private def isStale (r : Store.ScoreRow) : Bool := r.stale == some true
+
+/-- The aggregate of `rows`, leaving out the scores of the samples in `deleted` and, unless
+    `includeStale`, the stale ones; with how many stale scores there were and whether they are
+    in. -/
+private def aggregateOf (rows : Array Store.ScoreRow) (deleted : List String)
+    (includeStale : Bool) : Json :=
+  let rows := rows.filter (!deleted.contains ·.sample_id)
+  let agg := rows.foldl (init := ({} : Score.Aggregate)) fun a r =>
+    if isStale r && !includeStale then a else
     match Json.parse r.score with
     | .ok j => (a.add j).getD a
     | .error _ => a
+  agg.toJson.setObjVal! "staleScores" ((rows.filter isStale).size : Json)
+    |>.setObjVal! "staleIncluded" includeStale
 
 /-- How many of `jobs` are in each status, as `{status: n}`. -/
 private def statusCounts (jobs : Array Job) : Json :=
   let names := (jobs.map (·.statusRaw)).toList.eraseDups
   .mkObj (names.map fun s => (s, ((jobs.filter (·.statusRaw == s)).size : Json)))
 
-/-- A run, with its aggregate — of the samples not deleted; with `detail`, each of its jobs beside
-    its sample, marked when deleted, and its score. -/
-def runJson (run : Run) (detail : Bool) : IO Json := do
+/-- A run, with its aggregate — of the samples not deleted, and of the scores not stale unless
+    `includeStale`; with `detail`, each of its jobs beside its sample, marked when deleted, and its
+    score, marked when stale. -/
+def runJson (run : Run) (detail : Bool) (includeStale := false) : IO Json := do
   let jobs := (← calibrationJobs run.owner run.name).filter (·.runId == some run.id)
   let scores := (← scoresOf run.owner run.name).filter (·.run_id == some run.id)
   let deleted ← deletedSamples run.owner run.name
   let fields : List (String × Json) :=
     [("id", run.id), ("owner", run.owner), ("name", run.name), ("createdAt", run.createdAt),
      ("samples", run.sampleIds.length), ("jobs", statusCounts jobs),
-     ("aggregate", (aggregateOf scores deleted).toJson)]
+     ("aggregate", aggregateOf scores deleted includeStale)]
   unless detail do return .mkObj fields
   let results ← jobs.mapM fun j => do
     let sample ← match j.sampleId with
       | some sid => findSample sid
       | none => pure none
-    let score := (scores.find? (·.job_id == j.id)).bind fun r => (Json.parse r.score).toOption
+    let row := scores.find? (·.job_id == j.id)
+    let score := row.bind fun r => (Json.parse r.score).toOption
     return Json.mkObj [
       ("jobId", j.id), ("status", j.statusRaw), ("error", optStr j.error),
       ("rubricVersion", (j.rubricVersion.map fun v => (v : Json)).getD .null),
@@ -853,13 +880,13 @@ def runJson (run : Run) (detail : Bool) : IO Json := do
         ("reviewer", s.reviewer), ("state", s.state), ("commitId", s.commitId),
         ("title", s.title), ("scope", s.scope), ("comments", s.comments.length),
         ("deleted", s.deletedAt.isSome)]).getD .null),
-      ("score", score.getD .null)]
+      ("score", score.getD .null), ("scoreStale", row.any isStale)]
   return .mkObj (fields ++ [("results", .arr results)])
 
-/-- The aggregate over every scored calibration job of `owner/name` whose sample is not deleted,
-    and the same for each rubric version the jobs were reviewed against (`null`: before rubrics),
-    newest version first. -/
-def summaryJson (owner name : String) : IO Json := do
+/-- The aggregate over every scored calibration job of `owner/name` whose sample is not deleted
+    (and whose score is not stale, unless `includeStale`), and the same for each rubric version
+    the jobs were reviewed against (`null`: before rubrics), newest version first. -/
+def summaryJson (owner name : String) (includeStale := false) : IO Json := do
   let deleted ← deletedSamples owner name
   let scores := (← scoresOf owner name).filter (!deleted.contains ·.sample_id)
   let versions := ((scores.map (·.rubric_version)).toList.eraseDups.toArray.qsort fun a b =>
@@ -867,9 +894,10 @@ def summaryJson (owner name : String) : IO Json := do
   return .mkObj [
     ("owner", owner), ("name", name), ("runs", (← runsOf owner name).size),
     ("samples", (← listSamples owner name).size),
-    ("overall", (aggregateOf scores []).toJson),
+    ("overall", aggregateOf scores [] includeStale),
     ("byRubricVersion", .arr (versions.map fun v =>
       Json.mkObj [("rubricVersion", (v.map fun n => (n.toNat : Json)).getD .null),
-        ("aggregate", (aggregateOf (scores.filter (·.rubric_version == v)) []).toJson)]).toArray)]
+        ("aggregate", aggregateOf (scores.filter (·.rubric_version == v)) [] includeStale)]
+      ).toArray)]
 
 end DiffReviewer.Calibration

@@ -351,6 +351,10 @@ def theImportKeepsToItsBudget : Test := withTempDb do
   Calibration.importStep f.client svc.log 100
   let paused ← importNamed st pausedId
   let pausedCalls := (← f.reviewCalls.get).size
+  -- Fewer left on the next pass, still under the reserve: nothing new is written.
+  f.limit.set (some { remaining := 450, resetAt := now + 3600 })
+  Calibration.importStep f.client svc.log 100
+  let pausedAgain ← importNamed st pausedId
   -- Past the reset, it goes on; a budget of one pull request a pass.
   f.limit.set (some { remaining := 499, resetAt := now - 1 })
   Calibration.importStep f.client svc.log 1
@@ -371,6 +375,11 @@ x-ratelimit-remaining: 0\r\nX-RateLimit-Reset: 1792866501\r\ncontent-type: appli
     ++ checkEq (resumed.getObjVal? "error" |>.toOption) (some .null) "and no error"
     ++ checkEq pausedCalls 0 "under the reserve, nothing asked"
     ++ check ((str paused ["error"]).any (·.startsWith "paused until")) "and why"
+    ++ checkEq (str pausedAgain ["error"]) (str paused ["error"])
+      "the same words on the next pass"
+    ++ checkEq (str pausedAgain ["updatedAt"]) (str paused ["updatedAt"]) "and nothing written"
+    ++ check (!(str paused ["error"]).any (fun e => (e.splitOn "499").length > 1))
+      "no count in what is stored"
     ++ checkEq budgetCalls #[11] "past the reset, one pull request in a pass of budget one"
     ++ checkEq (num budgeted ["pullsRead"]) (some 1) "and recorded"
     ++ checkEq headers.length 3 "the last answer's headers, past the proxy's"
@@ -562,6 +571,14 @@ def calibrationJobsStandApart : Test := withTempDb do
     (statusBody "pending" failed.version))
   let busySample ← runOf roomy [s201]
   let thirdCharge ← runOf roomy [s101]
+  -- It fails again, and a newer run picks its sample: running it again is refused.
+  let _ ← Platform.updateJob calId fun j => return { j with statusRaw := "failed" }
+  let some failedAgain ← Platform.findJob calId | return #["the calibration job is gone"]
+  let roomier ← State.new cfg (← services f (limits := { maxCalibrationJobsPerDay := 10 }))
+  let newerRun ← runOf roomier [s201]
+  let sibling ← route roomier (req .post s!"/api/v1/jobs/{calId}/status"
+    (statusBody "pending" failedAgain.version))
+  let some stillFailed ← Platform.findJob calId | return #["the calibration job is gone"]
   return checkStatus both 429 "two jobs past a cap of one"
     ++ checkStatus one 201 "one job within it"
     ++ checkStatus another 429 "and none after"
@@ -576,6 +593,10 @@ def calibrationJobsStandApart : Test := withTempDb do
     ++ checkEq (field retried "status") (some "pending") "it is pending again"
     ++ checkStatus busySample 409 "a run of a sample a live job is reviewing"
     ++ checkStatus thirdCharge 201 "the third charge of three: the job and its retry count"
+    ++ checkStatus newerRun 201 "a newer run of the failed job's sample"
+    ++ checkStatus sibling 409 "running the old job again, beside the newer one"
+    ++ checkEq stillFailed.statusRaw "failed" "which stays failed"
+    ++ checkEq stillFailed.version failedAgain.version "untouched"
 
 /-- With two active jobs of one commit, the agent may name only the one made last. -/
 def aSupersededJobIsNotRun : Test := withTempDb do
@@ -627,6 +648,16 @@ def runsAreAggregated : Test := withTempDb do
   let unscorable ← Calibration.scorePending
   let unscorableAgain ← Calibration.scorePending
   let badRun ← route st (req .get s!"{repoPath}/calibration/runs/{(field bad "id").getD ""}")
+  -- A later review of alice's of #13's commit joins the sample: its score is stale, as it was.
+  f.reviews.modify (·.push (13, review 302 "alice" "COMMENTED" "And this." jobHead))
+  f.comments.modify (·.push (13, comment 12 302 "RIGHT" 18 (commit := jobHead)))
+  let _ ← importId st
+  Calibration.importStep f.client svc.log 100
+  let staleRun ← route st (req .get s!"{repoPath}/calibration/runs/{runId}")
+  let staleResult := ((resultsOf staleRun).head?).getD .null
+  let staleSummary := bodyJson (← route st (req .get s!"{repoPath}/calibration/summary"))
+  let withStale := bodyJson (← route st
+    { req .get s!"{repoPath}/calibration/summary" with query := "stale=include" })
   let badScore := ((resultsOf badRun).head?.bind (·.getObjVal? "score" |>.toOption)).getD .null
   -- Deleting the sample takes its score out of the aggregates, and marks it in the run.
   let _ ← route st (req .delete s!"{repoPath}/calibration/samples/{sid}")
@@ -646,6 +677,12 @@ def runsAreAggregated : Test := withTempDb do
     ++ checkEq unscorable 1 "a draft that does not read, marked"
     ++ checkEq unscorableAgain 0 "once"
     ++ check (str badScore ["unscorable"]).isSome "the run says why"
+    ++ checkEq ((staleResult.getObjValAs? Bool "scoreStale").toOption) (some true)
+      "a score of a sample a later review joined is stale"
+    ++ checkEq (ratioOf staleResult ["score", "precision"]) (some "0.5") "and left as it was"
+    ++ checkEq (num staleSummary ["overall", "scored"]) (some 0) "left out of the summary"
+    ++ checkEq (num staleSummary ["overall", "staleScores"]) (some 1) "which says so"
+    ++ checkEq (num withStale ["overall", "scored"]) (some 1) "and in it when asked"
     ++ checkEq (num summary' ["overall", "scored"]) (some 0) "a deleted sample's score left out"
     ++ checkEq ((result'.getObjVal? "sample").toOption.bind
       (·.getObjValAs? Bool "deleted" |>.toOption)) (some true) "and marked in its run"

@@ -323,6 +323,9 @@ export interface CalibrationAggregate {
   matcherVersion: number;
   scored: number;
   commentsScored: number;
+  /** Stale scores in scope, and whether they are counted (`?stale=include`). */
+  staleScores: number;
+  staleIncluded: boolean;
   agentComments: number;
   humanComments: number;
   matched: number;
@@ -358,6 +361,8 @@ export interface CalibrationRunResult {
   } | null;
   /** Null until the job's draft is scored. */
   score: CalibrationScore | CalibrationUnscorable | null;
+  /** A review joined the sample after the score was made; the score is kept as it was. */
+  scoreStale: boolean;
 }
 
 export interface CalibrationRun {

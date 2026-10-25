@@ -493,7 +493,7 @@
       ],
       "post": {
         "summary": "Make a person's decision on a job",
-        "description": "A person's moves only: `draft → approved | rejected | stale`, `approved → draft`, `rejected → draft`, and `failed → pending` to run the review again (which clears `queueEntry` and `error`; the next attempt is queued under a new orchestra `external_id`). Queueing, running, the agent's draft and posting are the platform's own, and no request makes them — posting is asked for with `POST /api/v1/jobs/{id}/post`. Any other move is a `409`, and so is approving a job without a readable review. `409` while a post of the job may have reached GitHub (`postStartedAt` is set). A `calibration` job is never approved: `409`. Running a failed `calibration` job again (`failed → pending`) charges the repository's daily cap of calibration jobs: `429` past it.",
+        "description": "A person's moves only: `draft → approved | rejected | stale`, `approved → draft`, `rejected → draft`, and `failed → pending` to run the review again (which clears `queueEntry` and `error`; the next attempt is queued under a new orchestra `external_id`). Queueing, running, the agent's draft and posting are the platform's own, and no request makes them — posting is asked for with `POST /api/v1/jobs/{id}/post`. Any other move is a `409`, and so is approving a job without a readable review. `409` while a post of the job may have reached GitHub (`postStartedAt` is set). A `calibration` job is never approved: `409`. Running a failed `calibration` job again (`failed → pending`) charges the repository's daily cap of calibration jobs: `429` past it. It is a `409` while another live calibration job reviews the same sample.",
         "operationId": "setJobStatus",
         "requestBody": {
           "required": true,
@@ -1740,6 +1740,18 @@
               "default": 0
             },
             "description": "How many items to skip."
+          },
+          {
+            "name": "stale",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "include"
+              ]
+            },
+            "description": "`include`: count stale scores in the aggregates too. By default they are left out."
           }
         ],
         "responses": {
@@ -1831,7 +1843,21 @@
           "404": {
             "$ref": "#/components/responses/Error"
           }
-        }
+        },
+        "parameters": [
+          {
+            "name": "stale",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "include"
+              ]
+            },
+            "description": "`include`: count stale scores in the aggregates too. By default they are left out."
+          }
+        ]
       }
     },
     "/api/v1/repos/{owner}/{name}/calibration/summary": {
@@ -1874,7 +1900,21 @@
           "404": {
             "$ref": "#/components/responses/Error"
           }
-        }
+        },
+        "parameters": [
+          {
+            "name": "stale",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "include"
+              ]
+            },
+            "description": "`include`: count stale scores in the aggregates too. By default they are left out."
+          }
+        ]
       }
     },
     "/api/v1/repos/{owner}/{name}/calibration/import/{id}/cancel": {
@@ -3123,7 +3163,9 @@
           "recall",
           "byCategory",
           "bySeverity",
-          "decisions"
+          "decisions",
+          "staleScores",
+          "staleIncluded"
         ],
         "description": "Scores by the current matcher of samples not deleted, added up: counts first, every ratio computed from the sums, so each comment weighs the same.",
         "properties": {
@@ -3274,6 +3316,14 @@
           "commentsScored": {
             "type": "integer",
             "description": "Of `scored`, the jobs of `full` samples: the ones whose comments the counts, precision and recall are of. Decisions are of all."
+          },
+          "staleScores": {
+            "type": "integer",
+            "description": "Scores in scope whose sample a later review has joined since they were made: of a sample that is no longer the whole of it. Left out unless `?stale=include`."
+          },
+          "staleIncluded": {
+            "type": "boolean",
+            "description": "Whether stale scores are counted in this aggregate."
           }
         }
       },
@@ -3327,7 +3377,8 @@
                 "rubricVersion",
                 "prType",
                 "sample",
-                "score"
+                "score",
+                "scoreStale"
               ],
               "properties": {
                 "jobId": {
@@ -3396,6 +3447,10 @@
                     "null"
                   ],
                   "description": "A `CalibrationScore`, an `unscorable` record, or null until the job's draft is scored."
+                },
+                "scoreStale": {
+                  "type": "boolean",
+                  "description": "Whether the score is stale: a review joined its sample after it was made. The score is kept as it was."
                 }
               }
             }

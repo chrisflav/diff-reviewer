@@ -250,6 +250,10 @@ structure ScoreRow where
   /-- The score, as `Score.toJson`. -/
   score : String
   created_at : String
+  /-- Whether the sample has grown since — a later review of its commit by its reviewer joined
+      it — so that the score is of a sample that is no longer the whole of it. The score itself is
+      left as it was; aggregates leave a stale one out unless asked. None is `false`. -/
+  stale : Option Bool
   deriving Repr
 
 /-- Calibration's jobs are found by their kind, among every review the platform has made. -/
@@ -427,7 +431,8 @@ def migration0004 : Db.Migration.Migration where
            ("name", { type := .text, nullable := false }),
            ("rubric_version", { type := .int, nullable := true }),
            ("score", { type := .text, nullable := false }),
-           ("created_at", { type := .text, nullable := false })],
+           ("created_at", { type := .text, nullable := false }),
+           ("stale", { type := .bool, nullable := true })],
         primaryKey := ["job_id", "matcher_version"] },
     .createIndex "review_job" jobKindIndex]
 

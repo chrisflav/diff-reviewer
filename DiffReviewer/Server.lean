@@ -644,6 +644,9 @@ private def putRubric (owner name body : String) : IO Reply := do
 
 /-! ## Calibration -/
 
+/-- Whether an aggregate's query asks for stale scores too (`?stale=include`). -/
+private def staleIn (query : String) : Bool := queryParam query "stale" == some "include"
+
 /-- Answer `k` for registered repository `owner/name`, or `404`. -/
 private def withRepo (owner name : String) (k : Repo → IO Reply) : IO Reply := do
   match ← Platform.findRepo owner.toLower name.toLower with
@@ -814,15 +817,15 @@ import is cancelled"), ("import", i.toJson)]) .conflict
   | ["repos", owner, name, "calibration", "runs"], .get =>
     withRepo owner name fun repo => do
       let runs ← Calibration.runsOf repo.owner repo.name
-      page r.query (← runs.mapM (Calibration.runJson · (detail := false)))
+      page r.query (← runs.mapM (Calibration.runJson · (detail := false) (staleIn r.query)))
   | ["repos", owner, name, "calibration", "runs", id], .get =>
     withRepo owner name fun repo => do
       match ← Calibration.findRun repo.owner repo.name id with
-      | some run => return .json (← Calibration.runJson run (detail := true))
+      | some run => return .json (← Calibration.runJson run (detail := true) (staleIn r.query))
       | none => return .error "not found" .notFound
   | ["repos", owner, name, "calibration", "summary"], .get =>
     withRepo owner name fun repo => do
-      return .json (← Calibration.summaryJson repo.owner repo.name)
+      return .json (← Calibration.summaryJson repo.owner repo.name (staleIn r.query))
   | ["repos", _, _, "calibration", "import"], _ | ["repos", _, _, "calibration", "samples"], _
   | ["repos", _, _, "calibration", "import", _, "cancel"], _
   | ["repos", _, _, "calibration", "samples", _], _ | ["repos", _, _, "calibration", "runs"], _
