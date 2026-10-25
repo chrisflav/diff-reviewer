@@ -7,3 +7,4 @@ import DiffReviewerTest.Rubrics
 import DiffReviewerTest.Calibration
 import DiffReviewerTest.Style
 import DiffReviewerTest.Validity
+import DiffReviewerTest.Fanout

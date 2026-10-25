@@ -401,7 +401,10 @@ private def page (query : String) (xs : Array Json) : IO Reply := do
 private def parseBody (body : String) : Except String Json :=
   (Json.parse body).mapError (s!"the body is not valid JSON: " ++ ·)
 
-/-- Register a repository or change its settings. Every field is optional. `fromProposal` names
+/-- Register a repository or change its settings. Every field is optional. `prType` fixes the pull
+    request type of the repository's reviews (a type of its current rubric; `""` for none, the
+    agent's pick), which a fan-out needs (`DiffReviewer.Fanout`), and `maxFanout` bounds the
+    sub-runs one review fans out to; both are kept when left out. `fromProposal` names
     the rubric proposal the style notes written come from: they record its provenance, and it is
     accepted with the write. `mode` and
     `autoReview` take their defaults when left out, as they always have; `trustedReviewers` and
@@ -455,6 +458,25 @@ private def putRepo (owner name body : String) : IO Reply := do
     | .ok v => match v.getNat? with
       | .ok n => pure (some n)
       | .error _ => return .error "'version' must be a whole number" .badRequest
+  -- The fixed type must be one the rubric names now; `""` clears it.
+  let prType ← match j.getObjVal? "prType" with
+    | .error _ | .ok .null => pure none
+    | .ok (.str "") => pure (some none)
+    | .ok (.str t) =>
+      let doc := (← Platform.currentRubric owner.toLower name.toLower).bind (·.rubric?.toOption)
+      unless (doc.bind (·.findType? t)).isSome do
+        return .error s!"'prType' must name a pull request type of the repository's rubric, \
+or be \"\" for none; '{t}' is not one" .badRequest
+      pure (some (some t))
+    | .ok _ => return .error "'prType' must be a pull request type's name, or \"\"" .badRequest
+  let maxFanout ← match j.getObjVal? "maxFanout" with
+    | .error _ | .ok .null => pure none
+    | .ok v => match v.getNat? with
+      | .ok n =>
+        unless 1 ≤ n && n ≤ maxFanoutLimit do
+          return .error s!"'maxFanout' must be between 1 and {maxFanoutLimit}" .badRequest
+        pure (some n)
+      | .error _ => return .error "'maxFanout' must be a whole number" .badRequest
   -- Style notes a person wrote from a rubric proposal — after rebasing it, say — record its
   -- provenance, and the proposal is accepted with the write.
   let provenance ← match j.getObjVal? "fromProposal" with
@@ -465,12 +487,17 @@ private def putRepo (owner name body : String) : IO Reply := do
       pure (Proposal.adoptIn repo id none now)
     | .ok _ => return .error "'fromProposal' must be a proposal's id" .badRequest
   match ← Platform.putRepo owner name
-      { mode, autoReview, trustedReviewers := trusted, styleNotes, evalShare, expected
-      , provenance } with
+      { mode, autoReview, trustedReviewers := trusted, styleNotes, evalShare, prType, maxFanout
+      , expected, provenance } with
   | .ok (existed, repo) => return .json repo.toJson (if existed then .ok else .created)
   | .error (.invalid why) => return .error why .badRequest
   | .error (.conflict why) => return .error why .conflict
   | .error .notFound => return .error "not found" .notFound
+
+/-- A job as `GET` answers it: with the states of its sub-runs, when it is fanned out (empty when
+    it is not). -/
+private def jobJson (job : Job) (subs : Array Fanout.SubRun) : Json :=
+  job.toJson.setObjVal! "subRuns" (.arr (subs.map (·.toJson)))
 
 private def createJob (body : String) : IO Reply := do
   let j ← match parseBody body with
@@ -904,7 +931,7 @@ private def apiRoute (st : State) (r : Req) (segs : List String) : IO Reply := d
     else return .error "not found" .notFound
   | ["jobs"], .get =>
     -- Review jobs unless `kind` says otherwise: calibration jobs are never acted on, and are read
-    -- with their runs.
+    -- with their runs. A fan-out job carries its sub-runs.
     let kind := queryParam r.query "kind"
     let keep ← match kind with
       | none | some "review" => pure fun (j : Job) => j.isReview
@@ -913,11 +940,13 @@ private def apiRoute (st : State) (r : Req) (segs : List String) : IO Reply := d
       | some "all" => pure fun (_ : Job) => true
       | some k =>
         return .error s!"'kind' must be review, calibration, proposal or all, not '{k}'" .badRequest
-    return .json (items (((← Platform.listJobs).filter keep).map (·.toJson)))
+    let subs ← Fanout.currentByJob
+    return .json (items (((← Platform.listJobs).filter keep).map fun j =>
+      jobJson j ((subs.lookup j.id).getD #[])))
   | ["jobs"], .post => createJob r.body
   | ["jobs", id], .get =>
     match ← Platform.findJob id with
-    | some j => return .json j.toJson
+    | some j => return .json (jobJson j (← Fanout.current j.id))
     | none   => return .error "not found" .notFound
   | ["jobs", id, "review"], .put => putReview id r.body
   | ["jobs", id, "status"], .post => setStatus st id r.body
@@ -1054,6 +1083,10 @@ def agentSegments (path : String) : Option (List String) :=
     running: guessing would let the run of a superseded head take over the review of the new one.
     A job of another kind — a rubric proposal — is refused (`404`): it has routes of its own.
 
+    A fan-out job is run by its sub-runs, each named `<job>.<key>` (`DiffReviewer.Fanout`): a
+    request naming the job alone is refused (`409`), and one naming a sub-run must name one of its
+    current round that is `queued` or `running`. The answer is the job and the sub-run named.
+
     kleis binds an agent's requests to its task's pull request, not to its job, so an agent could
     name another active job of the same pull request. Of the active jobs at one commit, only the one
     made last (to the second, as creation times are kept) is answered: an older run of that commit —
@@ -1062,22 +1095,37 @@ def agentSegments (path : String) : Option (List String) :=
     same pull request can still be named; closing that needs kleis to bind the header to a fact of
     the task (its orchestra `external_id`), which it does not have. -/
 private def activeJob (owner name : String) (pr : Nat) (jobId : Option String) :
-    IO (Except Reply Job) := do
-  let some id := jobId
+    IO (Except Reply (Job × Option Fanout.SubRun)) := do
+  let some ref := jobId
     | return .error (Reply.error "name the job you run: X-Diff-Reviewer-Job (`--job <id>`, as \
 the prompt gives it)" .badRequest)
+  -- A sub-run of a fan-out is named `<job>.<key>`.
+  let (id, key) := match ref.splitOn "." with
+    | i :: k :: rest => (i, some (".".intercalate (k :: rest)))
+    | _ => (ref, none)
   let active := (← Platform.jobsOfPull owner.toLower name.toLower pr).filter fun j =>
     (j.status? == some .queued || j.status? == some .running) &&
       (j.isReview || j.kind? == some .calibration)
-  return match active.find? (·.id == id) with
-    | some j =>
-      -- Made later, to the second: two jobs made in one second are both answered.
-      match active.find? fun k => k.headSha == j.headSha && k.createdAt > j.createdAt with
-      | some newer => .error (Reply.error s!"job {id} has been superseded by job {newer.id}, a \
-newer review of the same commit; it is not run" .conflict)
-      | none => .ok j
-    | none => .error (Reply.error s!"job {id} is not a review of {owner}/{name}#{pr} being run"
+  let some j := active.find? (·.id == id)
+    | return .error (Reply.error s!"job {id} is not a review of {owner}/{name}#{pr} being run"
         .notFound)
+  -- Made later, to the second: two jobs made in one second are both answered.
+  if let some newer := active.find? fun k => k.headSha == j.headSha && k.createdAt > j.createdAt
+  then
+    return .error (Reply.error s!"job {id} has been superseded by job {newer.id}, a newer review \
+of the same commit; it is not run" .conflict)
+  let subs ← Fanout.current j.id
+  match key with
+  | none =>
+    if subs.isEmpty then return .ok (j, none)
+    return .error (Reply.error s!"job {id} is reviewed in sub-runs, one per category: name yours, \
+`--job {id}.<key>`, as your prompt gives it" .conflict)
+  | some k =>
+    match subs.find? (·.key == k) with
+    | some sub =>
+      if sub.status == "queued" || sub.status == "running" then return .ok (j, some sub)
+      return .error (Reply.error s!"sub-run {ref} is {sub.status}, not being run" .notFound)
+    | none => return .error (Reply.error s!"job {id} has no sub-run '{k}' being run" .notFound)
 
 /-- The repository's current rubric, as its version and document: `none` when it has none, and a
     `409` reply when this build cannot read it — the agent is not to review by a default the
@@ -1102,16 +1150,63 @@ private def agentJobJson (job : Job) (rubric : Option (Nat × Rubric)) (styleNot
           ("rubricVersion", (rubric.map (·.1)).getD 0),
           ("examples", .arr (examples.map (·.toJson)))]
 
-/-- The first read of a queued job is the run starting: it moves to `running`. The examples of
-    the repository's review style leave out every sample of the job's pull request
-    (`Style.examplesFor`). -/
-private def agentShow (job : Job) : IO Reply := do
-  let rubric ← match ← agentRubric job with
+/-- The type `repo` fixes for its reviews (`Repo.prType`), when `doc` still names it: a type the
+    rubric has dropped since is no longer fixed, and the agent picks again. -/
+private def fixedType (repo : Repo) (doc : Option Rubric) : Option String :=
+  repo.prType.filter fun t => (doc.bind (·.findType? t)).isSome
+
+/-- The rubric a fan-out job's sub-runs review by: the version it was fanned out under, which every
+    sub-run is shown and checked against, whatever the rubric has become since. -/
+private def fanoutRubric (job : Job) : IO (Except Reply (Option (Nat × Rubric))) := do
+  let some v := job.rubricVersion | return .ok none
+  if v == 0 then return .ok none
+  let some rv ← Platform.rubricAt job.owner job.name v | return .ok none
+  match rv.rubric? with
+  | .ok d => return .ok (some (v, d))
+  | .error e => return .error (.error s!"the rubric of {job.owner}/{job.name} (version {v}) \
+cannot be read by this build ({e}); the review waits for it to be fixed" .conflict)
+
+/-- What a sub-run is told beside the job: its scope, at the end of its instructions and as
+    `subRun`, and the type its review is of (`prType`), which the platform fixed. -/
+private def withScope (answer : Json) (job : Job) (scope : Workers.Scope) : Json :=
+  let instructions := (answer.getObjValAs? String "instructions").toOption.getD ""
+  answer.setObjVal! "instructions" (instructions ++ Workers.scopeInstructions scope)
+    |>.setObjVal! "prType" ((job.prType.map Json.str).getD .null)
+    |>.setObjVal! "subRun" (.mkObj [
+      ("key", scope.sub.key), ("id", scope.sub.agentId),
+      ("category", ((scope.category.map (·.name)).map Json.str).getD .null),
+      ("description", ((scope.category.map (·.description)).map Json.str).getD .null),
+      ("others", .arr (scope.others.map Json.str).toArray)])
+
+/-- The first read of a queued job is the run starting: it moves to `running`; so does a sub-run,
+    and its job with it. The examples of the repository's review style leave out every sample of
+    the job's pull request (`Style.examplesFor`). A sub-run is shown the rubric its job fanned out
+    under, and its scope. -/
+private def agentShow (job : Job) (sub : Option Fanout.SubRun) : IO Reply := do
+  let rubric ← match ← (if sub.isSome then fanoutRubric job else agentRubric job) with
     | .ok r => pure r
     | .error reply => return reply
   let some repo ← Platform.findRepo job.owner job.name | return .error "not found" .notFound
   let examples ← Style.examplesFor repo job
-  let answer (j : Job) := agentJobJson j rubric repo.styleNotes examples
+  let scope ← match sub with
+    | some s => pure ((← Workers.scopesOf job (← Fanout.current job.id)).find? (·.sub.id == s.id))
+    | none => pure none
+  let fixed := fixedType repo (rubric.map (·.2))
+  let answer (j : Job) :=
+    let a := agentJobJson j rubric repo.styleNotes examples
+    match scope, fixed with
+    | some sc, _ => withScope a j sc
+    | none, some t =>
+      let instructions := (a.getObjValAs? String "instructions").toOption.getD ""
+      a.setObjVal! "prType" t |>.setObjVal! "instructions" (instructions ++ s!"\n\n# The pull \
+request type\n\nThe repository fixes the type of its reviews: `{t}`. Review by its rubric, and \
+submit with `prType` `{t}`.")
+    | none, none => a
+  if let some s := sub then
+    if s.status == "queued" then
+      let _ ← Fanout.update s.id fun _ cur => do
+        unless cur.status == "queued" || cur.status == "running" do throw "moved on"
+        return { cur with status := "running" }
   -- The notes version the agent is given, recorded as the rubric's is on submission: what its
   -- score is judged derived by. Written only when it changes, or the job starts.
   let notes := some repo.styleNotesVersion
@@ -1168,15 +1263,76 @@ private def agentProposalSubmit (repo : Repo) (job : Job) (body : String) : IO R
   | .error (.conflict why) => return .error why .conflict
   | .error (.invalid why) => return .error why .badRequest
 
+/-- A sub-run's partial review, checked as the agent's review is — against the rubric version its
+    job fanned out under, with `prType` the job's (or left out) — and, for a category's sub-run,
+    with every comment of its category. It is kept on the sub-run, not the job: once every sub-run
+    is in, the platform merges them into the job's draft (`Workers.settleFanout`), which may be at
+    once. -/
+private def subRunSubmit (st : State) (job : Job) (sub : Fanout.SubRun) (body : String) :
+    IO Reply := do
+  let j ← match parseBody body with
+    | .ok j => pure j
+    | .error e => return .error e .badRequest
+  let some headSha := (j.getObjValAs? String "headSha").toOption
+    | return .error "the body must name the 'headSha' that was reviewed" .badRequest
+  match j.getObjVal? "prType" with
+  | .error _ | .ok .null => if job.prType.isSome then
+      return .error s!"'prType' is '{job.prType.getD ""}', the type this review is of" .badRequest
+  | .ok (.str t) => unless job.prType == some t do
+      return .error s!"'prType' is {(job.prType.map (s!"'{·}'")).getD "null"}, the type this \
+review is of, not '{t}'" .badRequest
+  | .ok _ => return .error "'prType' must be a string or null" .badRequest
+  let review ← match j.getObjVal? "review" >>= Review.ofJson with
+    | .ok r => pure r
+    | .error e => return .error s!"'review' is not a review: {e}" .badRequest
+  if let .error e := review.validate then return .error s!"'review': {e}" .badRequest
+  let rubric ← match ← fanoutRubric job with
+    | .ok r => pure r
+    | .error reply => return reply
+  let doc := (rubric.map (·.2)).getD {}
+  match sub.category with
+  | some c =>
+    for (cm, i) in review.comments.zipIdx do
+      unless cm.category == some c do
+        return .error s!"'review': comment {i + 1}: this review covers the category '{c}' only; \
+give every comment the category '{c}'" .badRequest
+  | none =>
+    if let .error e := review.checkCategories (doc.categoriesFor job.prType) then
+      return .error s!"'review': {e}" .badRequest
+  if let .ok (_, d) ← Workers.diffOf st.services job then
+    if let .error e := Diff.check review d then return .error s!"'review': {e}" .badRequest
+  let review ← review.assignIds
+  let headSha := headSha.toLower
+  let submitted ← Fanout.update sub.id fun j cur => do
+    unless cur.status == "running" do
+      throw s!"sub-run {cur.agentId} is {cur.status}, not running; run `diff-reviewer agent show` \
+first"
+    unless j.status? == some .queued || j.status? == some .running do
+      throw s!"job {j.id} is {j.statusRaw}, not being run"
+    unless j.headSha == some headSha do
+      throw s!"the review is of {headSha}, but job {j.id} is of {j.headSha.getD "no commit"}"
+    return { cur with status := "submitted", reviewRaw := some review.toJson.compress
+                      error := none }
+  if let .error why := submitted then return .error why .conflict
+  Workers.settleFanout st.services job.id
+  let after := (← Platform.findJob job.id).getD job
+  return .json (.mkObj [("jobId", job.id), ("subRun", sub.key), ("subRunStatus", "submitted"),
+                        ("status", after.statusRaw),
+                        ("error", (after.error.map Json.str).getD .null)])
+
 /-- The agent's review. The body is `{"headSha", "prType", "review"}`; the job must be running and
     at that head. `prType` must be a type of the repository's current rubric (or `null` when it
-    names none) and every comment's category one of that type's; the job records the type and the
+    names none) — the one the repository fixes (`Repo.prType`), when it fixes one — and every
+    comment's category one of that type's; the job records the type and the
     rubric's version, comments without an id are given one, and the review is the first revision
     of the job's history. A `direct` repository's review is then posted at once; if that fails the
     job is left `approved` with the reason, for a person to post again, and the submission still
     stands. A calibration job's review is never posted, in any mode: it is scored against its
-    sample instead. -/
-private def agentSubmit (st : State) (job : Job) (body : String) : IO Reply := do
+    sample instead. A sub-run of a fan-out submits its partial review instead
+    (`subRunSubmit`). -/
+private def agentSubmit (st : State) (job : Job) (sub : Option Fanout.SubRun) (body : String) :
+    IO Reply := do
+  if let some s := sub then return ← subRunSubmit st job s body
   let j ← match parseBody body with
     | .ok j => pure j
     | .error e => return .error e .badRequest
@@ -1195,6 +1351,11 @@ private def agentSubmit (st : State) (job : Job) (body : String) : IO Reply := d
     | .error reply => return reply
   let doc := (rubric.map (·.2)).getD {}
   if let .error e := doc.checkPrType prType then return .error e .badRequest
+  if let some repo ← Platform.findRepo job.owner job.name then
+    if let some t := fixedType repo (rubric.map (·.2)) then
+      unless prType == some t do
+        return .error s!"'prType' must be '{t}': the repository fixes the type of its reviews"
+          .badRequest
   if let .error e := review.checkCategories (doc.categoriesFor prType) then
     return .error s!"'review': {e}" .badRequest
   -- GitHub refuses a comment off the diff; the agent is told now, while it can still fix it.
@@ -1214,19 +1375,7 @@ show` first")
   let job ← match drafted with
     | .ok j => pure j
     | .error e => return updateReply (.error e)
-  if job.kind? == some .calibration then
-    try
-      let _ ← Calibration.scoreJob job
-    catch e =>
-      -- The workers score it on their next pass.
-      IO.eprintln s!"diff-reviewer: scoring job {job.id}: {e}"
-  let job ← match ← Platform.findRepo job.owner job.name with
-    | some repo =>
-      if repo.mode != .direct || !job.isReview then pure job else
-      match ← Workers.postDirect st.services job.id job.version with
-      | .ok j => pure j
-      | .error _ => pure ((← Platform.findJob job.id).getD job)
-    | none => pure job
+  let job ← Workers.afterDraft st.services job
   return .json (.mkObj [("jobId", job.id), ("status", job.statusRaw),
                         ("error", (job.error.map Json.str).getD .null)])
 
@@ -1239,10 +1388,10 @@ private def agentRoute (st : State) (r : Req) : IO Reply := do
   let some segs := agentSegments r.path | return .error "not found" .notFound
   if r.method == .post && !isJsonContentType (r.header "content-type") then
     return .error "writes must be sent as application/json" .unsupportedMediaType
-  let pull (owner name pr : String) (k : Job → IO Reply) : IO Reply := do
+  let pull (owner name pr : String) (k : Job → Option Fanout.SubRun → IO Reply) : IO Reply := do
     let some n := pr.toNat? | return .error "not found" .notFound
     match ← activeJob owner name n (r.header "x-diff-reviewer-job") with
-    | .ok job => k job
+    | .ok (job, sub) => k job sub
     | .error reply => return reply
   let proposal (owner name id : String) (k : Repo → Job → IO Reply) : IO Reply := do
     match ← activeProposal owner name id (live := r.method != .post) with
@@ -1250,8 +1399,9 @@ private def agentRoute (st : State) (r : Req) : IO Reply := do
     | .error reply => return reply
   match segs, r.method with
   | ["repos", o, n, "pulls", pr], .get => pull o n pr agentShow
-  | ["repos", o, n, "pulls", pr, "diff"], .get => pull o n pr (diffReply st · (text := true))
-  | ["repos", o, n, "pulls", pr, "review"], .post => pull o n pr (agentSubmit st · r.body)
+  | ["repos", o, n, "pulls", pr, "diff"], .get =>
+    pull o n pr fun job _ => diffReply st job (text := true)
+  | ["repos", o, n, "pulls", pr, "review"], .post => pull o n pr (agentSubmit st · · r.body)
   | ["repos", o, n, "proposals", id], .get => proposal o n id agentProposalShow
   | ["repos", o, n, "proposals", id], .post =>
     proposal o n id (agentProposalSubmit · · r.body)

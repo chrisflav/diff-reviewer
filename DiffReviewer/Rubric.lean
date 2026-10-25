@@ -17,6 +17,12 @@ type's categories with a severity. Its submission names the type, which must be 
 document's (or `null` when there are none), and the job records the type and the version of the
 document it was checked against.
 
+A type, and the document for its default rubric, may ask for **fan-out** (`fanout: true`): its
+reviews are run as one sub-run per category plus one by the default rubric, side by side, and
+merged (`DiffReviewer.Fanout`). The agent picks a pull request's type while it reviews, so a
+fan-out needs the type before anything is queued: it is the repository's fixed type
+(`Repo.prType`), when it sets one (`fanoutPlan`).
+
 As reviews do, a document keeps the fields this build does not know — on the document, a type or
 a category — in `extra`, and writes them back: a document a newer build (or a newer front-end)
 wrote passes through this one, a `PUT` included, without losing them.
@@ -42,6 +48,8 @@ structure PrType where
   /-- How to review a pull request of this type, in markdown; on top of the default rubric. -/
   rubric      : String := ""
   categories  : List Category := []
+  /-- Whether a review of this type is run as one sub-run per category, plus the default. -/
+  fanout      : Bool := false
   extra       : List (String × Json) := []
   deriving Repr, BEq
 
@@ -49,10 +57,18 @@ structure Rubric where
   /-- How to review any pull request of the repository, in markdown. -/
   defaultRubric : String := ""
   prTypes       : List PrType := []
+  /-- Whether every review of the repository is run as sub-runs, one per category of its type
+      plus the default. -/
+  fanout        : Bool := false
   extra         : List (String × Json) := []
   deriving Repr, BEq
 
--- The unknown fields first, so that a known field is never shadowed by one of them.
+-- The unknown fields first, so that a known field is never shadowed by one of them. `fanout` is
+-- written only when it is on, so that a document that never asked for it reads back as it was.
+
+/-- `[("fanout", true)]` when `on`, and nothing otherwise. -/
+private def fanoutField (on : Bool) : List (String × Json) :=
+  if on then [("fanout", true)] else []
 
 def Category.toJson (c : Category) : Json :=
   let known : List (String × Json) := [("name", c.name), ("description", c.description)]
@@ -62,12 +78,12 @@ def PrType.toJson (t : PrType) : Json :=
   let known : List (String × Json) :=
     [("name", t.name), ("description", t.description), ("rubric", t.rubric),
      ("categories", .arr (t.categories.map Category.toJson).toArray)]
-  .mkObj (t.extra ++ known)
+  .mkObj (t.extra ++ known ++ fanoutField t.fanout)
 
 def Rubric.toJson (r : Rubric) : Json :=
   let known : List (String × Json) :=
     [("defaultRubric", r.defaultRubric), ("prTypes", .arr (r.prTypes.map PrType.toJson).toArray)]
-  .mkObj (r.extra ++ known)
+  .mkObj (r.extra ++ known ++ fanoutField r.fanout)
 
 /-- Field `k` of `j`, a string; absent is `""`. `null` is refused rather than read as empty: a
     document that says `null` where a rubric goes is a mistake, not an empty rubric. -/
@@ -84,6 +100,13 @@ private def arrField (j : Json) (k : String) (what : String) : Except String (Li
   | .ok (.arr xs) => .ok xs.toList
   | .ok _ => .error s!"{what}: '{k}' must be an array"
 
+/-- Field `k` of `j`, a boolean; absent is `false`, and `null` refused, as by `strField`. -/
+private def boolField (j : Json) (k : String) (what : String) : Except String Bool :=
+  match j.getObjVal? k with
+  | .error _ => .ok false
+  | .ok (.bool b) => .ok b
+  | .ok _ => .error s!"{what}: '{k}' must be true or false"
+
 def Category.ofJson (j : Json) (what : String) : Except String Category := do
   let some name := (j.getObjValAs? String "name").toOption
     | throw s!"{what} must have a 'name'"
@@ -97,8 +120,8 @@ def PrType.ofJson (j : Json) (what : String) : Except String PrType := do
   let categories ← (← arrField j "categories" what).zipIdx.mapM fun (c, i) =>
     Category.ofJson c s!"{what}, category {i + 1}"
   return { name, description := ← strField j "description" what
-         , rubric := ← strField j "rubric" what, categories
-         , extra := unknownFields j ["name", "description", "rubric", "categories"] }
+         , rubric := ← strField j "rubric" what, categories, fanout := ← boolField j "fanout" what
+         , extra := unknownFields j ["name", "description", "rubric", "categories", "fanout"] }
 
 /-- The document in `j`. `ignore` names fields that are not the document's — the `version` a write
     carries beside it — and are neither read nor kept. -/
@@ -107,7 +130,8 @@ def Rubric.ofJson (j : Json) (ignore : List String := []) : Except String Rubric
   let prTypes ← (← arrField j "prTypes" "the document").zipIdx.mapM fun (t, i) =>
     PrType.ofJson t s!"pull request type {i + 1}"
   return { defaultRubric := ← strField j "defaultRubric" "the document", prTypes
-         , extra := unknownFields j (["defaultRubric", "prTypes"] ++ ignore) }
+         , fanout := ← boolField j "fanout" "the document"
+         , extra := unknownFields j (["defaultRubric", "prTypes", "fanout"] ++ ignore) }
 
 /-- The most pull request types a document may name, and categories a type may. -/
 def maxPrTypes : Nat := 50
@@ -157,6 +181,32 @@ def Rubric.categoriesFor (r : Rubric) (prType : Option String) : List String :=
   match prType.bind r.findType? with
   | some t => t.categories.map (·.name)
   | none => (r.prTypes.flatMap (·.categories.map (·.name))).eraseDups
+
+/-- What a fan-out review is run as: the type its sub-runs are of, and the categories, one sub-run
+    each beside the default's. -/
+structure FanoutPlan where
+  prType     : Option String
+  categories : List Category
+  deriving Repr, BEq
+
+/-- How many sub-runs the plan makes: one per category, and the default. -/
+def FanoutPlan.size (p : FanoutPlan) : Nat := p.categories.length + 1
+
+/-- How a review under `r` is fanned out, or `none` when it is one run. `fixed` is the type the
+    repository fixes for its reviews (`Repo.prType`): the agent picks a type only while it
+    reviews, and a fan-out has to know it before anything is queued. It fans out when the fixed
+    type asks for it, or when the document does (`fanout` beside the default rubric); its
+    categories are the fixed type's, or — with no type fixed, or one the document no longer
+    names — every category of the document, as a review of no type may use. -/
+def Rubric.fanoutPlan (r : Rubric) (fixed : Option String) : Option FanoutPlan :=
+  let t := fixed.bind r.findType?
+  if !(r.fanout || t.any (·.fanout)) then none
+  else
+    let categories := match t with
+      | some t => t.categories
+      | none => (r.prTypes.flatMap (·.categories)).foldl
+          (fun acc c => if acc.any (·.name == c.name) then acc else acc ++ [c]) []
+    some { prType := t.map (·.name), categories }
 
 /-- Why `prType` is not a type a submission under `r` may name, if it is not: one of the
     document's types, or `null` when it names none. -/

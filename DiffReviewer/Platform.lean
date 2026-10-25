@@ -81,6 +81,13 @@ def PostingMode.ofString? : String → Option PostingMode
   | "direct" => some .direct
   | _        => none
 
+/-- The most sub-runs a fan-out review makes unless the repository says otherwise. -/
+def defaultMaxFanout : Nat := 8
+
+/-- The largest `maxFanout` a repository may set: a sub-run for every category a type may have,
+    and the default. -/
+def maxFanoutLimit : Nat := maxCategories + 1
+
 structure Repo where
   owner      : String
   name       : String
@@ -101,6 +108,13 @@ structure Repo where
   /-- The version of the style notes (`notesAt`), which records what they were derived from; 0
       before any. -/
   styleNotesVersion : Nat := 0
+  /-- The pull request type every review of the repository is of, fixed by the operator: the
+      agent does not pick one, and a type with `fanout` fans out (`Rubric.fanoutPlan`). `none`
+      lets the agent pick. -/
+  prType     : Option String := none
+  /-- The most sub-runs one fan-out review may make; a review that would make more is refused
+      (`failed`, with why). -/
+  maxFanout  : Nat := defaultMaxFanout
   /-- Incremented by every write of the settings, so that a stale page is refused (`409`) rather
       than overwriting what it never saw. -/
   version    : Nat := 1
@@ -115,6 +129,7 @@ def Repo.toJson (r : Repo) : Json :=
           ("trustedReviewers", .arr (r.trustedReviewers.map Json.str).toArray),
           ("styleNotes", r.styleNotes), ("evalShare", r.evalShare),
           ("styleNotesVersion", r.styleNotesVersion),
+          ("prType", (r.prType.map Json.str).getD .null), ("maxFanout", r.maxFanout),
           ("version", r.version), ("createdAt", r.createdAt)]
 
 /-- The strings a column holding a JSON array of strings holds; anything else is none. -/
@@ -136,6 +151,8 @@ private def Repo.ofRow (row : Store.RepoRow) : Repo :=
   , styleNotes := row.style_notes.getD ""
   , evalShare := (row.eval_share.getD 50).toNat
   , styleNotesVersion := (row.style_notes_version.getD 0).toNat
+  , prType := row.pr_type.filter (!·.isEmpty)
+  , maxFanout := (row.max_fanout.map (·.toNat)).getD defaultMaxFanout
   , version := (row.version.getD 1).toNat }
 
 /-- The repository as its row, for a write. -/
@@ -144,7 +161,8 @@ private def Repo.toRow (r : Repo) : Store.RepoRow :=
   , auto_review := some r.autoReview
   , trusted_reviewers := some (Json.arr (r.trustedReviewers.map Json.str).toArray).compress
   , style_notes := some r.styleNotes, eval_share := some r.evalShare
-  , style_notes_version := some r.styleNotesVersion, version := some r.version }
+  , style_notes_version := some r.styleNotesVersion, pr_type := r.prType
+  , max_fanout := some r.maxFanout, version := some r.version }
 
 /-! ## Provenance -/
 
@@ -425,7 +443,8 @@ def RubricVersion.toJson (r : RubricVersion) : Json :=
   match r.rubric? with
   | .ok doc =>
     let known : List (String × Json) := [("defaultRubric", doc.defaultRubric),
-      ("prTypes", .arr (doc.prTypes.map PrType.toJson).toArray), ("documentError", .null)]
+      ("prTypes", .arr (doc.prTypes.map PrType.toJson).toArray), ("fanout", doc.fanout),
+      ("documentError", .null)]
     .mkObj (doc.extra ++ fields ++ known)
   | .error e =>
     let known : List (String × Json) :=
@@ -442,7 +461,7 @@ def RubricVersion.fields : List String :=
 def RubricVersion.none (owner name : String) : Json :=
   .mkObj [("owner", owner), ("name", name), ("version", (0 : Nat)), ("createdAt", .null),
           ("derivedFrom", .arr #[]), ("derivedFromPulls", .arr #[]), ("defaultRubric", ""),
-          ("prTypes", .arr #[]), ("documentError", .null)]
+          ("prTypes", .arr #[]), ("fanout", false), ("documentError", .null)]
 
 private def RubricVersion.ofRow (row : Store.RubricRow) : RubricVersion :=
   { owner := row.owner, name := row.name, version := row.version.toNat
@@ -526,6 +545,9 @@ structure RepoUpdate where
   trustedReviewers : Option (List String) := none
   styleNotes       : Option String := none
   evalShare        : Option Nat := none
+  /-- The fixed pull request type: `some none` clears it. -/
+  prType           : Option (Option String) := none
+  maxFanout        : Option Nat := none
   /-- Run first in the write's transaction: what the style notes written are derived from (a
       rubric proposal they came from, which it marks accepted), or why nothing is to be written —
       `invalid` for a request that names no such proposal, `conflict` for one it may not use. -/
@@ -623,7 +645,8 @@ were read (version {v}, now {current}); reload them"
     let repo : Repo :=
       { old with mode := u.mode.getD old.mode, autoReview := u.autoReview.getD old.autoReview
                  trustedReviewers := trusted, styleNotes := u.styleNotes.getD old.styleNotes
-                 evalShare := u.evalShare.getD old.evalShare, version := old.version + 1 }
+                 evalShare := u.evalShare.getD old.evalShare, prType := u.prType.getD old.prType
+                 maxFanout := u.maxFanout.getD old.maxFanout, version := old.version + 1 }
     let prov ← match ← u.provenance with
       | .ok p => pure p
       | .error why => return .error why

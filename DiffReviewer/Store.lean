@@ -45,6 +45,12 @@ structure RepoRow where
   /-- The version of the style notes the repository has (`NotesRow`), whose provenance a job's
       agent saw (`0005`); none is none yet. -/
   style_notes_version : Option Int
+  /-- The pull request type every review of the repository is of, fixed by the operator rather
+      than picked by the agent — what a fan-out needs before it is queued (`0006`); none lets the
+      agent pick. -/
+  pr_type : Option String
+  /-- The most sub-runs one fan-out review may make (`0006`); none is 8. -/
+  max_fanout : Option Int
   deriving Repr
 
 /-- One review of one pull request at one head commit: queued, run, drafted, approved, posted. -/
@@ -351,6 +357,41 @@ structure NotesRow where
   created_at : String
   deriving Repr
 
+/-- One sub-run of a fan-out review (`0006`): the review of one category of the job's pull request
+    type, or the default review beside them, run as an orchestra task of its own and submitted as
+    a partial review, which the platform merges with the others into the job's draft. A job
+    fanned out again — a person ran a failed one again — has a new `round`; the old rows stay, and
+    count towards the day's spend. -/
+@[model (dbName := "fanout_run") (primaryKey := ["id"]) reviewdb]
+structure SubRunRow where
+  id : String
+  job_id : String
+  owner : String
+  name : String
+  /-- The job's attempt the fan-out was made at: the current sub-runs are the latest round's. -/
+  round : Int
+  /-- Its place in the merge: the default first, then the categories as the rubric lists them. -/
+  position : Int
+  /-- Unique within the round, made of the category's name: what the agent names it by (`--job
+      <job>.<key>`), and the end of its orchestra `external_id`. -/
+  key : String
+  /-- The category it reviews; none for the default review. -/
+  category : Option String
+  /-- `pending`, `queued`, `running`, `submitted`, `failed` or `cancelled`. -/
+  status : String
+  queue_entry : Option String
+  /-- How many times it has been queued on orchestra. -/
+  attempts : Int
+  /-- What its orchestra `external_id`s start with: the job's own for the attempt that fanned
+      out. -/
+  external_base : String
+  /-- The partial review it submitted, as `Review.toJson`. -/
+  review : Option String
+  error : Option String
+  created_at : String
+  updated_at : String
+  deriving Repr
+
 /-- Calibration's jobs are found by their kind, among every review the platform has made. -/
 def jobKindIndex : TableIndex String :=
   { name := "idx_review_job_kind", keys := [{ column := "kind" }] }
@@ -595,9 +636,37 @@ def migration0005 : Db.Migration.Migration where
            ("accepted_version", { type := .int, nullable := true })],
         primaryKey := ["id"] }]
 
+/-- `0006_m5`: fan-out — a repository's fixed pull request type and its bound on sub-runs, and the
+    sub-runs of each fan-out review. The new columns are nullable: a repository written before
+    lets the agent pick its type and may fan out to 8 sub-runs. -/
+def migration0006 : Db.Migration.Migration where
+  name := "0006_m5"
+  steps := [
+    .addColumn "repo" "pr_type" { type := .text, nullable := true },
+    .addColumn "repo" "max_fanout" { type := .int, nullable := true },
+    .createTable "fanout_run"
+      { columns := .ofList
+          [("id", { type := .text, nullable := false }),
+           ("job_id", { type := .text, nullable := false }),
+           ("owner", { type := .text, nullable := false }),
+           ("name", { type := .text, nullable := false }),
+           ("round", { type := .int, nullable := false }),
+           ("position", { type := .int, nullable := false }),
+           ("key", { type := .text, nullable := false }),
+           ("category", { type := .text, nullable := true }),
+           ("status", { type := .text, nullable := false }),
+           ("queue_entry", { type := .text, nullable := true }),
+           ("attempts", { type := .int, nullable := false }),
+           ("external_base", { type := .text, nullable := false }),
+           ("review", { type := .text, nullable := true }),
+           ("error", { type := .text, nullable := true }),
+           ("created_at", { type := .text, nullable := false }),
+           ("updated_at", { type := .text, nullable := false })],
+        primaryKey := ["id"] }]
+
 /-- The migrations, in the order they are applied. Appended to, never edited. -/
 def migrations : List Db.Migration.Migration :=
-  [migration0001, migration0002, migration0003, migration0004, migration0005]
+  [migration0001, migration0002, migration0003, migration0004, migration0005, migration0006]
 
 /-- Where the database is. Set once at start-up (`serve --db`), and by the tests. -/
 initialize pathRef : IO.Ref System.FilePath ← IO.mkRef (System.FilePath.mk "diff-reviewer.db")
