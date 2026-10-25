@@ -7,6 +7,7 @@ import {
   freeze,
   fromJson,
   KEY,
+  MAX_COMMENTS,
   mergeComment,
   parseReview,
   placeComments,
@@ -121,11 +122,11 @@ describe("commentProblem", () => {
 describe("parseReview", () => {
   it("reads a review and refuses what is not one", () => {
     const ok = parseReview(
-      '{"decision":"comment","body":"","comments":[{"file":"a","start_line":1,"end_line":1,"body":"x","suggestion":null}]}',
+      '{"decision":"comment","body":"s","comments":[{"file":"a","start_line":1,"end_line":1,"body":"x","suggestion":null}]}',
     );
     expect(ok).toEqual({
       decision: "comment",
-      body: "",
+      body: "s",
       comments: [{ file: "a", start_line: 1, end_line: 1, body: "x" }],
     });
     expect(typeof parseReview("{")).toBe("string");
@@ -136,6 +137,18 @@ describe("parseReview", () => {
         '{"decision":"comment","body":"","comments":[{"file":"a","start_line":2,"end_line":1,"body":"x"}]}',
       ),
     ).toBe("string");
+  });
+
+  it("mirrors Review.validate's rules for the whole review", () => {
+    const comment = { file: "a", start_line: 1, end_line: 1, body: "x" };
+    const review = (decision: string, body: string, n: number) =>
+      JSON.stringify({ decision, body, comments: Array.from({ length: n }, () => comment) });
+    // An empty summary is refused, except on an approval.
+    expect(parseReview(review("comment", " ", 0))).toMatch(/summary is empty/);
+    expect(parseReview(review("request_changes", "", 0))).toMatch(/summary is empty/);
+    expect(typeof parseReview(review("approve", "", 0))).toBe("object");
+    expect(typeof parseReview(review("comment", "s", MAX_COMMENTS))).toBe("object");
+    expect(parseReview(review("comment", "s", MAX_COMMENTS + 1))).toMatch(/at most 200/);
   });
 });
 

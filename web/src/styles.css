@@ -743,3 +743,27 @@ label.side .value {
   max-height: 16em;
   overflow-y: auto;
 }
+
+.pr-title {
+  margin: -8px 0 8px;
+  font-size: 1.05rem;
+  overflow-wrap: anywhere;
+}
+
+details.pr-body {
+  margin: 0 0 12px;
+}
+
+details.pr-body .body {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 24em;
+  overflow-y: auto;
+  border-left: 3px solid var(--rule);
+  padding-left: 10px;
+}
+
+.notice .body {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}

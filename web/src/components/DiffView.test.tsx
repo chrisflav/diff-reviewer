@@ -26,6 +26,7 @@ function render(
   bodies: string[],
   editable: boolean,
   selection: Selection | null = null,
+  canAdd: boolean = editable,
 ) {
   const files = parseDiff(text);
   const review = toLocal({
@@ -38,6 +39,7 @@ function render(
       files={files}
       placement={placeComments(files, review.comments)}
       editable={editable}
+      canAdd={canAdd}
       selection={selection}
       onSelect={() => {}}
       onRangeChange={() => {}}
@@ -98,5 +100,11 @@ ${Array.from({ length: n }, (_, i) => `+line ${i}`).join("\n")}
     );
     expect(html).toContain("Unreadable hunk header: @@ -x @@");
     expect(html).toContain("digits-6");
+  });
+
+  it("offers no line to comment on past the cap, and keeps the comments editable", () => {
+    const html = render(diff, ["kept"], true, null, false);
+    expect(html).not.toContain('class="lnum"');
+    expect(html).toContain("Edit");
   });
 });

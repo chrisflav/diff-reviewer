@@ -5,6 +5,7 @@ import {
   ApiError,
   canEdit,
   canPost,
+  githubLink,
   nextStatuses,
   UnauthorizedError,
   type Decision,
@@ -22,6 +23,7 @@ import {
   freshKeys,
   fromJson,
   KEY,
+  MAX_COMMENTS,
   mergeComment,
   placeComments,
   rangeLabel,
@@ -55,6 +57,18 @@ const decisionLabel = {
 } as const;
 
 const emptyReview: Review = { decision: "comment", body: "", comments: [] };
+
+/** A 409 that is about a post that may have reached GitHub: checking GitHub is the way on. */
+const claimConflict = /may have reached GitHub|may still be under way|being posted/;
+
+/** The job a failed request carries (a post or a check GitHub refused: `502` with the job). */
+function jobOf(err: unknown): Job | null {
+  if (!(err instanceof ApiError)) return null;
+  const b = err.body;
+  if (typeof b !== "object" || b === null || !("job" in b)) return null;
+  const j = (b as { job: unknown }).job;
+  return typeof j === "object" && j !== null && "id" in j && "version" in j ? (j as Job) : null;
+}
 
 type Pick = "mine" | "theirs";
 
@@ -207,17 +221,24 @@ function JobView({ id, onUnauthorized }: { id: string; onUnauthorized: () => voi
   if (job === null)
     return error !== null ? <p className="error">{error}</p> : <p className="mute">Loading…</p>;
 
-  const editable = canEdit(job.status) && job.reviewError === null && offer === null;
+  // A post that may have reached GitHub: until it is settled, what the review says is what may
+  // have been posted, and the server refuses edits and moves (409). The page does not offer them.
+  const claimed = job.postStartedAt !== null;
+  const editable = canEdit(job.status) && job.reviewError === null && offer === null && !claimed;
+  const atCap = current.comments.length >= MAX_COMMENTS;
 
   const fail = (err: unknown) => {
-    if (err instanceof UnauthorizedError) onUnauthorized();
-    else if (err instanceof ApiError && err.status === 409) setConflict(err.message);
+    if (err instanceof UnauthorizedError) return onUnauthorized();
+    const j = jobOf(err);
+    if (j !== null && j.id === job.id) setJob(j);
+    if (err instanceof ApiError && err.status === 409) setConflict(err.message);
     else setError(err instanceof Error ? err.message : String(err));
   };
 
   const run = (p: Promise<Job>, after?: () => void) => {
     setBusy(true);
     setError(null);
+    setConflict(null);
     p.then((j) => {
       setJob(j);
       after?.();
@@ -333,8 +354,12 @@ function JobView({ id, onUnauthorized }: { id: string; onUnauthorized: () => voi
     setOffer(null);
   };
 
+  const checkGitHub = () => run(api.reconcileJob(job.id, job.version));
+
   const moves = nextStatuses(job.status);
   const blockers = postBlockers(job, dirty, diff, diffError, placement);
+  const posted = githubLink(job.postedUrl);
+  const splitCount = placement.split.size;
 
   return (
     <FormsContext.Provider value={reportForm}>
@@ -345,11 +370,28 @@ function JobView({ id, onUnauthorized }: { id: string; onUnauthorized: () => voi
         {job.owner}/{job.name}#{job.prNumber}{" "}
         <span className={`status s-${job.status}`}>{job.status}</span>
       </h1>
+      {job.title !== null && <p className="pr-title">{job.title}</p>}
+      {job.prBody !== null && job.prBody.trim() !== "" && (
+        <details className="pr-body">
+          <summary>The pull request's description</summary>
+          <p className="body">{job.prBody}</p>
+        </details>
+      )}
       <dl className="facts">
         <dt>Job</dt>
         <dd className="data">{job.id}</dd>
         <dt>Head</dt>
         <dd className="data">{job.headSha ?? "—"}</dd>
+        <dt>Base</dt>
+        <dd className="data">{job.baseSha ?? "—"}</dd>
+        {job.prType !== null && (
+          <>
+            <dt>Kind</dt>
+            <dd>{job.prType}</dd>
+          </>
+        )}
+        <dt>Attempts</dt>
+        <dd className="data">{job.attempts}</dd>
         <dt>Queue entry</dt>
         <dd className="data">{job.queueEntry ?? "—"}</dd>
         <dt>Updated</dt>
@@ -379,6 +421,46 @@ function JobView({ id, onUnauthorized }: { id: string; onUnauthorized: () => voi
           The agent's run ended without submitting a review. Retry puts the job back in the queue.
         </p>
       )}
+      {job.error !== null && (
+        <p className="notice danger-notice">
+          The platform's last step on this job failed: <span className="body">{job.error}</span>
+        </p>
+      )}
+      {claimed && (
+        <div className="notice warn-notice" role="status">
+          <p>
+            Posting this review began at <span className="data">{job.postStartedAt}</span> and may
+            have reached GitHub. Until that is known the review cannot be edited, moved or posted
+            again from here: what it says is what may have been posted.
+          </p>
+          <div className="actions">
+            <button type="button" onClick={checkGitHub} disabled={busy}>
+              Check GitHub
+            </button>
+          </div>
+        </div>
+      )}
+      {(posted !== null || job.postedUrl !== null || job.postNote !== null) && (
+        <p className="notice">
+          {posted !== null ? (
+            <a href={posted} target="_blank" rel="noopener noreferrer">
+              The posted review on GitHub
+            </a>
+          ) : (
+            job.postedUrl !== null && (
+              <>
+                Posted at <span className="data">{job.postedUrl}</span>
+              </>
+            )
+          )}
+          {job.postNote !== null && (
+            <>
+              {(posted !== null || job.postedUrl !== null) && <br />}
+              <span className="body">{job.postNote}</span>
+            </>
+          )}
+        </p>
+      )}
       {error !== null && (
         <p className="error" role="alert">
           {error}
@@ -386,7 +468,19 @@ function JobView({ id, onUnauthorized }: { id: string; onUnauthorized: () => voi
       )}
       {conflict !== null && (
         <div className="notice warn-notice" role="alert">
-          <p>The job changed since this page loaded it, so nothing was saved: {conflict}</p>
+          <p>
+            {claimConflict.test(conflict)
+              ? "A post of this job may still be on its way to GitHub, so nothing was done: "
+              : "The job changed since this page loaded it, so nothing was done: "}
+            {conflict}
+          </p>
+          {claimConflict.test(conflict) && (
+            <div className="actions">
+              <button type="button" onClick={checkGitHub} disabled={busy}>
+                Check GitHub
+              </button>
+            </div>
+          )}
           {edits !== null ? (
             <>
               <p>
@@ -420,7 +514,7 @@ function JobView({ id, onUnauthorized }: { id: string; onUnauthorized: () => voi
               key={s}
               type="button"
               className={s === "approved" || s === "pending" ? "" : "ghost"}
-              disabled={busy || dirty}
+              disabled={busy || dirty || claimed}
               onClick={() => run(api.setStatus(job.id, job.version, s))}
             >
               {actionLabel[s] ?? s}
@@ -452,7 +546,12 @@ function JobView({ id, onUnauthorized }: { id: string; onUnauthorized: () => voi
         <PostDialog
           job={job}
           busy={busy}
-          onPost={() => run(api.post(job.id, job.version), () => setConfirmPost(false))}
+          onPost={() => {
+            // Closed either way: a refusal (502, with the job and its error) or a 409 is
+            // reported on the page, and a second click must not post twice.
+            setConfirmPost(false);
+            run(api.post(job.id, job.version));
+          }}
           onClose={() => setConfirmPost(false)}
         />
       )}
@@ -475,6 +574,7 @@ function JobView({ id, onUnauthorized }: { id: string; onUnauthorized: () => voi
           placement={placement}
           comments={current.comments}
           editable={editable}
+          canAdd={editable && !atCap}
           selection={selection}
           setSelection={setSelection}
           actions={actions}
@@ -498,6 +598,14 @@ function JobView({ id, onUnauthorized }: { id: string; onUnauthorized: () => voi
                   : job.status !== "draft" &&
                     job.status !== "pending" &&
                     " Saving makes the job a draft again.")}
+            {edits !== null && splitCount > 0 && (
+              <span className="warn">
+                {" "}
+                {splitCount === 1 ? "One comment spans" : `${splitCount} comments span`} more than
+                one hunk; GitHub refuses such comments, so the review cannot be posted until each
+                lies within one.
+              </span>
+            )}
           </span>
           {edits !== null && (
             <span className="actions">
@@ -524,6 +632,8 @@ export function postBlockers(
   placement: Placement,
 ): string[] {
   const out: string[] = [];
+  if (job.postStartedAt !== null)
+    out.push("a post of it may have reached GitHub; check GitHub first.");
   if (dirty) out.push("save or discard the edits first, comment forms included.");
   if (diffError !== null || diff === null)
     out.push("the diff is not loaded, so where the comments land cannot be checked.");
@@ -738,6 +848,7 @@ function DiffSection({
   placement,
   comments,
   editable,
+  canAdd,
   selection,
   setSelection,
   actions,
@@ -749,6 +860,8 @@ function DiffSection({
   placement: Placement;
   comments: LocalComment[];
   editable: boolean;
+  /** New comments may be added: editable, and below the cap. */
+  canAdd: boolean;
   selection: Selection | null;
   setSelection: (f: (s: Selection | null) => Selection | null) => void;
   actions: CommentActions;
@@ -819,10 +932,17 @@ function DiffSection({
               job's head <span className="data">{job.headSha.slice(0, 12)}</span>.
             </p>
           )}
+          {editable && !canAdd && (
+            <p className="notice warn-notice">
+              The review carries {comments.length} inline comments, the most a review may carry (
+              {MAX_COMMENTS}). Delete or merge one to add another.
+            </p>
+          )}
           <DiffView
             files={files}
             placement={placement}
             editable={editable}
+            canAdd={canAdd}
             selection={selection}
             onSelect={onSelect}
             onRangeChange={onRangeChange}

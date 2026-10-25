@@ -17,6 +17,16 @@ const job: Job = {
   version: 1,
   createdAt: "",
   updatedAt: "",
+  baseSha: null,
+  title: null,
+  prBody: null,
+  error: null,
+  prType: null,
+  attempts: 0,
+  postStartedAt: null,
+  postedUrl: null,
+  postNote: null,
+  postedReview: null,
 };
 
 const text = `diff --git a/a b/a
@@ -54,5 +64,10 @@ describe("postBlockers", () => {
     expect(postBlockers(job, false, { ...diff, headSha: "bbbb" }, null, place([]))).toHaveLength(1);
     expect(postBlockers(job, false, diff, null, place([[5, 5]]))[0]).toMatch(/outside the diff/);
     expect(postBlockers(job, false, diff, null, place([[1, 10]]))[0]).toMatch(/more than one hunk/);
+  });
+
+  it("holds back a job whose last post may have reached GitHub", () => {
+    const claimed = { ...job, postStartedAt: "2026-10-25T10:00:00Z" };
+    expect(postBlockers(claimed, false, diff, null, place([]))[0]).toMatch(/check GitHub/);
   });
 });

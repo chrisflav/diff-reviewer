@@ -252,7 +252,15 @@ export function commentProblem(c: InlineComment): string | null {
   return null;
 }
 
+/** The most inline comments a review may carry; mirrors `maxInlineComments` in Lean. */
+export const MAX_COMMENTS = 200;
+
+/** Why the server would refuse `r`, or `null`; mirrors `Review.validate` in Lean. */
 export function reviewProblem(r: Review): string | null {
+  if (r.comments.length > MAX_COMMENTS)
+    return `The review carries ${r.comments.length} inline comments; a review may carry at most ${MAX_COMMENTS}.`;
+  if (r.decision !== "approve" && r.body.trim() === "")
+    return "The summary is empty; GitHub requires one unless the review approves.";
   for (const [i, c] of r.comments.entries()) {
     const p = commentProblem(c);
     if (p !== null) return `Comment ${i + 1}: ${p}`;

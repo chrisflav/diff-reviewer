@@ -95,38 +95,64 @@ function Layout({ onSignedOut }: { onSignedOut: () => void }) {
 }
 
 function Login({ onSignedIn }: { onSignedIn: () => void }) {
-  const [password, setPassword] = useState("");
+  // The API token signs in too, and no limit refuses it: the way in while password attempts are.
+  const [withToken, setWithToken] = useState(false);
+  const [secret, setSecret] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [limited, setLimited] = useState(false);
 
   const submit = (e: FormEvent) => {
     e.preventDefault();
     setError(null);
-    api
-      .login(password)
+    (withToken ? api.loginWithToken(secret) : api.login(secret))
       .then(onSignedIn)
       .catch((err: unknown) => {
-        if (err instanceof UnauthorizedError) setError("That is not the password.");
-        else if (err instanceof ApiError) setError(err.message);
-        else setError("The server could not be reached.");
+        if (err instanceof UnauthorizedError)
+          setError(withToken ? "That is not the API token." : "That is not the password.");
+        else if (err instanceof ApiError) {
+          if (err.status === 429 && !withToken) {
+            setLimited(true);
+            setError(`${err.message}. The API token signs in meanwhile.`);
+          } else setError(err.message);
+        } else setError("The server could not be reached.");
       });
+  };
+
+  const switchTo = (token: boolean) => {
+    setWithToken(token);
+    setSecret("");
+    setError(null);
   };
 
   return (
     <form className="login" onSubmit={submit}>
       <h1 className="wordmark">diff-reviewer</h1>
       <label>
-        Password
+        {withToken ? "API token" : "Password"}
         <input
+          key={withToken ? "token" : "password"}
           type="password"
+          className={withToken ? "data" : ""}
           autoFocus
-          autoComplete="current-password"
-          value={password}
-          onChange={(e) => setPassword(e.target.value)}
+          autoComplete={withToken ? "off" : "current-password"}
+          value={secret}
+          onChange={(e) => setSecret(e.target.value)}
         />
       </label>
-      {error !== null && <p className="error">{error}</p>}
-      <button type="submit" disabled={password === ""}>
+      {error !== null && (
+        <p className="error" role="alert">
+          {error}
+        </p>
+      )}
+      <button type="submit" disabled={secret === ""}>
         Sign in
+      </button>
+      <button
+        type="button"
+        className={limited && !withToken ? "" : "ghost"}
+        onClick={() => switchTo(!withToken)}
+      >
+        {withToken ? "Sign in with the password" : "Sign in with API token"}
       </button>
     </form>
   );

@@ -28,6 +28,7 @@ export function DiffView({
   files,
   placement,
   editable,
+  canAdd,
   selection,
   onSelect,
   onRangeChange,
@@ -37,6 +38,8 @@ export function DiffView({
   files: DiffFile[];
   placement: Placement;
   editable: boolean;
+  /** Line numbers pick lines for a new comment: false past the review's cap of comments. */
+  canAdd: boolean;
   selection: Selection | null;
   onSelect: (file: string, line: number, extend: boolean) => void;
   onRangeChange: (start: number, end: number) => void;
@@ -82,7 +85,7 @@ export function DiffView({
           Collapse all
         </button>
       </div>
-      {editable && (
+      {canAdd && (
         <p className="mute small-text">
           Pick a line number on the new side to comment on it; shift-click another to cover a range.
           With the keyboard: Tab to a file's line numbers, the arrow keys move between them, Enter
@@ -105,6 +108,7 @@ export function DiffView({
             split={placement.split}
             commentCount={commentsIn(placement, f)}
             editable={editable}
+            canAdd={canAdd}
             selection={sel}
             onSelect={onSelect}
             onRangeChange={onRangeChange}
@@ -141,6 +145,7 @@ interface FileProps {
   split: Set<number>;
   commentCount: number;
   editable: boolean;
+  canAdd: boolean;
   selection: Selection | null;
   onSelect: (file: string, line: number, extend: boolean) => void;
   onRangeChange: (start: number, end: number) => void;
@@ -209,6 +214,7 @@ function FileTable({
   covered,
   split,
   editable,
+  canAdd,
   selection,
   onSelect,
   onRangeChange,
@@ -216,7 +222,7 @@ function FileTable({
   suggestionSeed,
 }: FileProps) {
   const path = displayPath(file);
-  const commentable = editable && file.newPath !== null;
+  const commentable = canAdd && file.newPath !== null;
   const first = file.hunks.flatMap((h) => h.lines).find((l) => l.newLine !== null)?.newLine ?? null;
   // One line number per file is a tab stop (a roving tab index); the arrows move it.
   const [focusLine, setFocusLine] = useState<number | null>(null);

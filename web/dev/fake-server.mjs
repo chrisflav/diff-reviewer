@@ -12,6 +12,9 @@
  *
  *     curl -X POST 127.0.0.1:8091/__fake/expire          # the session ends: 401 until sign-in
  *     curl -X POST '127.0.0.1:8091/__fake/delay?ms=3000' # writes answer after a pause
+ *     curl -X POST '127.0.0.1:8091/__fake/post?outcome=hang' # next post: ok, refuse or hang
+ *
+ * A claim (a post that may have reached GitHub) is settled by "Check GitHub" as found, posted.
  */
 
 import { createServer } from "node:http";
@@ -136,8 +139,34 @@ for (const [id, status, prNumber, r] of [
     version: 1,
     createdAt: now(),
     updatedAt: now(),
+    baseSha: "89abcdef0123456789abcdef0123456789abcdef",
+    title: `Add the dismiss decision (#${prNumber})`,
+    prBody: "Adds `dismiss`.\n\n<script>alert('a PR body is text')</script>",
+    error: status === "failed" ? "the run ended without a submission" : null,
+    prType: status === "failed" ? null : "feature",
+    attempts: status === "failed" ? 2 : 1,
+    postStartedAt: null,
+    postedUrl: null,
+    postNote: null,
+    postedReview: null,
   });
 }
+
+const repos = new Map([
+  [
+    "chrisflav/diff-reviewer",
+    {
+      owner: "chrisflav",
+      name: "diff-reviewer",
+      mode: "staged",
+      autoReview: false,
+      createdAt: now(),
+    },
+  ],
+]);
+// What the next post does: "ok", "refuse" (GitHub says no: 502 with the job) or "hang" (the post
+// may have reached GitHub: the claim stays, and the answer is a 502).
+let postOutcome = "ok";
 
 const moves = {
   draft: ["approved", "rejected", "stale"],
@@ -150,6 +179,21 @@ const editable = ["pending", "draft", "approved", "rejected"];
 function send(res, status, body) {
   res.writeHead(status, { "Content-Type": "application/json" });
   res.end(JSON.stringify(body));
+}
+
+function posted(job) {
+  const url = `https://github.com/${job.owner}/${job.name}/pull/${job.prNumber}#pullrequestreview-1`;
+  return bump(job, {
+    status: "posted",
+    postStartedAt: null,
+    error: null,
+    postedUrl: url,
+    postNote:
+      job.review?.decision === "request_changes"
+        ? "posted as a comment: GitHub refuses a request for changes on one's own pull request"
+        : null,
+    postedReview: { id: 1, url, body: job.review?.body ?? "" },
+  });
 }
 
 function bump(job, change) {
@@ -186,7 +230,13 @@ createServer(async (req, res) => {
     return send(res, 200, {});
   }
   if (url.pathname === "/api/session") return send(res, 200, { authenticated: signedIn });
+  if (url.pathname === "/__fake/post") {
+    postOutcome = url.searchParams.get("outcome") ?? "ok";
+    return send(res, 200, {});
+  }
   if (url.pathname === "/api/login") {
+    if (typeof body.token === "string" && body.token !== "token")
+      return send(res, 401, { error: "unauthorized" });
     signedIn = true;
     return send(res, 200, { authenticated: true });
   }
@@ -196,10 +246,19 @@ createServer(async (req, res) => {
   }
   if (!signedIn) return send(res, 401, { error: "unauthorized" });
   if (req.method !== "GET" && delay > 0) await new Promise((r) => setTimeout(r, delay));
-  if (url.pathname === "/api/v1/repos")
-    return send(res, 200, {
-      items: [{ owner: "chrisflav", name: "diff-reviewer", mode: "staged", createdAt: now() }],
-    });
+  if (url.pathname === "/api/v1/repos") return send(res, 200, { items: [...repos.values()] });
+  if (parts[2] === "repos" && parts.length === 5 && req.method === "PUT") {
+    const key = `${parts[3]}/${parts[4]}`.toLowerCase();
+    const repo = {
+      owner: parts[3].toLowerCase(),
+      name: parts[4].toLowerCase(),
+      mode: body.mode ?? "staged",
+      autoReview: body.autoReview ?? false,
+      createdAt: repos.get(key)?.createdAt ?? now(),
+    };
+    repos.set(key, repo);
+    return send(res, 200, repo);
+  }
   if (url.pathname === "/api/v1/jobs" && req.method === "GET")
     return send(res, 200, { items: [...jobs.values()] });
 
@@ -211,6 +270,10 @@ createServer(async (req, res) => {
     if (action === "diff") return send(res, 200, { headSha: job.headSha, diff });
     if (body.version !== job.version)
       return send(res, 409, { error: `job ${job.id} is at version ${job.version}` });
+    if (job.postStartedAt !== null && (action === "review" || action === "status"))
+      return send(res, 409, {
+        error: `a post of job ${job.id} (begun ${job.postStartedAt}) may have reached GitHub; it is being checked`,
+      });
     if (action === "review" && req.method === "PUT") {
       if (!editable.includes(job.status))
         return send(res, 409, {
@@ -228,7 +291,27 @@ createServer(async (req, res) => {
     if (action === "post" && req.method === "POST") {
       if (job.status !== "approved")
         return send(res, 409, { error: `job ${job.id} is ${job.status}, not approved` });
-      return send(res, 200, bump(job, { status: "posted" }));
+      if (job.postStartedAt !== null)
+        return send(res, 409, {
+          error: `posting job ${job.id} began at ${job.postStartedAt} and may still be under way`,
+        });
+      if (postOutcome === "refuse") {
+        bump(job, { error: "posting failed: 422 Unprocessable Entity" });
+        return send(res, 502, { error: "GitHub refused the review: 422", job });
+      }
+      if (postOutcome === "hang") {
+        bump(job, { postStartedAt: now() });
+        return send(res, 502, {
+          error: "GitHub did not answer; the post may have reached it",
+          job,
+        });
+      }
+      return send(res, 200, posted(job));
+    }
+    if (action === "reconcile" && req.method === "POST") {
+      if (job.postStartedAt === null)
+        return send(res, 409, { error: `job ${job.id} has no post to settle` });
+      return send(res, 200, posted(job));
     }
   }
   send(res, 404, { error: "no such route" });

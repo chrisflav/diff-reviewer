@@ -14,10 +14,13 @@ export class UnauthorizedError extends Error {
 
 export class ApiError extends Error {
   readonly status: number;
-  constructor(status: number, message: string) {
+  /** The answer's JSON, for errors that carry more than a message (a failed post's job). */
+  readonly body: unknown;
+  constructor(status: number, message: string, body: unknown = null) {
     super(message);
     this.name = "ApiError";
     this.status = status;
+    this.body = body;
   }
 }
 
@@ -142,7 +145,7 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
       json !== null && typeof json === "object" && "error" in json
         ? String((json as { error: unknown }).error)
         : `${res.status} ${res.statusText}`;
-    throw new ApiError(res.status, msg);
+    throw new ApiError(res.status, msg, json);
   }
   return json as T;
 }
@@ -150,11 +153,15 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
 export const api = {
   session: () => request<{ authenticated: boolean }>("GET", "/api/session"),
   login: (password: string) => request<{ authenticated: boolean }>("POST", "/api/login", { password }),
+  /** Sign in with the API token: never rate-limited, the way in while password attempts are not. */
+  loginWithToken: (token: string) =>
+    request<{ authenticated: boolean }>("POST", "/api/login", { token }),
   logout: () => request<{ authenticated: boolean }>("POST", "/api/logout"),
 
   repos: () => request<{ items: Repo[] }>("GET", "/api/v1/repos").then((r) => r.items),
-  putRepo: (owner: string, name: string, mode: PostingMode) =>
-    request<Repo>("PUT", `/api/v1/repos/${seg(owner)}/${seg(name)}`, { mode }),
+  /** Replaces the settings: both are sent, since an omitted one would fall back to its default. */
+  putRepo: (owner: string, name: string, mode: PostingMode, autoReview: boolean) =>
+    request<Repo>("PUT", `/api/v1/repos/${seg(owner)}/${seg(name)}`, { mode, autoReview }),
   deleteRepo: (owner: string, name: string) =>
     request<void>("DELETE", `/api/v1/repos/${seg(owner)}/${seg(name)}`),
 
@@ -196,6 +203,11 @@ export function nextStatuses(s: string): JobStatus[] {
     default:
       return [];
   }
+}
+
+/** Whether a GitHub URL the server recorded may be shown as a link: GitHub's own pages only. */
+export function githubLink(url: string | null): string | null {
+  return url !== null && url.startsWith("https://github.com/") ? url : null;
 }
 
 /** Whether a job may be posted now; posting is its own action, not a status move. */
