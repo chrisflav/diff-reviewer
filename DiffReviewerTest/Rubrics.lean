@@ -139,19 +139,19 @@ def theAgentReviewsByTheRubric : Test := withTempDb do
   let id := (field created "id").getD ""
   Workers.queuePending svc
   let prompt := ((← orch.queued.get)[0]?.map (·.prompt)).getD ""
-  let shown ← route st (agentReq .get "")
+  let shown ← routeAgent st (agentReq .get "")
   let types := (((bodyJson shown).getObjVal? "prTypes").bind (·.getArr?)).toOption.getD #[]
   let feature := types[0]?.getD .null
   let categories := ((feature.getObjVal? "categories").bind (·.getArr?)).toOption.getD #[]
   let tagged := withComment ", \"category\": \"correctness\", \"severity\": \"major\""
-  let noType ← route st (agentReq .post "/review" (submission headA tagged))
-  let otherType ← route st (agentReq .post "/review"
+  let noType ← routeAgent st (agentReq .post "/review" (submission headA tagged))
+  let otherType ← routeAgent st (agentReq .post "/review"
     (submission headA tagged (prType := "\"refactor\"")))
-  let wrongCategory ← route st (agentReq .post "/review" (submission headA
+  let wrongCategory ← routeAgent st (agentReq .post "/review" (submission headA
     (withComment ", \"category\": \"naming\"") (prType := "\"feature\"")))
-  let badSeverity ← route st (agentReq .post "/review" (submission headA
+  let badSeverity ← routeAgent st (agentReq .post "/review" (submission headA
     (withComment ", \"severity\": \"critical\"") (prType := "\"feature\"")))
-  let submitted ← route st (agentReq .post "/review"
+  let submitted ← routeAgent st (agentReq .post "/review"
     (submission headA tagged (prType := "\"feature\"")))
   let job ← route st (req .get s!"/api/v1/jobs/{id}")
   let comment := (commentsOf job).headD .null
@@ -197,8 +197,8 @@ def everyWriteIsARevision : Test := withTempDb do
     s!"\{\"owner\": \"acme\", \"name\": \"widgets\", \"prNumber\": 7, \"headSha\": \"{headA}\"}")
   let id := (field created "id").getD ""
   Workers.queuePending svc
-  let _ ← route st (agentReq .get "")
-  let _ ← route st (agentReq .post "/review"
+  let _ ← routeAgent st (agentReq .get "")
+  let _ ← routeAgent st (agentReq .post "/review"
     (submission headA (withComment ", \"category\": \"anything at all\"")))
   let drafted ← route st (req .get s!"/api/v1/jobs/{id}")
   let agentId := ((commentsOf drafted).headD .null |> (strOf · "id")).getD ""
@@ -324,7 +324,7 @@ def rubricsKeepUnknownFields : Test := withTempDb do
 \"feature\", \"weight\": 2, \"categories\": [{\"name\": \"style\", \"color\": \"red\"}]}]}"
   Store.run <| HasModel.save
     ({ owner := "acme", name := "widgets", version := 1, document := newer
-     , created_at := "2026-01-01T00:00:00Z" } : Store.RubricRow)
+     , created_at := "2026-01-01T00:00:00Z", derived_samples := none } : Store.RubricRow)
   let read ← route st (req .get "/api/v1/repos/acme/widgets/rubrics")
   -- An older client: changes the default rubric, sends back the rest as it read it.
   let back := (bodyJson read).setObjVal! "defaultRubric" "d, revised"
@@ -350,7 +350,7 @@ private def directJob (st : State) (svc : Workers.Services) : IO String := do
   let created ← route st (req .post "/api/v1/jobs"
     s!"\{\"owner\": \"acme\", \"name\": \"widgets\", \"prNumber\": 7, \"headSha\": \"{headA}\"}")
   Workers.queuePending svc
-  let _ ← route st (agentReq .get "")
+  let _ ← routeAgent st (agentReq .get "")
   return (field created "id").getD ""
 
 private def ageClaim (id : String) : IO Unit := do
@@ -368,8 +368,8 @@ def aDirectPostIsRetried : Test := withTempDb do
   let st ← State.new cfg svc
   let id ← directJob st svc
   gh.outcome.set .failedUnposted
-  let submitted ← route st (agentReq .post "/review" (submission headA (review := "{\"decision\": \
-\"request_changes\", \"body\": \"No.\", \"comments\": []}")))
+  let submitted ← routeAgent st (agentReq .post "/review" (submission headA
+    (review := "{\"decision\": \"request_changes\", \"body\": \"No.\", \"comments\": []}")))
   let first ← job! id
   gh.outcome.set .ok
   ageClaim id
@@ -394,7 +394,7 @@ def aDirectPostIsRetriedAtMostThrice : Test := withTempDb do
   let st ← State.new cfg svc
   let id ← directJob st svc
   gh.outcome.set .failedUnposted
-  let _ ← route st (agentReq .post "/review" (submission headA))
+  let _ ← routeAgent st (agentReq .post "/review" (submission headA))
   for _ in [0:5] do
     ageClaim id
     Workers.settleClaims svc
@@ -418,7 +418,7 @@ def aDirectRepostChecksThePull : Test := withTempDb do
   let st ← State.new cfg svc
   let id ← directJob st svc
   gh.outcome.set .failedUnposted
-  let _ ← route st (agentReq .post "/review" (submission headA))
+  let _ ← routeAgent st (agentReq .post "/review" (submission headA))
   gh.outcome.set .ok
   gh.pulls.set #[pull7 headB]
   ageClaim id
@@ -446,7 +446,7 @@ def aPersonsPostIsNotRetried : Test := withTempDb do
   let st ← State.new cfg svc
   let id ← directJob st svc
   gh.outcome.set .failedUnposted
-  let _ ← route st (agentReq .post "/review" (submission headA))
+  let _ ← routeAgent st (agentReq .post "/review" (submission headA))
   ageClaim id
   -- The person posts: the earlier claim is settled, and the person's own post fails too.
   let _ ← route st (req .post s!"/api/v1/jobs/{id}/post" s!"\{\"version\": {(← job! id).version}}")
@@ -477,8 +477,8 @@ def rubricEdgesAreHeld : Test := withTempDb do
     s!"\{\"owner\": \"acme\", \"name\": \"widgets\", \"prNumber\": 7, \"headSha\": \"{headA}\"}")
   let id := (field created "id").getD ""
   Workers.queuePending svc
-  let _ ← route st (agentReq .get "")
-  let _ ← route st (agentReq .post "/review"
+  let _ ← routeAgent st (agentReq .get "")
+  let _ ← routeAgent st (agentReq .post "/review"
     (submission headA (withComment ", \"category\": \"legacy\"")))
   let noRubric ← job! id
   -- A rubric with categories now: the job was reviewed against none, so free text still holds.
@@ -509,7 +509,7 @@ def rubricEdgesAreHeld : Test := withTempDb do
   let nullDefault ← putRubric st 1 "\"defaultRubric\": null"
   Store.run <| HasModel.save
     ({ owner := "acme", name := "widgets", version := 2, document := "{\"prTypes\": 7}"
-     , created_at := "2026-01-01T00:00:00Z" } : Store.RubricRow)
+     , created_at := "2026-01-01T00:00:00Z", derived_samples := none } : Store.RubricRow)
   let unreadable ← route st (req .get "/api/v1/repos/acme/widgets/rubrics")
   let overwrite ← putRubric st 2 "\"defaultRubric\": \"x\""
   let doc : Rubric := match Rubric.ofJson ((Json.parse s!"\{{twoTypes}}").toOption.getD .null) with

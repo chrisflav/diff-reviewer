@@ -224,6 +224,12 @@
                     "type": "string",
                     "description": "Markdown, at most 16 KiB (UTF-8). Left out (or null), the current notes are kept; an empty string clears them."
                   },
+                  "evalShare": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 100,
+                    "description": "Percent of new samples held out; kept when left out. Changes only the samples split after it."
+                  },
                   "version": {
                     "type": "integer",
                     "minimum": 0,
@@ -760,16 +766,16 @@
         {
           "name": "X-Diff-Reviewer-Job",
           "in": "header",
-          "required": false,
+          "required": true,
           "schema": {
             "type": "string"
           },
-          "description": "The job the agent's prompt named (`--job`). Without it, the request is about the pull request's only queued or running job, and with two it is a `409`: an older run must not take over a newer review."
+          "description": "The job the agent's prompt named (`--job`): a review or calibration job of the pull request, queued or running. Required: a request that names none is a `400`, and one naming a job of another kind (a rubric proposal) or not being run a `404`. Naming a job of a commit another active job of the same pull request was made for later (to the second) is a `409`: only the newest job of a commit is run."
         }
       ],
       "get": {
         "summary": "The review the agent is running",
-        "description": "The job the agent runs (see `X-Diff-Reviewer-Job`), `queued` or `running`; reading a `queued` one moves it to `running`. `404` when no review of the pull request is being run. `409` too when the repository's rubric cannot be read by this build. With `X-Diff-Reviewer-Job` naming a job of a commit another active job of the same pull request was made for later (to the second), `409`: only the newest job of a commit is run.",
+        "description": "The job the agent runs, named by `X-Diff-Reviewer-Job`, `queued` or `running`; reading a `queued` one moves it to `running`. `400` when no job is named, `404` when the named job is not a review of the pull request being run. `409` too when the repository's rubric cannot be read by this build, and when the named job is of a commit another active job of the same pull request was made for later (to the second): only the newest job of a commit is run.",
         "operationId": "agentShow",
         "security": [
           {
@@ -794,6 +800,9 @@
             "$ref": "#/components/responses/Error"
           },
           "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "400": {
             "$ref": "#/components/responses/Error"
           }
         }
@@ -829,11 +838,11 @@
         {
           "name": "X-Diff-Reviewer-Job",
           "in": "header",
-          "required": false,
+          "required": true,
           "schema": {
             "type": "string"
           },
-          "description": "The job the agent's prompt named (`--job`). Without it, the request is about the pull request's only queued or running job, and with two it is a `409`: an older run must not take over a newer review."
+          "description": "The job the agent's prompt named (`--job`): a review or calibration job of the pull request, queued or running. Required: a request that names none is a `400`, and one naming a job of another kind (a rubric proposal) or not being run a `404`. Naming a job of a commit another active job of the same pull request was made for later (to the second) is a `409`: only the newest job of a commit is run."
         }
       ],
       "get": {
@@ -873,6 +882,9 @@
           },
           "413": {
             "$ref": "#/components/responses/Error"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
           }
         }
       }
@@ -907,11 +919,11 @@
         {
           "name": "X-Diff-Reviewer-Job",
           "in": "header",
-          "required": false,
+          "required": true,
           "schema": {
             "type": "string"
           },
-          "description": "The job the agent's prompt named (`--job`). Without it, the request is about the pull request's only queued or running job, and with two it is a `409`: an older run must not take over a newer review."
+          "description": "The job the agent's prompt named (`--job`): a review or calibration job of the pull request, queued or running. Required: a request that names none is a `400`, and one naming a job of another kind (a rubric proposal) or not being run a `404`. Naming a job of a commit another active job of the same pull request was made for later (to the second) is a `409`: only the newest job of a commit is run."
         }
       ],
       "post": {
@@ -976,6 +988,169 @@
                       "type": [
                         "string",
                         "null"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "415": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/agent/v1/repos/{owner}/{name}/proposals/{jobId}": {
+      "parameters": [
+        {
+          "name": "owner",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "name",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "jobId",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          },
+          "description": "The proposal job the agent's prompt named. kleis binds the request to the task's repository; the platform to this job, which must be a proposal job of that repository."
+        }
+      ],
+      "get": {
+        "summary": "What a rubric proposal is written from",
+        "operationId": "agentProposalShow",
+        "description": "The proposal job must be `queued` or `running` (`404` otherwise); reading a `queued` one moves it to `running`. Of the repository and the job, with no pull request: kleis's `reviewer` spec does not allow it, a `rubric-proposer` spec does. The first read records the style notes it gives (which accepting the proposal's notes checks are still the repository's) and every read the samples its context drew on.",
+        "security": [
+          {
+            "agentBearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The context.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProposalContext"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "post": {
+        "summary": "Submit a rubric proposal",
+        "operationId": "agentProposalSubmit",
+        "description": "The job must be `running` (`409` otherwise: a proposal is submitted once). `rubric` is checked as `PUT …/rubrics` checks a document, and may carry no field a rubric does not have, on the document, a type or a category (`400`, naming them) — only a person's document keeps unknown fields; `baseVersion` must be a version the rubric has had (`400`) — one older than the current is stored, and accepting it asks for a rebase. Stored as a `pending` proposal; the job becomes a `draft`.",
+        "security": [
+          {
+            "agentBearer": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "baseVersion",
+                  "rubric",
+                  "rationale"
+                ],
+                "properties": {
+                  "baseVersion": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "The `rubric.version` of the context."
+                  },
+                  "rubric": {
+                    "type": "object",
+                    "description": "A whole rubric document, as `PUT …/rubrics` takes it (without `version`).",
+                    "properties": {
+                      "defaultRubric": {
+                        "type": "string"
+                      },
+                      "prTypes": {
+                        "type": "array",
+                        "items": {
+                          "$ref": "#/components/schemas/PrType"
+                        }
+                      }
+                    }
+                  },
+                  "styleNotes": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "maxLength": 16384,
+                    "description": "The full new style notes; null or left out to propose none."
+                  },
+                  "rationale": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Why, in markdown, at most 32 KiB."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Stored.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "proposalId",
+                    "jobId",
+                    "status"
+                  ],
+                  "properties": {
+                    "proposalId": {
+                      "type": "string"
+                    },
+                    "jobId": {
+                      "type": "string"
+                    },
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "pending"
                       ]
                     }
                   }
@@ -1506,679 +1681,6 @@
         }
       }
     },
-    "/api/v1/repos/{owner}/{name}/calibration/samples": {
-      "parameters": [
-        {
-          "name": "owner",
-          "in": "path",
-          "required": true,
-          "schema": {
-            "type": "string"
-          }
-        },
-        {
-          "name": "name",
-          "in": "path",
-          "required": true,
-          "schema": {
-            "type": "string"
-          }
-        }
-      ],
-      "get": {
-        "summary": "The samples, most recently reviewed first",
-        "operationId": "listCalibrationSamples",
-        "description": "Deleted samples are not listed.",
-        "parameters": [
-          {
-            "name": "limit",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "minimum": 1,
-              "maximum": 200,
-              "default": 50
-            },
-            "description": "The most items in the page."
-          },
-          {
-            "name": "offset",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "minimum": 0,
-              "default": 0
-            },
-            "description": "How many items to skip."
-          },
-          {
-            "name": "deleted",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "enum": [
-                "exclude",
-                "include"
-              ],
-              "default": "exclude"
-            },
-            "description": "`include` lists deleted samples too, marked by `deleted` and `deletedAt`."
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "The samples.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "required": [
-                    "items",
-                    "nextOffset"
-                  ],
-                  "properties": {
-                    "items": {
-                      "type": "array",
-                      "items": {
-                        "$ref": "#/components/schemas/CalibrationSample"
-                      }
-                    },
-                    "nextOffset": {
-                      "type": [
-                        "integer",
-                        "null"
-                      ],
-                      "description": "The `offset` of the next page; null on the last."
-                    }
-                  }
-                }
-              }
-            }
-          },
-          "400": {
-            "$ref": "#/components/responses/Error"
-          },
-          "401": {
-            "$ref": "#/components/responses/Error"
-          },
-          "404": {
-            "$ref": "#/components/responses/Error"
-          }
-        }
-      }
-    },
-    "/api/v1/repos/{owner}/{name}/calibration/samples/{id}": {
-      "parameters": [
-        {
-          "name": "owner",
-          "in": "path",
-          "required": true,
-          "schema": {
-            "type": "string"
-          }
-        },
-        {
-          "name": "name",
-          "in": "path",
-          "required": true,
-          "schema": {
-            "type": "string"
-          }
-        },
-        {
-          "name": "id",
-          "in": "path",
-          "required": true,
-          "schema": {
-            "type": "string"
-          }
-        }
-      ],
-      "get": {
-        "summary": "One sample",
-        "operationId": "getCalibrationSample",
-        "responses": {
-          "200": {
-            "description": "The sample.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/CalibrationSample"
-                }
-              }
-            }
-          },
-          "401": {
-            "$ref": "#/components/responses/Error"
-          },
-          "404": {
-            "$ref": "#/components/responses/Error"
-          }
-        }
-      },
-      "delete": {
-        "summary": "Delete a sample",
-        "operationId": "deleteCalibrationSample",
-        "description": "It is no longer listed or picked for a run, and importing again does not bring it back. The scores of the jobs that reviewed it are kept.",
-        "responses": {
-          "204": {
-            "description": "Deleted."
-          },
-          "401": {
-            "$ref": "#/components/responses/Error"
-          },
-          "404": {
-            "$ref": "#/components/responses/Error"
-          }
-        }
-      }
-    },
-    "/api/v1/repos/{owner}/{name}/calibration/runs": {
-      "parameters": [
-        {
-          "name": "owner",
-          "in": "path",
-          "required": true,
-          "schema": {
-            "type": "string"
-          }
-        },
-        {
-          "name": "name",
-          "in": "path",
-          "required": true,
-          "schema": {
-            "type": "string"
-          }
-        }
-      ],
-      "post": {
-        "summary": "Run the agent on samples",
-        "operationId": "createCalibrationRun",
-        "description": "One `calibration` job per sample, at the sample's commit and with its base for the diff, queued and run as any review is, with the same prompt and rubric, and never posted. Each job's orchestra request carries the kleis narrowing `github: only discover, fetch`: the task clones and fetches over git, and cannot read GitHub's REST or GraphQL API, where the person's review is. `{\"samples\": [id, …]}` names them; `{\"count\": n}` takes the n reviewed by the fewest runs so far, the most recent first. At most 20 either way, and a sample a live (pending, queued or running) calibration job is reviewing is refused (`409`); `count` leaves those out. `429` when the jobs would pass `--max-calibration-jobs-per-day` (20 by default) for the repository, a cap apart from `--max-jobs-per-day`: each job is a charge on it, and so is each time a person runs a failed one again.",
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "type": "object",
-                "properties": {
-                  "samples": {
-                    "type": "array",
-                    "items": {
-                      "type": "string"
-                    },
-                    "minItems": 1,
-                    "maxItems": 20
-                  },
-                  "count": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 20
-                  }
-                }
-              }
-            }
-          }
-        },
-        "responses": {
-          "201": {
-            "description": "The run, with its jobs.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/CalibrationRun"
-                }
-              }
-            }
-          },
-          "400": {
-            "$ref": "#/components/responses/Error"
-          },
-          "401": {
-            "$ref": "#/components/responses/Error"
-          },
-          "404": {
-            "$ref": "#/components/responses/Error"
-          },
-          "415": {
-            "$ref": "#/components/responses/Error"
-          },
-          "429": {
-            "$ref": "#/components/responses/Error"
-          },
-          "409": {
-            "$ref": "#/components/responses/Error"
-          }
-        }
-      },
-      "get": {
-        "summary": "The runs, newest first",
-        "operationId": "listCalibrationRuns",
-        "description": "Each with its jobs by status and the aggregate of its scores: the repository's calibration over time.",
-        "parameters": [
-          {
-            "name": "limit",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "minimum": 1,
-              "maximum": 200,
-              "default": 50
-            },
-            "description": "The most items in the page."
-          },
-          {
-            "name": "offset",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "minimum": 0,
-              "default": 0
-            },
-            "description": "How many items to skip."
-          },
-          {
-            "name": "stale",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "enum": [
-                "include"
-              ]
-            },
-            "description": "`include`: count stale scores in the aggregates too. By default they are left out."
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "The runs.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "required": [
-                    "items",
-                    "nextOffset"
-                  ],
-                  "properties": {
-                    "items": {
-                      "type": "array",
-                      "items": {
-                        "$ref": "#/components/schemas/CalibrationRun"
-                      }
-                    },
-                    "nextOffset": {
-                      "type": [
-                        "integer",
-                        "null"
-                      ],
-                      "description": "The `offset` of the next page; null on the last."
-                    }
-                  }
-                }
-              }
-            }
-          },
-          "400": {
-            "$ref": "#/components/responses/Error"
-          },
-          "401": {
-            "$ref": "#/components/responses/Error"
-          },
-          "404": {
-            "$ref": "#/components/responses/Error"
-          }
-        }
-      }
-    },
-    "/api/v1/repos/{owner}/{name}/calibration/runs/{id}": {
-      "parameters": [
-        {
-          "name": "owner",
-          "in": "path",
-          "required": true,
-          "schema": {
-            "type": "string"
-          }
-        },
-        {
-          "name": "name",
-          "in": "path",
-          "required": true,
-          "schema": {
-            "type": "string"
-          }
-        },
-        {
-          "name": "id",
-          "in": "path",
-          "required": true,
-          "schema": {
-            "type": "string"
-          }
-        }
-      ],
-      "get": {
-        "summary": "One run, with each sample's result",
-        "operationId": "getCalibrationRun",
-        "responses": {
-          "200": {
-            "description": "The run, with `results`.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/CalibrationRun"
-                }
-              }
-            }
-          },
-          "401": {
-            "$ref": "#/components/responses/Error"
-          },
-          "404": {
-            "$ref": "#/components/responses/Error"
-          }
-        },
-        "parameters": [
-          {
-            "name": "stale",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "enum": [
-                "include"
-              ]
-            },
-            "description": "`include`: count stale scores in the aggregates too. By default they are left out."
-          }
-        ]
-      }
-    },
-    "/api/v1/repos/{owner}/{name}/calibration/summary": {
-      "parameters": [
-        {
-          "name": "owner",
-          "in": "path",
-          "required": true,
-          "schema": {
-            "type": "string"
-          }
-        },
-        {
-          "name": "name",
-          "in": "path",
-          "required": true,
-          "schema": {
-            "type": "string"
-          }
-        }
-      ],
-      "get": {
-        "summary": "The aggregate over every run",
-        "operationId": "getCalibrationSummary",
-        "description": "Every scored calibration job of the repository by the current matcher, and the same broken down by the rubric version the jobs were reviewed against.",
-        "responses": {
-          "200": {
-            "description": "The summary.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/CalibrationSummary"
-                }
-              }
-            }
-          },
-          "401": {
-            "$ref": "#/components/responses/Error"
-          },
-          "404": {
-            "$ref": "#/components/responses/Error"
-          }
-        },
-        "parameters": [
-          {
-            "name": "stale",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "enum": [
-                "include"
-              ]
-            },
-            "description": "`include`: count stale scores in the aggregates too. By default they are left out."
-          }
-        ]
-      }
-    },
-    "/api/v1/repos/{owner}/{name}/calibration/import/{id}/cancel": {
-      "parameters": [
-        {
-          "name": "owner",
-          "in": "path",
-          "required": true,
-          "schema": {
-            "type": "string"
-          }
-        },
-        {
-          "name": "name",
-          "in": "path",
-          "required": true,
-          "schema": {
-            "type": "string"
-          }
-        },
-        {
-          "name": "id",
-          "in": "path",
-          "required": true,
-          "schema": {
-            "type": "string"
-          }
-        }
-      ],
-      "post": {
-        "summary": "Cancel an import",
-        "operationId": "cancelCalibrationImport",
-        "description": "A queued or running import is read no further; what it stored stays. `409` (with the import, as `import`) for one that has ended.",
-        "responses": {
-          "200": {
-            "description": "Cancelled.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/CalibrationImport"
-                }
-              }
-            }
-          },
-          "401": {
-            "$ref": "#/components/responses/Error"
-          },
-          "404": {
-            "$ref": "#/components/responses/Error"
-          },
-          "409": {
-            "$ref": "#/components/responses/Error"
-          },
-          "415": {
-            "$ref": "#/components/responses/Error"
-          }
-        }
-      }
-    },
-    "/api/agent/v1/repos/{owner}/{name}/proposals/{jobId}": {
-      "parameters": [
-        {
-          "name": "owner",
-          "in": "path",
-          "required": true,
-          "schema": {
-            "type": "string"
-          }
-        },
-        {
-          "name": "name",
-          "in": "path",
-          "required": true,
-          "schema": {
-            "type": "string"
-          }
-        },
-        {
-          "name": "jobId",
-          "in": "path",
-          "required": true,
-          "schema": {
-            "type": "string"
-          },
-          "description": "The proposal job the agent's prompt named. kleis binds the request to the task's repository; the platform to this job, which must be a proposal job of that repository."
-        }
-      ],
-      "get": {
-        "summary": "What a rubric proposal is written from",
-        "operationId": "agentProposalShow",
-        "description": "The proposal job must be `queued` or `running` (`404` otherwise); reading a `queued` one moves it to `running`. Of the repository and the job, with no pull request: kleis's `reviewer` spec does not allow it, a `rubric-proposer` spec does.",
-        "security": [
-          {
-            "agentBearer": []
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "The context.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProposalContext"
-                }
-              }
-            }
-          },
-          "401": {
-            "$ref": "#/components/responses/Error"
-          },
-          "404": {
-            "$ref": "#/components/responses/Error"
-          }
-        }
-      },
-      "post": {
-        "summary": "Submit a rubric proposal",
-        "operationId": "agentProposalSubmit",
-        "description": "The job must be `running` (`409` otherwise: a proposal is submitted once). `rubric` is checked as `PUT …/rubrics` checks a document (`400`); `baseVersion` must be a version the rubric has had (`400`) — one older than the current is stored, and accepting it asks for a rebase. Stored as a `pending` proposal; the job becomes a `draft`.",
-        "security": [
-          {
-            "agentBearer": []
-          }
-        ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "type": "object",
-                "required": [
-                  "baseVersion",
-                  "rubric",
-                  "rationale"
-                ],
-                "properties": {
-                  "baseVersion": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "description": "The `rubric.version` of the context."
-                  },
-                  "rubric": {
-                    "type": "object",
-                    "description": "A whole rubric document, as `PUT …/rubrics` takes it (without `version`).",
-                    "properties": {
-                      "defaultRubric": {
-                        "type": "string"
-                      },
-                      "prTypes": {
-                        "type": "array",
-                        "items": {
-                          "$ref": "#/components/schemas/PrType"
-                        }
-                      }
-                    }
-                  },
-                  "styleNotes": {
-                    "type": [
-                      "string",
-                      "null"
-                    ],
-                    "maxLength": 16384,
-                    "description": "The full new style notes; null or left out to propose none."
-                  },
-                  "rationale": {
-                    "type": "string",
-                    "minLength": 1,
-                    "description": "Why, in markdown, at most 32 KiB."
-                  }
-                }
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Stored.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "required": [
-                    "proposalId",
-                    "jobId",
-                    "status"
-                  ],
-                  "properties": {
-                    "proposalId": {
-                      "type": "string"
-                    },
-                    "jobId": {
-                      "type": "string"
-                    },
-                    "status": {
-                      "type": "string",
-                      "enum": [
-                        "pending"
-                      ]
-                    }
-                  }
-                }
-              }
-            }
-          },
-          "400": {
-            "$ref": "#/components/responses/Error"
-          },
-          "401": {
-            "$ref": "#/components/responses/Error"
-          },
-          "404": {
-            "$ref": "#/components/responses/Error"
-          },
-          "409": {
-            "$ref": "#/components/responses/Error"
-          },
-          "415": {
-            "$ref": "#/components/responses/Error"
-          }
-        }
-      }
-    },
     "/api/v1/repos/{owner}/{name}/proposals": {
       "parameters": [
         {
@@ -2392,7 +1894,7 @@
       "post": {
         "summary": "Accept a rubric proposal",
         "operationId": "acceptProposal",
-        "description": "A versioned write of the rubric: `version` is the rubric version the person read. The proposal's document becomes the next rubric version, and its style notes, if it has any, the repository's (a new version of its settings), in one transaction with the decision. `409` when the proposal is decided already, when the repository's style notes changed since it was submitted, and — with `baseVersion` and `currentVersion` beside `error` — when the rubric has moved since the proposal's base or since `version`: rebase it in the editor and save that as a rubric `PUT` instead.",
+        "description": "A versioned write of the rubric: `version` is the rubric version the person read. The proposal's document becomes the next rubric version, recording the calibration samples the proposal's context drew on (`derivedFrom`); with `applyStyleNotes`, its style notes become the repository's, recording them too. One transaction, the rubric written first: a refusal after it rolls everything back. `409` when the proposal is decided already, when applying notes it has none or the repository's notes are no longer the ones its agent first read, and — with `baseVersion` and `currentVersion` beside `error` — when the rubric has moved since the proposal's base or since `version`: rebase it in the editor and save that as a rubric `PUT` instead.",
         "requestBody": {
           "required": true,
           "content": {
@@ -2406,6 +1908,11 @@
                   "version": {
                     "type": "integer",
                     "minimum": 0
+                  },
+                  "applyStyleNotes": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Also write the proposal's style notes as the repository's. Without it the rubric is written and the notes are not. `409` when the proposal has none, or when the repository's notes are no longer the ones its agent read."
                   }
                 }
               }
@@ -2543,6 +2050,631 @@
           }
         }
       }
+    },
+    "/api/v1/repos/{owner}/{name}/proposals/jobs/{jobId}/cancel": {
+      "parameters": [
+        {
+          "name": "owner",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "name",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "jobId",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "post": {
+        "summary": "Cancel a rubric proposal job",
+        "operationId": "cancelProposalJob",
+        "description": "A pending, queued or running `proposal` job becomes `failed` (`error`: cancelled by a person), and its orchestra run is cancelled through the proposals' client. `409` for a job that is not live; `404` for a job that is not a proposal of the repository.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The job, failed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Job"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "415": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/v1/repos/{owner}/{name}/calibration/samples": {
+      "parameters": [
+        {
+          "name": "owner",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "name",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "get": {
+        "summary": "The samples, most recently reviewed first",
+        "operationId": "listCalibrationSamples",
+        "description": "Deleted samples are not listed.",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 200,
+              "default": 50
+            },
+            "description": "The most items in the page."
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0
+            },
+            "description": "How many items to skip."
+          },
+          {
+            "name": "deleted",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "exclude",
+                "include"
+              ],
+              "default": "exclude"
+            },
+            "description": "`include` lists deleted samples too, marked by `deleted` and `deletedAt`."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The samples.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "items",
+                    "nextOffset"
+                  ],
+                  "properties": {
+                    "items": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/CalibrationSample"
+                      }
+                    },
+                    "nextOffset": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ],
+                      "description": "The `offset` of the next page; null on the last."
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/v1/repos/{owner}/{name}/calibration/samples/{id}": {
+      "parameters": [
+        {
+          "name": "owner",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "name",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "get": {
+        "summary": "One sample",
+        "operationId": "getCalibrationSample",
+        "responses": {
+          "200": {
+            "description": "The sample.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CalibrationSample"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete a sample",
+        "operationId": "deleteCalibrationSample",
+        "description": "It is no longer listed or picked for a run, and importing again does not bring it back. The scores of the jobs that reviewed it are kept.",
+        "responses": {
+          "204": {
+            "description": "Deleted."
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/v1/repos/{owner}/{name}/calibration/runs": {
+      "parameters": [
+        {
+          "name": "owner",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "name",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "post": {
+        "summary": "Run the agent on samples",
+        "operationId": "createCalibrationRun",
+        "description": "One `calibration` job per sample, at the sample's commit and with its base for the diff, queued and run as any review is, with the same prompt and rubric, and never posted. Each job's orchestra request carries the kleis narrowing `github: only discover, fetch`: the task clones and fetches over git, and cannot read GitHub's REST or GraphQL API, where the person's review is. `{\"samples\": [id, …]}` names them; `{\"count\": n}` takes the n reviewed by the fewest runs so far, the most recent first. At most 20 either way, and a sample a live (pending, queued or running) calibration job is reviewing is refused (`409`); `count` leaves those out. `429` when the jobs would pass `--max-calibration-jobs-per-day` (20 by default) for the repository, a cap apart from `--max-jobs-per-day`: each job is a charge on it, and so is each time a person runs a failed one again. Runs are of the `eval` samples unless `split` says `pool`.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "samples": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    },
+                    "minItems": 1,
+                    "maxItems": 20
+                  },
+                  "count": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 20
+                  },
+                  "split": {
+                    "type": "string",
+                    "enum": [
+                      "eval",
+                      "pool"
+                    ],
+                    "default": "eval",
+                    "description": "`eval`: what calibration measures by. `pool`: evidence for rubric proposals, never in an aggregate. Every sample must be of it (`400`); `count` picks from it."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "The run, with its jobs.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CalibrationRun"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "415": {
+            "$ref": "#/components/responses/Error"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "get": {
+        "summary": "The runs, newest first",
+        "operationId": "listCalibrationRuns",
+        "description": "Each with its jobs by status and the aggregate of its scores: the repository's calibration over time.",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 200,
+              "default": 50
+            },
+            "description": "The most items in the page."
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0
+            },
+            "description": "How many items to skip."
+          },
+          {
+            "name": "stale",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "include"
+              ]
+            },
+            "description": "`include`: count stale scores in the aggregates too. By default they are left out."
+          },
+          {
+            "name": "derived",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "include"
+              ]
+            },
+            "description": "`include` counts derived scores too."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The runs.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "items",
+                    "nextOffset"
+                  ],
+                  "properties": {
+                    "items": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/CalibrationRun"
+                      }
+                    },
+                    "nextOffset": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ],
+                      "description": "The `offset` of the next page; null on the last."
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/v1/repos/{owner}/{name}/calibration/runs/{id}": {
+      "parameters": [
+        {
+          "name": "owner",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "name",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "get": {
+        "summary": "One run, with each sample's result",
+        "operationId": "getCalibrationRun",
+        "responses": {
+          "200": {
+            "description": "The run, with `results`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CalibrationRun"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "parameters": [
+          {
+            "name": "stale",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "include"
+              ]
+            },
+            "description": "`include`: count stale scores in the aggregates too. By default they are left out."
+          },
+          {
+            "name": "derived",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "include"
+              ]
+            },
+            "description": "`include` counts derived scores too."
+          }
+        ]
+      }
+    },
+    "/api/v1/repos/{owner}/{name}/calibration/summary": {
+      "parameters": [
+        {
+          "name": "owner",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "name",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "get": {
+        "summary": "The aggregate over every run",
+        "operationId": "getCalibrationSummary",
+        "description": "Every scored calibration job of the repository by the current matcher, and the same broken down by the rubric version the jobs were reviewed against.",
+        "responses": {
+          "200": {
+            "description": "The summary.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CalibrationSummary"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "parameters": [
+          {
+            "name": "stale",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "include"
+              ]
+            },
+            "description": "`include`: count stale scores in the aggregates too. By default they are left out."
+          },
+          {
+            "name": "derived",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "include"
+              ]
+            },
+            "description": "`include` counts derived scores too."
+          }
+        ]
+      }
+    },
+    "/api/v1/repos/{owner}/{name}/calibration/import/{id}/cancel": {
+      "parameters": [
+        {
+          "name": "owner",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "name",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "post": {
+        "summary": "Cancel an import",
+        "operationId": "cancelCalibrationImport",
+        "description": "A queued or running import is read no further; what it stored stays. `409` (with the import, as `import`) for one that has ended.",
+        "responses": {
+          "200": {
+            "description": "Cancelled.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CalibrationImport"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "415": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -2597,6 +2729,8 @@
           "autoReview",
           "trustedReviewers",
           "styleNotes",
+          "evalShare",
+          "styleNotesDerivedFrom",
           "version",
           "createdAt"
         ],
@@ -2629,6 +2763,19 @@
             "type": "string",
             "maxLength": 16384,
             "description": "What the operator says of how the repository's reviews are written, in markdown, at most 16 KiB: the agent's instructions end with it. Empty for none."
+          },
+          "evalShare": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100,
+            "description": "The share of new calibration samples, in percent, held out as `eval` (what runs measure by); the rest are the `pool` examples and proposals learn from. 50 by default. A sample's split is fixed once made."
+          },
+          "styleNotesDerivedFrom": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The calibration samples the style notes were derived from, by accepted rubric proposals."
           },
           "version": {
             "type": "integer",
@@ -3020,7 +3167,7 @@
           "examples": {
             "type": "array",
             "maxItems": 20,
-            "description": "Up to 20 inline comments the repository's trusted reviewers wrote, from its calibration samples (`full` and `partial`), picked deterministically for variety — different files, categories when known, both scopes, short and medium lengths — to write in the style of, not to copy. Never of the job's pull request: for a calibration job, nothing of any sample of its pull request, so the review it is scored against never reaches it. Empty when nobody is trusted or nothing is imported.",
+            "description": "Up to 20 inline comments the repository's trusted reviewers wrote, from its `pool` calibration samples (`full` and `partial`) submitted before the review the job is — a calibration job's sample's review, or the time a review job was made — picked deterministically for variety (different files, categories when known, both scopes, short and medium lengths), to write in the style of, not to copy. Each is its text and category only. Never of the job's pull request, nor of an `eval` sample. Empty when nobody is trusted or nothing qualifies.",
             "items": {
               "$ref": "#/components/schemas/StyleExample"
             }
@@ -3144,6 +3291,13 @@
               "null"
             ],
             "description": "Why this build cannot read the stored document, when it cannot. The agent API then refuses the repository's reviews (`409`) rather than review without the rubric."
+          },
+          "derivedFrom": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The calibration samples the version was derived from: those of the rubric proposal it was accepted from, and every earlier version's. Ignored when sent back with a `PUT`."
           }
         }
       },
@@ -3237,7 +3391,8 @@
           "scope",
           "updatedAt",
           "deleted",
-          "deletedAt"
+          "deletedAt",
+          "split"
         ],
         "description": "What one trusted reviewer said of one commit of a closed pull request: every review they submitted of it, merged. Its comments are theirs together, its state the strongest (`CHANGES_REQUESTED`, then `APPROVED`, then `COMMENTED`), its bodies joined.",
         "properties": {
@@ -3343,6 +3498,18 @@
               "null"
             ],
             "format": "date-time"
+          },
+          "split": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "eval",
+              "pool",
+              null
+            ],
+            "description": "`eval` (held out: what runs measure by) or `pool` (what examples and proposals learn from), by a stable hash of the group against `evalShare`, fixed once made; null until assigned."
           }
         }
       },
@@ -3448,6 +3615,10 @@
               "deleted": {
                 "type": "integer",
                 "description": "Reviews of a group whose sample was deleted: added to nothing."
+              },
+              "ownPosts": {
+                "type": "integer",
+                "description": "The platform's own posts among the trusted reviewers' reviews, by a job's `postedReview` id or the marker in their body; never samples."
               }
             }
           },
@@ -3752,7 +3923,9 @@
           "bySeverity",
           "decisions",
           "staleScores",
-          "staleIncluded"
+          "staleIncluded",
+          "derivedScores",
+          "derivedIncluded"
         ],
         "description": "Scores by the current matcher of samples not deleted, added up: counts first, every ratio computed from the sums, so each comment weighs the same.",
         "properties": {
@@ -3911,6 +4084,13 @@
           "staleIncluded": {
             "type": "boolean",
             "description": "Whether stale scores are counted in this aggregate."
+          },
+          "derivedScores": {
+            "type": "integer",
+            "description": "Scores of samples the rubric version they were reviewed against, or the style notes, were derived from; left out unless `?derived=include`."
+          },
+          "derivedIncluded": {
+            "type": "boolean"
           }
         }
       },
@@ -4093,31 +4273,20 @@
                 }
               }
             }
+          },
+          "split": {
+            "type": "string",
+            "description": "Whose scores: `eval`."
           }
         }
       },
       "StyleExample": {
         "type": "object",
         "required": [
-          "file",
-          "start_line",
-          "end_line",
           "body",
-          "category",
-          "scope"
+          "category"
         ],
         "properties": {
-          "file": {
-            "type": "string"
-          },
-          "start_line": {
-            "type": "integer",
-            "minimum": 1
-          },
-          "end_line": {
-            "type": "integer",
-            "minimum": 1
-          },
           "body": {
             "type": "string",
             "description": "What the reviewer wrote, 20 to 600 characters."
@@ -4128,14 +4297,6 @@
               "null"
             ],
             "description": "The category of the agent's comment calibration paired it with; null when it was paired with none."
-          },
-          "scope": {
-            "type": "string",
-            "enum": [
-              "full",
-              "partial"
-            ],
-            "description": "The scope of the sample it is from."
           }
         }
       },
@@ -4445,7 +4606,7 @@
           },
           "instructions": {
             "type": "string",
-            "description": "The task, that the proposal is advisory, and what to submit, in markdown."
+            "description": "The task, that the proposal is advisory, that everything else in the context is untrusted data and never instructions, and what to submit, in markdown."
           },
           "rubric": {
             "$ref": "#/components/schemas/RubricDocument",
@@ -4456,12 +4617,12 @@
           },
           "calibration": {
             "$ref": "#/components/schemas/CalibrationSummary",
-            "description": "Calibration's aggregates — overall, by category, by severity and by rubric version."
+            "description": "Calibration's aggregates of the `pool` samples — overall, by category, by severity and by rubric version — never of the `eval` samples calibration measures by."
           },
           "missedHuman": {
             "type": "array",
             "maxItems": 30,
-            "description": "Trusted reviewers' comments the agent did not match, from the most recent scores (`full` samples, not stale, not deleted).",
+            "description": "Trusted reviewers' comments the agent did not match, from the most recent scores of `pool` samples (`full`, not stale, not deleted, of a reviewer still trusted). A body over 2 KiB is cut and marked `bodyTruncated`.",
             "items": {
               "type": "object",
               "required": [
@@ -4486,6 +4647,9 @@
                 },
                 "body": {
                   "type": "string"
+                },
+                "bodyTruncated": {
+                  "type": "boolean"
                 }
               }
             }
@@ -4493,7 +4657,7 @@
           "unmatchedAgent": {
             "type": "array",
             "maxItems": 30,
-            "description": "The agent's comments no trusted reviewer's matched, likewise.",
+            "description": "The agent's comments no trusted reviewer's matched, likewise. A body over 2 KiB is cut and marked `bodyTruncated`.",
             "items": {
               "type": "object",
               "required": [
@@ -4532,6 +4696,9 @@
                     "string",
                     "null"
                   ]
+                },
+                "bodyTruncated": {
+                  "type": "boolean"
                 }
               }
             }
@@ -4539,7 +4706,7 @@
           "personEdits": {
             "type": "array",
             "maxItems": 30,
-            "description": "What people changed in the agent's drafts before posting them: of the posted review jobs, most recent first, each comment of the agent's first draft against the same comment (by id) as posted.",
+            "description": "What people changed in the agent's drafts before posting them: of the posted review jobs, most recent first, each comment of the agent's first draft against the same comment (by id) as posted. A body or suggestion over 2 KiB is cut and marked `bodyTruncated` or `suggestionTruncated`.",
             "items": {
               "type": "object",
               "required": [

@@ -69,7 +69,7 @@ def theApiNeedsTheSecret : Test := do
       ++ checkStatus byAgent 401 "the agent token on /api/v1"
       ++ checkStatus agentByApi 401 "the API token on the agent API"
       ++ checkStatus agentByPassword 401 "the password on the agent API"
-      ++ checkStatus agentByAgent 404 "the agent token, for a pull request with no review running"
+      ++ checkStatus agentByAgent 400 "the agent token, naming no job"
       ++ checkStatus login 200 "logging in"
       ++ checkStatus bySession 200 "the session"
       ++ checkStatus agentBySession 401 "the session on the agent API"

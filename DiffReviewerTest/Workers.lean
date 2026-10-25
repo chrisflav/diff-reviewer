@@ -147,6 +147,23 @@ def agentReq (method : Std.Http.Method) (suffix : String) (body : String := "")
     (pr : Nat := 7) : Req :=
   req method s!"/api/agent/v1/repos/acme/widgets/pulls/{pr}{suffix}" body (token := agentToken)
 
+/-- `route`, for an agent's request about a pull request that names no job: named, as the
+    agent's `--job` names it, by the one review or calibration job of the pull request being run;
+    with none, by a job that is not one (`404`), and with two, not at all (`400`). -/
+def routeAgent (st : State) (r : Req) : IO Reply := do
+  if (r.header "x-diff-reviewer-job").isSome then return ← route st r
+  match r.path.splitOn "/" with
+  | _ :: _ :: _ :: _ :: "repos" :: o :: n :: "pulls" :: pr :: _ =>
+    let jobs := (← Platform.jobsOfPull o n (pr.toNat?.getD 0)).filter fun j =>
+      (j.status? == some .queued || j.status? == some .running) && j.kind? != some .proposal
+    let named (id : String) : Req :=
+      { r with header := fun k => if k == "x-diff-reviewer-job" then some id else r.header k }
+    match jobs.toList with
+    | [j] => route st (named j.id)
+    | [] => route st (named "none")
+    | _ => route st r
+  | _ => route st r
+
 /-- A submission of `review` at `head`; `prType` is JSON, `null` for a repository without pull
     request types. -/
 def submission (head : String) (review : String := fine) (prType : String := "null") : String :=
@@ -217,22 +234,22 @@ def anAgentReviewsAndItIsPosted : Test := withTempDb do
   let created ← route st (req .post "/api/v1/jobs"
     "{\"owner\": \"acme\", \"name\": \"widgets\", \"prNumber\": 7}")
   let id := (field created "id").getD ""
-  let beforeQueue ← route st (agentReq .get "")
+  let beforeQueue ← routeAgent st (agentReq .get "")
   Workers.queuePending svc
   let queued ← orch.queued.get
   let some q := queued[0]? | return #["nothing was queued"]
   let feature := "\"feature\""
-  let early ← route st (agentReq .post "/review" (submission headA (prType := feature)))
-  let shown ← route st (agentReq .get "")
-  let diff ← route st (agentReq .get "/diff")
-  let diff2 ← route st (agentReq .get "/diff")
-  let other ← route st (agentReq .get "" (pr := 8))
-  let wrongHead ← route st (agentReq .post "/review" (submission headB (prType := feature)))
-  let invalid ← route st (agentReq .post "/review" (submission headA
+  let early ← routeAgent st (agentReq .post "/review" (submission headA (prType := feature)))
+  let shown ← routeAgent st (agentReq .get "")
+  let diff ← routeAgent st (agentReq .get "/diff")
+  let diff2 ← routeAgent st (agentReq .get "/diff")
+  let other ← routeAgent st (agentReq .get "" (pr := 8))
+  let wrongHead ← routeAgent st (agentReq .post "/review" (submission headB (prType := feature)))
+  let invalid ← routeAgent st (agentReq .post "/review" (submission headA
     "{\"decision\": \"comment\", \"body\": \"\", \"comments\": [{\"file\": \"A.lean\", \"start_line\": 0, \"end_line\": 0, \"body\": \"x\"}]}"))
-  let submitted ← route st (agentReq .post "/review" (submission headA (prType := feature)))
-  let again ← route st (agentReq .post "/review" (submission headA (prType := feature)))
-  let afterSubmit ← route st (agentReq .get "")
+  let submitted ← routeAgent st (agentReq .post "/review" (submission headA (prType := feature)))
+  let again ← routeAgent st (agentReq .post "/review" (submission headA (prType := feature)))
+  let afterSubmit ← routeAgent st (agentReq .get "")
   let job ← route st (req .get s!"/api/v1/jobs/{id}")
   let approved ← route st (req .post s!"/api/v1/jobs/{id}/status"
     (statusBody "approved" (versionOf job)))
@@ -319,8 +336,8 @@ def aDirectReviewIsPostedOnSubmission : Test := withTempDb do
   let _ ← route st (req .post "/api/v1/jobs"
     s!"\{\"owner\": \"acme\", \"name\": \"widgets\", \"prNumber\": 7, \"headSha\": \"{headA}\"}")
   Workers.queuePending svc
-  let _ ← route st (agentReq .get "")
-  let submitted ← route st (agentReq .post "/review" (submission headA))
+  let _ ← routeAgent st (agentReq .get "")
+  let submitted ← routeAgent st (agentReq .post "/review" (submission headA))
   return checkEq (field submitted "status") (some "posted") "the job after the submission"
     ++ checkEq (← gh.posted.get).size 1 "reviews on GitHub"
 
@@ -437,11 +454,14 @@ def theAgentCliTalksToTheServer : Test := withTempDb do
   let (port, stop) ← Server.serve { cfg with port := 0 } svc
   try
     let agent : Agent.Config := { url := s!"http://127.0.0.1:{port}", token := agentToken }
-    let shown ← Agent.request agent "GET" "acme/widgets" "7" ""
-    let diff ← Agent.request agent "GET" "acme/widgets" "7" "/diff"
+    let some job := (← Platform.jobsOfPull "acme" "widgets" 7)[0]? | return #["no job"]
+    let shown ← Agent.request agent "GET" "acme/widgets" "7" "" (job := some job.id)
+    let diff ← Agent.request agent "GET" "acme/widgets" "7" "/diff" (job := some job.id)
     let wrong ← Agent.request { agent with token := "kleis" } "GET" "acme/widgets" "7" ""
+      (job := some job.id)
+    let unnamed ← Agent.request agent "GET" "acme/widgets" "7" ""
     let submitted ← Agent.request agent "POST" "acme/widgets" "7" "/review"
-      (some (submission jobHead))
+      (some (submission jobHead)) (job := some job.id)
     let status (r : Except String Http.Response) := match r with
       | .ok r => r.status
       | .error _ => 0
@@ -450,6 +470,7 @@ def theAgentCliTalksToTheServer : Test := withTempDb do
       ++ check (match diff with | .ok r => r.body.startsWith "diff --git" | .error _ => false)
         "the diff's text"
       ++ checkEq (status wrong) 401 "the placeholder, unreplaced"
+      ++ checkEq (status unnamed) 400 "a request that names no job"
       ++ checkEq (status submitted) 200 "submit"
   finally stop
 

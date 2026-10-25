@@ -32,14 +32,14 @@ USAGE:
       person may ask for per repository). --trusted-proxy is the reverse proxy whose
       X-Forwarded-For names the client, for the login rate limit.
 
-  diff-reviewer agent show   <owner/repo> <pr-number> [--job <id>]
-  diff-reviewer agent diff   <owner/repo> <pr-number> [--job <id>]
-  diff-reviewer agent submit <owner/repo> <pr-number> <submission.json | -> [--job <id>]
+  diff-reviewer agent show   <owner/repo> <pr-number> --job <id>
+  diff-reviewer agent diff   <owner/repo> <pr-number> --job <id>
+  diff-reviewer agent submit <owner/repo> <pr-number> <submission.json | -> --job <id>
       What a reviewing agent runs: the review it is to write, the diff under
       review, and submitting the review. The platform's URL and token are in
       ~/.config/diff-reviewer/agent.json ({\"url\": …, \"token\": …}), and
       $DIFF_REVIEWER_URL and $DIFF_REVIEWER_TOKEN override them. --job names
-      the job the agent's prompt gave it.
+      the job the agent's prompt gave it, and is required.
 
   diff-reviewer agent proposal show   <owner/repo> --job <id>
   diff-reviewer agent proposal submit <owner/repo> <proposal.json | -> --job <id>
@@ -175,8 +175,17 @@ private def cmdServe (flags : List String) : IO Unit := do
   let github ← GitHub.Client.fromEnv cfg.limits.maxDiffBytes
   if github.isNone then
     log "no DIFF_REVIEWER_GITHUB_TOKEN_FILE: no discovery, no diffs, no posting"
-  let orchestra ← Orchestra.Client.fromEnv
-  let proposer ← Orchestra.Client.fromEnv "DIFF_REVIEWER_ORCHESTRA_PROPOSER_TOKEN_FILE"
+  let orchestraUrl ← IO.getEnv "DIFF_REVIEWER_ORCHESTRA_URL"
+  let orchestraToken ← tokenFromEnv "DIFF_REVIEWER_ORCHESTRA_TOKEN_FILE"
+  let proposerToken ← tokenFromEnv "DIFF_REVIEWER_ORCHESTRA_PROPOSER_TOKEN_FILE"
+  let cfg := { cfg with orchestraToken, proposerToken }
+  if let .error e := cfg.check then
+    IO.eprintln s!"error: {e}"
+    IO.Process.exit 1
+  let client (tok? : Option String) : Option Orchestra.Client := do
+    return Orchestra.Client.curl (← orchestraUrl) (← tok?)
+  let orchestra := client orchestraToken
+  let proposer := client proposerToken
   if orchestra.isSome && proposer.isNone then
     log "no DIFF_REVIEWER_ORCHESTRA_PROPOSER_TOKEN_FILE: rubric proposals stay pending"
   let services ← Workers.Services.new github orchestra log cfg.limits proposer

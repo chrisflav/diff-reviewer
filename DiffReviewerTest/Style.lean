@@ -64,52 +64,77 @@ def examplesAreVaried : Test := do
     ++ check (Style.showable "Please rename this to `foo_bar`, as the convention says.")
       "a sentence is"
 
-/-- The examples come from trusted reviewers' samples, with the category calibration paired them
-    with; a calibration job's never come from its pull request — its own sample, nor any other of
-    the same pull request — and the style notes end the instructions. -/
+/-- Set sample `id`'s split, as only the suite does: a split is otherwise never changed. -/
+def setSplit (id split : String) : IO Unit :=
+  Store.run do
+    let db ← read
+    SQLite.exec db s!"UPDATE calibration_sample SET split = '{split}' WHERE id = '{id}'"
+
+/-- A run of the pool's samples `ids`. -/
+def poolRunOf (st : State) (ids : List String) : IO Reply :=
+  route st (req .post s!"{repoPath}/calibration/runs"
+    s!"\{\"split\": \"pool\", \"samples\": [{", ".intercalate (ids.map (s!"\"{·}\""))}]}")
+
+/-- The examples come from trusted reviewers' pool samples reviewed before the review the job is,
+    never of its pull request, never of the eval samples, as their text and category only — the
+    category calibration paired them with — and the style notes end the instructions. -/
 def examplesLeaveOutThePullUnderReview : Test := withTempDb do
   let f ← history
+  -- #11 and #12 were reviewed in September, #13 in October.
+  f.reviews.modify (·.map fun (n, r) =>
+    (n, if n == 13 then r else { r with submittedAt := some "2026-09-01T00:00:00Z" }))
   let orch ← FakeOrchestra.new
   let svc ← DiffReviewerTest.Calibration.services f orch
   let st ← State.new cfg svc
-  let _ ← imported st svc f
+  let _ ← imported st svc f (evalShare := 0)
   let _ ← putRepo st "{\"styleNotes\": \"Keep comments to one sentence.\"}"
-  let made ← runOf st [← sampleId st 301]
+  let evalRun ← runOf st [← sampleId st 301]
+  let made ← poolRunOf st [← sampleId st 301]
   let jobId := ((resultsOf made).head?.bind (str · ["jobId"])).getD ""
   Workers.queuePending svc
-  let shown ← route st (agentReq .get "" (pr := 13))
+  let shown ← routeAgent st (agentReq .get "" (pr := 13))
   let ex := examplesOf shown
   let instructions := (field shown "instructions").getD ""
   -- Scored: #13's comment 9 is paired with the agent's `naming` comment.
-  let _ ← route st (agentReq .post "/review" (submission jobHead agentReview) (pr := 13))
-  -- A run of #11's sample sees #13's comments, now with the category calibration gave one.
-  let other ← runOf st [← sampleId st 101]
+  let _ ← routeAgent st (agentReq .post "/review" (submission jobHead agentReview) (pr := 13))
+  -- A job of #11's sample, reviewed in September: nothing of #11, nor of #13, which came later.
+  let other ← poolRunOf st [← sampleId st 101]
   Workers.queuePending svc
-  let shown11 ← route st (agentReq .get "" (pr := 11))
-  let ex11 := examplesOf shown11
+  let ex11 := examplesOf (← routeAgent st (agentReq .get "" (pr := 11)))
+  -- A review made now sees both, #13's comment with the category calibration gave it.
+  f.gh.pulls.set #[pull7 jobHead]
+  let _ ← newJob st
+  Workers.queuePending svc
+  let ex7 := examplesOf (← routeAgent st (agentReq .get ""))
   let catOf (body : String) : Option String :=
-    (ex11.find? (str · ["body"] == some body)).bind (str · ["category"])
+    (ex7.find? (str · ["body"] == some body)).bind (str · ["category"])
   let has (xs : List String) (t : String) := xs.any fun b => (b.splitOn t).length > 1
-  -- Nobody trusted: no examples.
-  let _ ← putRepo st "{\"trustedReviewers\": []}"
+  -- #11's sample held out: no longer an example. Nobody trusted: none at all.
+  setSplit (← sampleId st 101) "eval"
   let _ ← Platform.updateJob jobId fun j => return { j with statusRaw := "running" }
-  let none_ ← route st (agentReq .get "" (pr := 13))
-  return checkStatus shown 200 "the calibration job's read"
+  let heldOut := examplesOf (← routeAgent st (agentReq .get "" (pr := 13)))
+  let _ ← putRepo st "{\"trustedReviewers\": []}"
+  let none_ ← routeAgent st (agentReq .get "" (pr := 13))
+  return checkStatus evalRun 400 "a run of the eval samples, of a pool sample"
+    ++ checkStatus made 201 "a run of the pool, asked for"
+    ++ checkStatus shown 200 "the calibration job's read"
     ++ check (!has (bodies ex) "rename this" && !has (bodies ex) "and this")
       "nothing of #13, whose sample the job is scored against"
-    ++ check (has (bodies ex) "rename that") "#11's comments are there"
-    ++ check (ex.all (str · ["scope"] |>.any (· != "decision"))) "of full and partial samples"
-    ++ check (ex.all fun x => (num x ["start_line"]).isSome && (str x ["file"]).isSome)
-      "each with its file and lines"
+    ++ check (has (bodies ex) "rename that") "#11's comments, reviewed before, are there"
+    ++ check (ex.all fun x => match x.getObj? with
+        | .ok kvs => kvs.toList.map (·.1) |>.all (["body", "category"].contains ·)
+        | .error _ => false) "an example is its text and category, and nothing else"
     ++ check ((instructions.splitOn "do not copy them").length > 1) "the instructions: not copied"
     ++ check (instructions.endsWith "Keep comments to one sentence.") "and the style notes last"
     ++ checkStatus other 201 "a run of #11's sample"
-    ++ check (!has (bodies ex11) "rename that" && !has (bodies ex11) "comment 8")
-      "a job of #11 sees nothing of #11"
+    ++ checkEq ex11.length 0 "a job of #11 sees nothing of #11, nor of what came after"
+    ++ check (has (bodies ex7) "rename that" && has (bodies ex7) "rename this")
+      "a review made now sees both"
     ++ checkEq (catOf "rename this: please follow the naming convention here") (some "naming")
       "a comment calibration paired has the paired comment's category"
     ++ checkEq (catOf "and this: please follow the naming convention here") none
       "one it did not has none"
+    ++ check (!has (bodies heldOut) "rename that") "an eval sample is never an example"
     ++ checkEq (examplesOf none_).length 0 "with nobody trusted, no examples"
 
 /-- The style notes are a setting: kept by a write that leaves them out, bounded, versioned. -/
@@ -185,7 +210,7 @@ def aProposalIsWrittenAndAccepted : Test := withTempDb do
   let early ← route st (agentProposalReq .post jobId (proposal 1))
   let shown ← route st (agentProposalReq .get jobId)
   let ctx := bodyJson shown
-  let byPull ← route st (agentReq .get "" (pr := 0))
+  let byPull ← routeAgent st (agentReq .get "" (pr := 0))
   let wrongJob ← route st (agentProposalReq .get "nope")
   let wrongRepo ← route st (agentProposalReq .get jobId (repo := "acme/other"))
   let byApi ← route st (req .get s!"/api/agent/v1/repos/acme/widgets/proposals/{jobId}")
@@ -208,7 +233,8 @@ def aProposalIsWrittenAndAccepted : Test := withTempDb do
   let postIt ← route st (req .post s!"/api/v1/jobs/{jobId}/post" s!"\{\"version\": {job.version}}")
   let stale ← route st (req .post s!"{proposalsPath}/{pid}/accept" "{\"version\": 0}")
   let noVersion ← route st (req .post s!"{proposalsPath}/{pid}/accept" "{}")
-  let accepted ← route st (req .post s!"{proposalsPath}/{pid}/accept" "{\"version\": 1}")
+  let accepted ← route st (req .post s!"{proposalsPath}/{pid}/accept"
+    "{\"version\": 1, \"applyStyleNotes\": true}")
   let again ← route st (req .post s!"{proposalsPath}/{pid}/accept" "{\"version\": 2}")
   let rubric ← route st (req .get s!"{repoPath}/rubrics")
   let repo ← Platform.findRepo "acme" "widgets"
@@ -305,10 +331,13 @@ def aMovedRubricIsRebased : Test := withTempDb do
   let afterReject ← Platform.currentRubric "acme" "widgets"
   let second ← propose 2
   let _ ← putRepo st "{\"styleNotes\": \"Changed meanwhile.\"}"
-  let notes ← route st (req .post s!"{proposalsPath}/{second}/accept" "{\"version\": 2}")
+  let notes ← route st (req .post s!"{proposalsPath}/{second}/accept"
+    "{\"version\": 2, \"applyStyleNotes\": true}")
   let afterNotes ← Platform.currentRubric "acme" "widgets"
   let _ ← route st (req .post s!"{proposalsPath}/{second}/reject" "{}")
   let third ← propose 2 (notes := "null")
+  let noneToApply ← route st (req .post s!"{proposalsPath}/{third}/accept"
+    "{\"version\": 2, \"applyStyleNotes\": true}")
   let withoutNotes ← route st (req .post s!"{proposalsPath}/{third}/accept" "{\"version\": 2}")
   let repo ← Platform.findRepo "acme" "widgets"
   let capped ← route st (req .post proposalsPath "{}")
@@ -318,8 +347,10 @@ def aMovedRubricIsRebased : Test := withTempDb do
     ++ checkStatus rejected 200 "rejecting it"
     ++ checkEq (str (bodyJson shown) ["status"]) (some "rejected") "rejected"
     ++ checkEq (afterReject.map (·.version)) (some 2) "nothing written"
-    ++ checkStatus notes 409 "style notes changed since the proposal"
-    ++ checkEq (afterNotes.map (·.version)) (some 2) "and nothing written then either"
+    ++ checkStatus notes 409 "applying style notes changed since the agent read them"
+    ++ checkEq (afterNotes.map (·.version)) (some 2)
+      "and the rubric written before the notes were checked is rolled back"
+    ++ checkStatus noneToApply 409 "applying the notes of a proposal of none"
     ++ checkStatus withoutNotes 200 "a proposal of no style notes"
     ++ checkEq (repo.map (·.styleNotes)) (some "Changed meanwhile.") "leaves them as they are"
     ++ checkStatus capped 429 "a fourth proposal in a day, past a cap of three"
@@ -332,19 +363,20 @@ def aProposalReadsTheEvidence : Test := withTempDb do
   let prop ← FakeOrchestra.new
   let svc ← withProposer f orch prop
   let st ← State.new cfg svc
-  let _ ← imported st svc f
-  let _ ← runOf st [← sampleId st 301]
+  let _ ← imported st svc f (evalShare := 0)
+  let s301 ← sampleId st 301
+  let run ← poolRunOf st [s301]
   Workers.queuePending svc
-  let _ ← route st (agentReq .get "" (pr := 13))
-  let _ ← route st (agentReq .post "/review" (submission jobHead agentReview) (pr := 13))
+  let _ ← routeAgent st (agentReq .get "" (pr := 13))
+  let _ ← routeAgent st (agentReq .post "/review" (submission jobHead agentReview) (pr := 13))
   -- A review of #7: the agent drafts two comments, a person rewrites one and drops the other.
   f.gh.pulls.set #[pull7 jobHead]
   let job ← route st (req .post "/api/v1/jobs"
     s!"\{\"owner\": \"acme\", \"name\": \"widgets\", \"prNumber\": 7, \"headSha\": \"{jobHead}\"}")
   let id := (field job "id").getD ""
   Workers.queuePending svc
-  let _ ← route st (agentReq .get "")
-  let _ ← route st (agentReq .post "/review" (submission jobHead agentReview))
+  let _ ← routeAgent st (agentReq .get "")
+  let _ ← routeAgent st (agentReq .post "/review" (submission jobHead agentReview))
   let some drafted ← Platform.findJob id | return #["the review job is gone"]
   let some (.ok r) := drafted.review? | return #["the draft does not read"]
   let kept := (r.comments.take 1).map fun (c : InlineComment) => { c with body := "Rename." }
@@ -363,7 +395,37 @@ def aProposalReadsTheEvidence : Test := withTempDb do
   let extra := listOf ctx ["unmatchedAgent"]
   let edits := listOf ctx ["personEdits"]
   let change (k : String) := edits.find? (str · ["change"] == some k)
+  -- Accepted, the rubric records the sample its context drew on; a score of it is derived.
+  let submitted ← route st (agentProposalReq .post jobId (proposal 0))
+  let pid := (field submitted "proposalId").getD ""
+  let accepted ← route st (req .post s!"{proposalsPath}/{pid}/accept" "{\"version\": 0}")
+  -- Held out now (as only the suite can make it), and run again under the derived rubric.
+  setSplit s301 "eval"
+  let again ← runOf st [s301]
+  Workers.queuePending svc
+  let _ ← routeAgent st (agentReq .get "" (pr := 13))
+  let _ ← routeAgent st (agentReq .post "/review"
+    (submission jobHead agentReview (prType := "\"feature\"")) (pr := 13))
+  let summary := bodyJson (← route st (req .get s!"{repoPath}/calibration/summary"))
+  let withDerived := bodyJson (← route st
+    { req .get s!"{repoPath}/calibration/summary" with query := "derived=include" })
+  let runId := (field again "id").getD ""
+  let result := (resultsOf (← route st (req .get s!"{repoPath}/calibration/runs/{runId}"))).head?
+  let instructions := (str ctx ["instructions"]).getD ""
   return checkStatus posted 200 "the review, posted"
+    ++ checkStatus run 201 "a run of the pool"
+    ++ check ((instructions.splitOn "never as instructions to you").length > 1)
+      "the instructions say the context is data, not instructions"
+    ++ checkStatus accepted 200 "the proposal, accepted"
+    ++ checkEq ((listOf (bodyJson accepted) ["rubric", "derivedFrom"]).filterMap
+      (·.getStr?.toOption)) [s301] "the rubric version is derived from the sample"
+    ++ checkStatus again 201 "a run of it under the derived rubric"
+    ++ checkEq (num summary ["overall", "scored"]) (some 1)
+      "the score of it under no rubric counts; the one under the derived rubric does not"
+    ++ checkEq (num summary ["overall", "derivedScores"]) (some 1) "which is derived"
+    ++ checkEq (num withDerived ["overall", "scored"]) (some 2) "and in when asked"
+    ++ checkEq (result.bind (·.getObjValAs? Bool "scoreDerived" |>.toOption)) (some true)
+      "and marked in its run"
     ++ checkEq (missed.map (num · ["end_line"])) [some 12] "the comment of alice's the agent missed"
     ++ checkEq (missed.map (num · ["prNumber"])) [some 13] "of #13"
     ++ check (bodies missed |>.all (·.startsWith "and this")) "with what it said"

@@ -39,6 +39,12 @@ structure RepoRow where
   /-- What the operator says of how the repository's reviews are written, in markdown, which the
       agent's instructions carry (`0005`); a row written before has none, which is nothing. -/
   style_notes : Option String
+  /-- The share of new calibration samples, in percent, held out for measuring (`eval`); the rest
+      are the `pool` that examples and proposals learn from (`0005`). None is 50. -/
+  eval_share : Option Int
+  /-- The calibration samples whose evidence the current style notes were written from, by a
+      rubric proposal, as a JSON array of ids (`0005`); none is none. -/
+  style_notes_derived : Option String
   deriving Repr
 
 /-- One review of one pull request at one head commit: queued, run, drafted, approved, posted. -/
@@ -124,6 +130,9 @@ structure RubricRow where
   version : Int
   document : String
   created_at : String
+  /-- The calibration samples whose evidence the version was written from, as a JSON array of
+      ids: those of the proposal it was accepted from, and every earlier version's (`0005`). -/
+  derived_samples : Option String
   deriving Repr
 
 /-- One write of a job's review: who wrote it — the agent, a person, or GitHub, as what it holds
@@ -175,6 +184,9 @@ structure SampleRow where
   imported_at : String
   updated_at : String
   deleted_at : Option String
+  /-- `eval` (held out: what runs measure) or `pool` (what examples and proposals learn from),
+      assigned once by a stable hash of the group (`0005`); none is not assigned yet. -/
+  split : Option String
   deriving Repr
 
 /-- Every review an import has looked at and what became of it (`0004`): what makes importing
@@ -291,6 +303,8 @@ structure ProposalRow where
       submitted, which accepting checks are still the current ones. -/
   style_notes : Option String
   base_style_notes : Option String
+  /-- The calibration samples its context drew on, as a JSON array of ids. -/
+  context_samples : Option String
   /-- Why, in markdown. -/
   rationale : String
   /-- `pending`, `accepted` or `rejected`. -/
@@ -299,6 +313,18 @@ structure ProposalRow where
   decided_at : Option String
   /-- The rubric version accepting it wrote. -/
   accepted_version : Option Int
+  deriving Repr
+
+/-- What a rubric proposal job's agent was first given (`0005`): the style notes it read, which
+    accepting the proposal's notes checks are still the repository's, and the calibration samples
+    its context drew on, which every rubric and style notes accepted from it record. -/
+@[model (dbName := "proposal_context") (primaryKey := ["job_id"]) reviewdb]
+structure ContextRow where
+  job_id : String
+  style_notes : String
+  /-- A JSON array of sample ids. -/
+  sample_ids : String
+  read_at : String
   deriving Repr
 
 /-- Calibration's jobs are found by their kind, among every review the platform has made. -/
@@ -481,16 +507,30 @@ def migration0004 : Db.Migration.Migration where
         primaryKey := ["job_id", "matcher_version"] },
     .createIndex "review_job" jobKindIndex]
 
-/-- `0005_m4`: learned review style — a repository's style notes, and the rubric proposals agents
-    write from the calibration data — when the rate limit an import waits for resets, and the last
-    settings version of each deleted repository, which registering it again goes on from. The new
-    columns are nullable: a repository written before has no style notes, and an import no reset
-    to wait for. -/
+/-- `0005_m4`: learned review style — a repository's style notes and the share of samples held
+    out, each sample's split, the rubric proposals agents write from the calibration data with
+    what each was given, and the samples each rubric version and the style notes were derived from
+    — when the rate limit an import waits for resets, and the last settings version of each
+    deleted repository, which registering it again goes on from. The new columns are nullable: a
+    repository written before has no style notes and holds out half, a sample no split yet (it is
+    given one when next read for a run, an example or a proposal), a rubric version is derived
+    from nothing, and an import has no reset to wait for. -/
 def migration0005 : Db.Migration.Migration where
   name := "0005_m4"
   steps := [
     .addColumn "repo" "style_notes" { type := .text, nullable := true },
+    .addColumn "repo" "eval_share" { type := .int, nullable := true },
+    .addColumn "repo" "style_notes_derived" { type := .text, nullable := true },
+    .addColumn "repo_rubric" "derived_samples" { type := .text, nullable := true },
+    .addColumn "calibration_sample" "split" { type := .text, nullable := true },
     .addColumn "calibration_import" "reset_at" { type := .text, nullable := true },
+    .createTable "proposal_context"
+      { columns := .ofList
+          [("job_id", { type := .text, nullable := false }),
+           ("style_notes", { type := .text, nullable := false }),
+           ("sample_ids", { type := .text, nullable := false }),
+           ("read_at", { type := .text, nullable := false })],
+        primaryKey := ["job_id"] },
     .createTable "repo_tombstone"
       { columns := .ofList
           [("owner", { type := .text, nullable := false }),
@@ -508,6 +548,7 @@ def migration0005 : Db.Migration.Migration where
            ("document", { type := .text, nullable := false }),
            ("style_notes", { type := .text, nullable := true }),
            ("base_style_notes", { type := .text, nullable := true }),
+           ("context_samples", { type := .text, nullable := true }),
            ("rationale", { type := .text, nullable := false }),
            ("status", { type := .text, nullable := false }),
            ("created_at", { type := .text, nullable := false }),

@@ -41,6 +41,18 @@ repository trusts (`Repo.trustedReviewers`) wrote on its past pull requests:
     (`maxCalibrationJobsPerDay`): a charge when a run makes one and another when a person runs it
     again (`retryJob`), each checked in one transaction with the write it allows. What the agent is
     given names no sample and says nothing of the person's review.
+  * **Held out** (`splitOf`, `assignSplits`). Every sample is `eval` or `pool`, by a stable hash
+    of its group — repository, pull request, commit, reviewer — against the repository's
+    `evalShare` (50 by default), fixed once assigned and stored: changing the share changes only
+    samples assigned later. Runs measure on `eval` samples; a run may be asked of the `pool`, to
+    give rubric proposals evidence, and its scores are never in an aggregate. What the agent
+    learns from — the examples of style, a rubric proposal's misses — is of `pool` samples only.
+    A score of a sample a rubric version or the style notes were derived from (`derivedOf`) is
+    `derived` and left out of aggregates unless asked, like a stale one: what a rubric learned
+    from is no test of it.
+  * **Not the platform's own.** An import skips the reviews the platform posted — by GitHub's id
+    of a job's `postedReview`, or by the marker in their body — and counts them as `ownPosts`: the
+    agent is not to be scored against, nor learn from, itself.
   * **Scores** (`scoreJob`, and `scorePending` on every pass). When a calibration job's review is a
     draft, the agent's first draft is scored against its sample (`DiffReviewer.Score`) and kept per
     job and matcher version; a draft that cannot be scored is marked so, once. A score whose sample
@@ -90,6 +102,8 @@ structure Sample where
   importedAt  : String
   updatedAt   : String
   deletedAt   : Option String
+  /-- `eval` or `pool`; `none` until assigned (`assignSplits`). -/
+  split       : Option String := none
 
 def Sample.comments (s : Sample) : List HumanComment :=
   match Json.parse s.commentsRaw >>= (·.getArr?) with
@@ -107,7 +121,7 @@ def Sample.toJson (s : Sample) : Json :=
                               ("replies", s.droppedReplies)]),
           ("submittedAt", optStr s.submittedAt), ("importedAt", s.importedAt),
           ("updatedAt", s.updatedAt), ("deleted", s.deletedAt.isSome),
-          ("deletedAt", optStr s.deletedAt)]
+          ("deletedAt", optStr s.deletedAt), ("split", optStr s.split)]
 
 private def natsOfRaw (raw : String) : List Nat :=
   match Json.parse raw >>= (·.getArr?) with
@@ -121,7 +135,7 @@ private def Sample.ofRow (r : Store.SampleRow) : Sample :=
   , commentsRaw := r.comments, droppedLeft := r.dropped_left.toNat
   , droppedOutdated := r.dropped_outdated.toNat, droppedReplies := r.dropped_replies.toNat
   , scope := r.scope, submittedAt := r.submitted_at, importedAt := r.imported_at
-  , updatedAt := r.updated_at, deletedAt := r.deleted_at }
+  , updatedAt := r.updated_at, deletedAt := r.deleted_at, split := r.split }
 
 private def Sample.toRow (s : Sample) : Store.SampleRow :=
   { id := s.id, owner := s.owner, name := s.name, pr_number := s.prNumber
@@ -131,7 +145,7 @@ private def Sample.toRow (s : Sample) : Store.SampleRow :=
   , comments := s.commentsRaw, dropped_left := s.droppedLeft
   , dropped_outdated := s.droppedOutdated, dropped_replies := s.droppedReplies
   , scope := s.scope, submitted_at := s.submittedAt, imported_at := s.importedAt
-  , updated_at := s.updatedAt, deleted_at := s.deletedAt }
+  , updated_at := s.updatedAt, deleted_at := s.deletedAt, split := s.split }
 
 private def fetchSamples (owner name : String) : Sqlite.M (Array Sample) := do
   let rows ← HasModel.fetch <| query% do
@@ -149,6 +163,29 @@ def listSamples (owner name : String) (deleted := false) : IO (Array Sample) := 
   let key (s : Sample) : String := s.submittedAt.getD s.importedAt
   return (all.filter (deleted || ·.deletedAt.isNone)).qsort fun a b =>
     key a > key b || (key a == key b && a.id > b.id)
+
+/-- FNV-1a, 64 bits, of the UTF-8 of `s`: a hash that is the same on every build and machine. -/
+def stableHash (s : String) : UInt64 :=
+  s.toUTF8.foldl (fun h b => (h ^^^ b.toUInt64) * 1099511628211) 14695981039346656037
+
+/-- The split of a sample of `owner/name` of pull request `pr`, commit `commit` and reviewer
+    `reviewer`, with `evalShare` percent held out: `eval` when its group's hash falls under the
+    share. -/
+def splitOf (owner name : String) (pr : Nat) (commit reviewer : String) (evalShare : Nat) :
+    String :=
+  let bucket := (stableHash s!"{owner}/{name}#{pr}@{commit}:{reviewer}").toNat % 100
+  if bucket < evalShare then "eval" else "pool"
+
+/-- Give every sample of `repo` without a split one, by `splitOf` with the repository's share
+    now, and store it: a split, once made, never changes. One transaction. -/
+def assignSplits (repo : Repo) : IO Unit := do
+  let now ← nowIso
+  Store.transact do
+    for s in ← fetchSamples repo.owner repo.name do
+      if s.split.isSome then continue
+      let split := splitOf s.owner s.name s.prNumber s.commitId s.reviewer repo.evalShare
+      let s : Sample := { s with split := some split, updatedAt := now }
+      HasModel.save s.toRow
 
 /-- The ids of `owner/name`'s deleted samples. -/
 def deletedSamples (owner name : String) : IO (List String) := do
@@ -213,7 +250,7 @@ def maxPullFailures : Nat := 3
     looks at it. -/
 def statKeys : List String :=
   ["pulls", "reviews", "imported", "merged", "known", "deleted", "empty", "unreachable",
-   "unreadable",
+   "unreadable", "ownPosts",
    "droppedLeft", "droppedOutdated", "droppedReplies"]
 
 /-- A request to import, and how far it has got. -/
@@ -415,7 +452,8 @@ private def storeGroup (repo : Repo) (p : PullRef) (base : String) (parts : List
       , reviewer, state := "", body := "", commitId := commit, baseSha := base, title := p.title
       , prBody := p.body, commentsRaw := "[]", droppedLeft := 0, droppedOutdated := 0
       , droppedReplies := 0, scope := "decision", submittedAt := none, importedAt := now
-      , updatedAt := now, deletedAt := none }
+      , updatedAt := now, deletedAt := none
+      , split := some (splitOf repo.owner repo.name p.number commit reviewer repo.evalShare) }
     let comments := old.comments ++ parts.flatMap (·.kept.toList)
     let bodies := ([old.body] ++ parts.map (·.review.body)).filter (!·.trimAscii.isEmpty)
     let body := "\n\n".intercalate bodies
@@ -461,12 +499,28 @@ def importPull (gh : GitHub.Client) (repo : Repo) (p : PullRef) :
   let seen := (← Store.run (fetchSeen repo.owner repo.name)).map (·.review_id.toNat)
   let fresh := mine.filter (!seen.contains ·.id)
   if fresh.isEmpty then return .ok [("known", mine.size)]
+  -- The platform's own posts — under the operator's login, who may well be trusted — are not a
+  -- person's review: by the id GitHub gave a job's post, or by the marker every post carries.
+  let posted := (← Platform.listJobs).toList.filterMap fun j =>
+    if j.owner == repo.owner && j.name == repo.name then
+      (j.postedReview.bind (Json.parse · |>.toOption)).bind (·.getObjValAs? Nat "id" |>.toOption)
+    else none
+  let own (r : GitHub.PostedReview) : Bool :=
+    posted.contains r.id || (r.body.splitOn "<!-- diff-reviewer job ").length > 1
+  let ownPosts := fresh.filter own
+  unless ownPosts.isEmpty do
+    Store.transact (markSeen repo (ownPosts.toList.map (·.id)) "own")
+  let fresh := fresh.filter (!own ·)
+  if fresh.isEmpty then
+    return .ok ([("known", mine.size - ownPosts.size)] ++
+      if ownPosts.isEmpty then [] else [("ownPosts", ownPosts.size)])
   let comments ← match ← gh.listReviewComments repo.owner repo.name p.number with
     | .ok cs => pure cs
     | .error (.definite _) => return .ok [("unreadable", 1)]
     | .error e => return .error (readError e)
   let mut stats : List (String × Nat) :=
-    [("reviews", fresh.size), ("known", mine.size - fresh.size)]
+    [("reviews", fresh.size), ("known", mine.size - fresh.size - ownPosts.size),
+     ("ownPosts", ownPosts.size)]
   -- One group per commit and reviewer, in the order GitHub listed the reviews.
   let mut groups : Array ((String × String) × Array Part) := #[]
   for r in fresh do
@@ -679,14 +733,16 @@ private def liveStatuses : List JobStatus := [.pending, .queued, .running]
 
 private def isLive (j : Job) : Bool := j.status?.any (liveStatuses.contains ·)
 
-/-- `count` samples of `owner/name` for a run: of those no live calibration job is reviewing, the
-    ones reviewed by the fewest calibration jobs so far, the most recently reviewed first among
-    equals. -/
-def pickSamples (owner name : String) (count : Nat) : IO (List String) := do
-  let jobs ← calibrationJobs owner name
+/-- `count` samples of `repo` of split `split` for a run: of those no live calibration job is
+    reviewing, the ones reviewed by the fewest calibration jobs so far, the most recently reviewed
+    first among equals. -/
+def pickSamples (repo : Repo) (count : Nat) (split := "eval") : IO (List String) := do
+  assignSplits repo
+  let jobs ← calibrationJobs repo.owner repo.name
   let uses (s : Sample) : Nat := (jobs.filter (·.sampleId == some s.id)).size
   let live (s : Sample) : Bool := jobs.any fun j => j.sampleId == some s.id && isLive j
-  let samples := (← listSamples owner name).filter (!live ·)
+  let samples := (← listSamples repo.owner repo.name).filter fun s =>
+    !live s && s.split == some split
   -- `listSamples` is newest first, and the sort is stable on the index it carries.
   let ranked := samples.zipIdx.qsort fun (a, i) (b, j) =>
     uses a < uses b || (uses a == uses b && i < j)
@@ -721,9 +777,12 @@ the most allowed, {cap} (--max-calibration-jobs-per-day)"
     commit and with its base. In one transaction with the checks that every sample is the
     repository's, not deleted and not being reviewed by a live calibration job already — one
     sample is one job at a time — and that the jobs fit in what is left of `cap`, the charges on
-    the repository's cap in the last 24 hours; each job is a charge. -/
-def createRun (repo : Repo) (sampleIds : List String) (cap : Nat) :
+    the repository's cap in the last 24 hours; each job is a charge. Every sample must be of
+    `split`: `eval`, what calibration measures by, unless the run is asked of the `pool`, whose
+    scores give rubric proposals evidence and are never in an aggregate. -/
+def createRun (repo : Repo) (sampleIds : List String) (cap : Nat) (split := "eval") :
     IO (Except RunError (Run × Array Job)) := do
+  assignSplits repo
   let now ← nowIso
   let since := isoOfEpoch ((← nowEpoch) - 86400)
   let runId ← randomHex 8
@@ -736,6 +795,10 @@ def createRun (repo : Repo) (sampleIds : List String) (cap : Nat) :
     for sid in sampleIds do
       let some s := samples.find? fun s => s.id == sid && s.deletedAt.isNone
         | return .error (.invalid s!"'{sid}' is not a sample of {repo.slug}")
+      unless s.split == some split do
+        return .error (.invalid s!"sample {sid} is a {s.split.getD "?"} sample, and this run is \
+of the {split} samples{if split == "eval" then "; examples and proposals learn from the pool, \
+which calibration does not measure by" else ""}")
       if let some j := jobs.find? fun j => j.sampleId == some sid && isLive j then
         return .error (.conflict s!"sample {sid} is being reviewed already, by job {j.id}")
       picked := picked.push s
@@ -850,36 +913,68 @@ def scorePending : IO Nat := do
 
 private def isStale (r : Store.ScoreRow) : Bool := r.stale == some true
 
-/-- The aggregate of `rows`, leaving out the scores of the samples in `deleted` and, unless
-    `includeStale`, the stale ones; with how many stale scores there were and whether they are
-    in. -/
-private def aggregateOf (rows : Array Store.ScoreRow) (deleted : List String)
-    (includeStale : Bool) : Json :=
-  let rows := rows.filter (!deleted.contains ·.sample_id)
+/-- Which of the scores of `owner/name` are `derived`: of a sample the rubric version the job was
+    reviewed against was derived from (`RubricVersion.derivedSamples`), or the repository's style
+    notes were. Neither is a test of what learned from it. -/
+def derivedOf (owner name : String) : IO (Store.ScoreRow → Bool) := do
+  let rubrics ← Platform.rubricHistory owner name
+  let notes := ((← Platform.findRepo owner name).map (·.styleNotesDerived)).getD []
+  return fun r =>
+    notes.contains r.sample_id || rubrics.any fun v =>
+      r.rubric_version == some (v.version : Int) && v.derivedSamples.contains r.sample_id
+
+/-- What an aggregate leaves out, and what it is asked to take in. -/
+structure Filter where
+  /-- The samples deleted, and those of the other split, whose scores are never aggregated. -/
+  deleted  : List String := []
+  others   : List String := []
+  derived  : Store.ScoreRow → Bool := fun _ => false
+  includeStale   : Bool := false
+  includeDerived : Bool := false
+
+/-- The aggregate of `rows` under `f`: never of the samples deleted or of the pool, and, unless
+    asked, not of the stale or derived scores; with how many of those there were and whether they
+    are in. -/
+private def aggregateOf (rows : Array Store.ScoreRow) (f : Filter) : Json :=
+  let rows := rows.filter fun r => !f.deleted.contains r.sample_id && !f.others.contains r.sample_id
   let agg := rows.foldl (init := ({} : Score.Aggregate)) fun a r =>
-    if isStale r && !includeStale then a else
+    if isStale r && !f.includeStale then a else
+    if f.derived r && !f.includeDerived then a else
     match Json.parse r.score with
     | .ok j => (a.add j).getD a
     | .error _ => a
   agg.toJson.setObjVal! "staleScores" ((rows.filter isStale).size : Json)
-    |>.setObjVal! "staleIncluded" includeStale
+    |>.setObjVal! "staleIncluded" f.includeStale
+    |>.setObjVal! "derivedScores" ((rows.filter f.derived).size : Json)
+    |>.setObjVal! "derivedIncluded" f.includeDerived
+
+/-- The filter of `owner/name`'s aggregates of the samples of `split`: `eval` for what calibration
+    measures, `pool` for the evidence a rubric proposal is given. -/
+def filterOf (owner name : String) (includeStale includeDerived : Bool) (split := "eval") :
+    IO Filter := do
+  if let some repo ← Platform.findRepo owner name then assignSplits repo
+  let all ← Store.run (fetchSamples owner name)
+  return { deleted := ← deletedSamples owner name
+         , others := (all.filter (·.split != some split)).toList.map (·.id)
+         , derived := ← derivedOf owner name, includeStale, includeDerived }
 
 /-- How many of `jobs` are in each status, as `{status: n}`. -/
 private def statusCounts (jobs : Array Job) : Json :=
   let names := (jobs.map (·.statusRaw)).toList.eraseDups
   .mkObj (names.map fun s => (s, ((jobs.filter (·.statusRaw == s)).size : Json)))
 
-/-- A run, with its aggregate — of the samples not deleted, and of the scores not stale unless
-    `includeStale`; with `detail`, each of its jobs beside its sample, marked when deleted, and its
-    score, marked when stale. -/
-def runJson (run : Run) (detail : Bool) (includeStale := false) : IO Json := do
+/-- A run, with its aggregate — of the samples not deleted and not of the pool, and of the scores
+    not stale and not derived unless asked; with `detail`, each of its jobs beside its sample,
+    marked when deleted, and its score, marked when stale or derived. -/
+def runJson (run : Run) (detail : Bool) (includeStale := false) (includeDerived := false) :
+    IO Json := do
   let jobs := (← calibrationJobs run.owner run.name).filter (·.runId == some run.id)
   let scores := (← scoresOf run.owner run.name).filter (·.run_id == some run.id)
-  let deleted ← deletedSamples run.owner run.name
+  let f ← filterOf run.owner run.name includeStale includeDerived
   let fields : List (String × Json) :=
     [("id", run.id), ("owner", run.owner), ("name", run.name), ("createdAt", run.createdAt),
      ("samples", run.sampleIds.length), ("jobs", statusCounts jobs),
-     ("aggregate", aggregateOf scores deleted includeStale)]
+     ("aggregate", aggregateOf scores f)]
   unless detail do return .mkObj fields
   let results ← jobs.mapM fun j => do
     let sample ← match j.sampleId with
@@ -894,25 +989,28 @@ def runJson (run : Run) (detail : Bool) (includeStale := false) : IO Json := do
       ("sample", (sample.map fun s => Json.mkObj [("id", s.id), ("prNumber", s.prNumber),
         ("reviewer", s.reviewer), ("state", s.state), ("commitId", s.commitId),
         ("title", s.title), ("scope", s.scope), ("comments", s.comments.length),
-        ("deleted", s.deletedAt.isSome)]).getD .null),
-      ("score", score.getD .null), ("scoreStale", row.any isStale)]
+        ("deleted", s.deletedAt.isSome), ("split", optStr s.split)]).getD .null),
+      ("score", score.getD .null), ("scoreStale", row.any isStale),
+      ("scoreDerived", row.any f.derived)]
   return .mkObj (fields ++ [("results", .arr results)])
 
 /-- The aggregate over every scored calibration job of `owner/name` whose sample is not deleted
-    (and whose score is not stale, unless `includeStale`), and the same for each rubric version
-    the jobs were reviewed against (`null`: before rubrics), newest version first. -/
-def summaryJson (owner name : String) (includeStale := false) : IO Json := do
-  let deleted ← deletedSamples owner name
-  let scores := (← scoresOf owner name).filter (!deleted.contains ·.sample_id)
+    and not of the pool (and whose score is neither stale nor derived, unless asked), and the same
+    for each rubric version the jobs were reviewed against (`null`: before rubrics), newest version
+    first. -/
+def summaryJson (owner name : String) (includeStale := false) (includeDerived := false)
+    (split := "eval") : IO Json := do
+  let f ← filterOf owner name includeStale includeDerived split
+  let scores := (← scoresOf owner name).filter (!f.deleted.contains ·.sample_id)
   let versions := ((scores.map (·.rubric_version)).toList.eraseDups.toArray.qsort fun a b =>
     a.getD (-1) > b.getD (-1)).toList
   return .mkObj [
-    ("owner", owner), ("name", name), ("runs", (← runsOf owner name).size),
+    ("owner", owner), ("name", name), ("split", split), ("runs", (← runsOf owner name).size),
     ("samples", (← listSamples owner name).size),
-    ("overall", aggregateOf scores [] includeStale),
+    ("overall", aggregateOf scores f),
     ("byRubricVersion", .arr (versions.map fun v =>
       Json.mkObj [("rubricVersion", (v.map fun n => (n.toNat : Json)).getD .null),
-        ("aggregate", aggregateOf (scores.filter (·.rubric_version == v)) [] includeStale)]
+        ("aggregate", aggregateOf (scores.filter (·.rubric_version == v)) f)]
       ).toArray)]
 
 end DiffReviewer.Calibration

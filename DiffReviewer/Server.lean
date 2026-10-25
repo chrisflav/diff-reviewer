@@ -98,6 +98,10 @@ structure Config where
   /-- The bearer for `/api/agent/v1/` (`DIFF_REVIEWER_AGENT_TOKEN_FILE`). Without one the agent API
       refuses everything. -/
   agentToken : Option String := none
+  /-- The platform's tokens on orchestra, for reviews and for rubric proposals: not served with,
+      but checked with the others, so that no two credentials are one. -/
+  orchestraToken : Option String := none
+  proposerToken : Option String := none
   port : UInt16 := 8090
   /-- Loopback by default: the API is plain HTTP, so anything wider is a deliberate choice. -/
   host : String := "127.0.0.1"
@@ -126,6 +130,16 @@ def Config.check (cfg : Config) : Except String Unit := do
       if tok == cfg.password then throw s!"the {what} token is the password"
   if let (some a, some b) := (cfg.apiToken, cfg.agentToken) then
     if a == b then throw "the API token and the agent token are the same"
+  -- Orchestra refuses a token two clients share, and names neither; and a token of the platform's
+  -- own that reached orchestra, or one of orchestra's that reached the platform, must not open
+  -- the other.
+  if let some p := cfg.proposerToken then
+    if p.length < 32 then throw "the orchestra proposer token is shorter than 32 characters"
+    let others := [("the password", some cfg.password), ("the API token", cfg.apiToken),
+                   ("the agent token", cfg.agentToken),
+                   ("the orchestra token", cfg.orchestraToken)]
+    for (what, tok?) in others do
+      if tok? == some p then throw s!"the orchestra proposer token is {what}"
 
 private def nowEpoch : IO Int :=
   return (← Std.Time.Timestamp.now).toSecondsSinceUnixEpoch.val
@@ -422,13 +436,20 @@ private def putRepo (owner name body : String) : IO Reply := do
         return .error s!"'styleNotes' is longer than {maxStyleNotesBytes} bytes" .badRequest
       pure (some s)
     | .ok _ => return .error "'styleNotes' must be a string" .badRequest
+  let evalShare ← match j.getObjVal? "evalShare" with
+    | .error _ | .ok .null => pure none
+    | .ok v => match v.getNat? with
+      | .ok n =>
+        unless n ≤ 100 do return .error "'evalShare' must be between 0 and 100" .badRequest
+        pure (some n)
+      | .error _ => return .error "'evalShare' must be a whole number of percent" .badRequest
   let expected ← match j.getObjVal? "version" with
     | .error _ | .ok .null => pure none
     | .ok v => match v.getNat? with
       | .ok n => pure (some n)
       | .error _ => return .error "'version' must be a whole number" .badRequest
   match ← Platform.putRepo owner name
-      { mode, autoReview, trustedReviewers := trusted, styleNotes, expected } with
+      { mode, autoReview, trustedReviewers := trusted, styleNotes, evalShare, expected } with
   | .ok (existed, repo) => return .json repo.toJson (if existed then .ok else .created)
   | .error why => return .error why .conflict
 
@@ -665,6 +686,9 @@ private def putRubric (owner name body : String) : IO Reply := do
 /-- Whether an aggregate's query asks for stale scores too (`?stale=include`). -/
 private def staleIn (query : String) : Bool := queryParam query "stale" == some "include"
 
+/-- Whether it asks for derived scores too (`?derived=include`). -/
+private def derivedIn (query : String) : Bool := queryParam query "derived" == some "include"
+
 /-- Answer `k` for registered repository `owner/name`, or `404`. -/
 private def withRepo (owner name : String) (k : Repo → IO Reply) : IO Reply := do
   match ← Platform.findRepo owner.toLower name.toLower with
@@ -701,13 +725,20 @@ private def calibrationImport (st : State) (owner name body : String) : IO Reply
 
 /-- Ask for a calibration run. The body is `{"samples": [id, …]}`, or `{"count": n}` for the `n`
     samples reviewed by the fewest runs so far; at most `Calibration.maxRunSamples` either way.
-    `201` with the run; `429` when its jobs would pass the daily cap of calibration jobs. -/
+    `"split"` is `eval` (the default: what calibration measures by) or `pool` (evidence for
+    rubric proposals, never aggregated); every sample must be of it. `201` with the run; `429`
+    when its jobs would pass the daily cap of calibration jobs. -/
 private def calibrationRun (st : State) (owner name body : String) : IO Reply :=
   withRepo owner name fun repo => do
     let j ← match parseBody body with
       | .ok j => pure j
       | .error e => return .error e .badRequest
     let most := Calibration.maxRunSamples
+    let split ← match j.getObjVal? "split" with
+      | .error _ | .ok .null => pure "eval"
+      | .ok (.str "eval") => pure "eval"
+      | .ok (.str "pool") => pure "pool"
+      | .ok _ => return .error "'split' must be eval or pool" .badRequest
     let ids ← match j.getObjVal? "samples", j.getObjVal? "count" with
       | .ok (.arr xs), .error _ =>
         let some ids := xs.toList.mapM (·.getStr?.toOption)
@@ -719,15 +750,16 @@ private def calibrationRun (st : State) (owner name body : String) : IO Reply :=
         | .ok n =>
           unless 1 ≤ n && n ≤ most do
             return .error s!"'count' must be between 1 and {most}" .badRequest
-          Calibration.pickSamples repo.owner repo.name n
+          Calibration.pickSamples repo n split
         | .error _ => return .error "'count' must be a whole number" .badRequest
       | .ok _, .error _ => return .error "'samples' must be an array of sample ids" .badRequest
       | _, _ => return .error "the body names either 'samples' or a 'count'" .badRequest
     if ids.isEmpty then
-      return .error s!"{repo.slug} has no samples to review; import some first" .badRequest
+      return .error s!"{repo.slug} has no {split} samples to review; import some first"
+        .badRequest
     if ids.length > most then
       return .error s!"a run reviews at most {most} samples" .badRequest
-    match ← Calibration.createRun repo ids st.services.limits.maxCalibrationJobsPerDay with
+    match ← Calibration.createRun repo ids st.services.limits.maxCalibrationJobsPerDay split with
     | .ok (run, _) => return .json (← Calibration.runJson run (detail := true)) .created
     | .error .notFound => return .error "not found" .notFound
     | .error (.invalid why) => return .error why .badRequest
@@ -768,11 +800,34 @@ private def acceptProposal (owner name id body : String) : IO Reply :=
       | .error e => return .error e .badRequest
     let some version := (j.getObjValAs? Nat "version").toOption
       | return .error "the body must carry the rubric's 'version', as last read" .badRequest
-    match ← Proposal.accept repo id version with
+    let apply ← match j.getObjVal? "applyStyleNotes" with
+      | .error _ | .ok .null => pure false
+      | .ok (.bool b) => pure b
+      | .ok _ => return .error "'applyStyleNotes' must be true or false" .badRequest
+    match ← Proposal.accept repo id version apply with
     | .ok (p, v) =>
       return decideReply (.ok (.mkObj [("proposal", ← p.toJson v.version (detail := true)),
                                        ("rubric", v.toJson)]))
     | .error e => return decideReply (.error e)
+
+/-- Cancel proposal job `jobId`: a pending, queued or running one is `failed`, its orchestra run
+    cancelled through the proposals' client (`Workers.retire`). The body is `{}`. `409` for a job
+    that is not live. -/
+private def cancelProposalJob (st : State) (owner name jobId body : String) : IO Reply :=
+  withRepo owner name fun repo => do
+    if let .error e := parseBody body then return .error e .badRequest
+    let some job ← Platform.findJob jobId | return .error "not found" .notFound
+    unless job.kind? == some .proposal && job.owner == repo.owner && job.name == repo.name do
+      return .error "not found" .notFound
+    unless job.status?.any (Proposal.liveStatuses.contains ·) do
+      return .error s!"job {jobId} is {job.statusRaw}; only a pending, queued or running proposal \
+job is cancelled" .conflict
+    Workers.retire st.services job .failed "cancelled by a person"
+    let some after ← Platform.findJob jobId | return .error "not found" .notFound
+    unless after.status? == some .failed do
+      return .error s!"job {jobId} moved on while it was cancelled; it is {after.statusRaw}"
+        .conflict
+    return .json after.toJson
 
 /-- Reject a proposal. The body is `{}`. -/
 private def rejectProposal (owner name id body : String) : IO Reply :=
@@ -808,7 +863,8 @@ def apiRoutes : Array (String × Array String) :=
     ("repos/{owner}/{name}/proposals",                #["get", "post"]),
     ("repos/{owner}/{name}/proposals/{id}",           #["get"]),
     ("repos/{owner}/{name}/proposals/{id}/accept",    #["post"]),
-    ("repos/{owner}/{name}/proposals/{id}/reject",    #["post"])]
+    ("repos/{owner}/{name}/proposals/{id}/reject",    #["post"]),
+    ("repos/{owner}/{name}/proposals/jobs/{jobId}/cancel", #["post"])]
 
 private def apiRoute (st : State) (r : Req) (segs : List String) : IO Reply := do
   match segs, r.method with
@@ -895,15 +951,19 @@ import is cancelled"), ("import", i.toJson)]) .conflict
   | ["repos", owner, name, "calibration", "runs"], .get =>
     withRepo owner name fun repo => do
       let runs ← Calibration.runsOf repo.owner repo.name
-      page r.query (← runs.mapM (Calibration.runJson · (detail := false) (staleIn r.query)))
+      page r.query (← runs.mapM (Calibration.runJson · (detail := false) (staleIn r.query)
+        (derivedIn r.query)))
   | ["repos", owner, name, "calibration", "runs", id], .get =>
     withRepo owner name fun repo => do
       match ← Calibration.findRun repo.owner repo.name id with
-      | some run => return .json (← Calibration.runJson run (detail := true) (staleIn r.query))
+      | some run =>
+        return .json (← Calibration.runJson run (detail := true) (staleIn r.query)
+          (derivedIn r.query))
       | none => return .error "not found" .notFound
   | ["repos", owner, name, "calibration", "summary"], .get =>
     withRepo owner name fun repo => do
-      return .json (← Calibration.summaryJson repo.owner repo.name (staleIn r.query))
+      return .json (← Calibration.summaryJson repo.owner repo.name (staleIn r.query)
+        (derivedIn r.query))
   | ["repos", owner, name, "proposals"], .post =>
     createProposal st owner.toLower name.toLower r.body
   | ["repos", owner, name, "proposals"], .get =>
@@ -921,6 +981,10 @@ import is cancelled"), ("import", i.toJson)]) .conflict
     acceptProposal owner name id r.body
   | ["repos", owner, name, "proposals", id, "reject"], .post =>
     rejectProposal owner name id r.body
+  | ["repos", owner, name, "proposals", "jobs", jobId, "cancel"], .post =>
+    cancelProposalJob st owner name jobId r.body
+  | ["repos", _, _, "proposals", "jobs", _, "cancel"], _ =>
+    return .error "method not allowed" .methodNotAllowed
   | ["repos", _, _, "proposals"], _ | ["repos", _, _, "proposals", _], _
   | ["repos", _, _, "proposals", _, "accept"], _ | ["repos", _, _, "proposals", _, "reject"], _ =>
     return .error "method not allowed" .methodNotAllowed
@@ -957,10 +1021,11 @@ def agentSegments (path : String) : Option (List String) :=
     apiSegments ("/api/v1/" ++ (path.drop "/api/agent/v1/".length).toString)
   else none
 
-/-- The job an agent is running for a pull request: one that is `queued` or `running` — the one the
-    agent names (`X-Diff-Reviewer-Job`, from `--job`), or else the only one. With two, an agent
-    that does not say which it runs is told so rather than given one: the run of a superseded head
-    must not take over the review of the new one.
+/-- The job an agent is running for a pull request: the one it names (`X-Diff-Reviewer-Job`, from
+    `--job`), which must be a review or calibration job of that pull request, `queued` or
+    `running`. A request that names none is refused (`400`), whatever the pull request has
+    running: guessing would let the run of a superseded head take over the review of the new one.
+    A job of another kind — a rubric proposal — is refused (`404`): it has routes of its own.
 
     kleis binds an agent's requests to its task's pull request, not to its job, so an agent could
     name another active job of the same pull request. Of the active jobs at one commit, only the one
@@ -971,12 +1036,13 @@ def agentSegments (path : String) : Option (List String) :=
     the task (its orchestra `external_id`), which it does not have. -/
 private def activeJob (owner name : String) (pr : Nat) (jobId : Option String) :
     IO (Except Reply Job) := do
-  -- A rubric proposal is of no pull request, and answered on its own routes only.
+  let some id := jobId
+    | return .error (Reply.error "name the job you run: X-Diff-Reviewer-Job (`--job <id>`, as \
+the prompt gives it)" .badRequest)
   let active := (← Platform.jobsOfPull owner.toLower name.toLower pr).filter fun j =>
-    (j.status? == some .queued || j.status? == some .running) && j.kind? != some .proposal
-  let notRun := Reply.error s!"no review of {owner}/{name}#{pr} is being run" .notFound
-  match jobId with
-  | some id => return match active.find? (·.id == id) with
+    (j.status? == some .queued || j.status? == some .running) &&
+      (j.isReview || j.kind? == some .calibration)
+  return match active.find? (·.id == id) with
     | some j =>
       -- Made later, to the second: two jobs made in one second are both answered.
       match active.find? fun k => k.headSha == j.headSha && k.createdAt > j.createdAt with
@@ -985,12 +1051,6 @@ newer review of the same commit; it is not run" .conflict)
       | none => .ok j
     | none => .error (Reply.error s!"job {id} is not a review of {owner}/{name}#{pr} being run"
         .notFound)
-  | none =>
-    match active.toList with
-    | [] => return .error notRun
-    | [j] => return .ok j
-    | _ => return .error (Reply.error s!"{active.size} reviews of {owner}/{name}#{pr} are being \
-run; name yours with --job" .conflict)
 
 /-- The repository's current rubric, as its version and document: `none` when it has none, and a
     `409` reply when this build cannot read it — the agent is not to review by a default the

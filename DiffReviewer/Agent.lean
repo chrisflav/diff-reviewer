@@ -168,9 +168,9 @@ def submitProposal (slug path job : String) : IO UInt32 := do
   | .error e => fail e
   | .ok j => callProposal "POST" slug job (some j.compress)
 
-/-- `[]` or `["--job", id]`: the optional trailing flag of every subcommand. -/
+/-- `["--job", id]`: the trailing flag every subcommand requires, since the platform answers only
+    a request that names its job. -/
 def jobFlag : List String → Option (Option String)
-  | [] => some none
   | ["--job", id] => some (some id)
   | _ => none
 

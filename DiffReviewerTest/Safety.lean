@@ -124,8 +124,8 @@ def decisionsArePostedAsAPersonDecides : Test := withTempDb do
   let _ ← route st (req .post "/api/v1/jobs"
     s!"\{\"owner\": \"acme\", \"name\": \"widgets\", \"prNumber\": 7, \"headSha\": \"{headA}\"}")
   Workers.queuePending (← servicesWith gh orch logs)
-  let _ ← route st (agentReq .get "")
-  let submitted ← route st (agentReq .post "/review" (submission headA (review "approve" "")))
+  let _ ← routeAgent st (agentReq .get "")
+  let submitted ← routeAgent st (agentReq .post "/review" (submission headA (review "approve" "")))
   let directId := (field submitted "jobId").getD ""
   let direct ← job! directId
   -- A person posts a staged approval as an approval.
@@ -349,8 +349,8 @@ def listingsReadEveryPage : Test := do
     ++ checkEq threeCalls 3 "requests for them"
     ++ checkEq (endless.toOption.map (·.size)) (some (100 * GitHub.maxPages)) "a bounded listing"
 
-/-- With two reviews of one pull request running, the agent must say which is its own; naming it,
-    only that one starts. -/
+/-- The agent must always say which job is its own — with one review running as with two — and
+    naming it, only that one starts; a proposal job is not a review. -/
 def anAgentRunsOnlyItsOwnJob : Test := withTempDb do
   let gh ← FakeGitHub.new #[pull7 jobHead]
   let orch ← FakeOrchestra.new
@@ -363,11 +363,16 @@ def anAgentRunsOnlyItsOwnJob : Test := withTempDb do
   let a := (field first "id").getD ""
   let b := (field second "id").getD ""
   let unnamed ← route st (agentReq .get "")
+  let proposal ← route st (req .post "/api/v1/repos/acme/widgets/proposals" "{}")
+  let byProposal ← route st { agentReq .get "" with
+    header := fun n => if n == "x-diff-reviewer-job" then field proposal "id" else
+      (agentReq .get "").header n }
   let named ← route st { agentReq .get "" with
     header := fun n => if n == "x-diff-reviewer-job" then some b else (agentReq .get "").header n }
   let ja ← job! a
   let jb ← job! b
-  return checkStatus unnamed 409 "two reviews, and the agent does not say which"
+  return checkStatus unnamed 400 "the agent does not say which job it runs"
+    ++ checkStatus byProposal 404 "a proposal job's id on a pull request's route"
     ++ checkStatus named 200 "the agent names its job"
     ++ checkEq jb.statusRaw "running" "that job"
     ++ checkEq ja.statusRaw "queued" "the other one, untouched"
@@ -452,10 +457,10 @@ diff --git \"a/sp ace/\\303\\251t\\303\\251.lean\" \"b/sp ace/\\303\\251t\\303\\
   let st ← State.new cfg svc
   let _ ← newJob st
   Workers.queuePending svc
-  let _ ← route st (agentReq .get "")
-  let off ← route st (agentReq .post "/review" (submission jobHead
+  let _ ← routeAgent st (agentReq .get "")
+  let off ← routeAgent st (agentReq .post "/review" (submission jobHead
     "{\"decision\": \"comment\", \"body\": \"x\", \"comments\": [{\"file\": \"A.lean\", \"start_line\": 30, \"end_line\": 31, \"body\": \"y\"}]}"))
-  let on ← route st (agentReq .post "/review" (submission jobHead
+  let on ← routeAgent st (agentReq .post "/review" (submission jobHead
     "{\"decision\": \"comment\", \"body\": \"x\", \"comments\": [{\"file\": \"A.lean\", \"start_line\": 2, \"end_line\": 3, \"body\": \"y\"}]}"))
   let msg := ((bodyJson off).getObjValAs? String "error").toOption.getD ""
   return pure
