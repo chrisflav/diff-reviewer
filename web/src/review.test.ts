@@ -13,9 +13,11 @@ import {
   placeComments,
   rebase,
   resolve,
+  sameReview,
   thaw,
   toLocal,
   toReview,
+  type LocalComment,
   type LocalReview,
 } from "./review";
 
@@ -372,5 +374,126 @@ describe("rebase", () => {
     const r = rebase(sent, now, toReview(sent));
     expect(r.conflicts).toEqual([]);
     expect(toReview(r.review)).toEqual(toReview(now));
+  });
+  // Regressions: the other side may hold this person's own changes, or move what they edited.
+  const cmt = (file: string, s0: number, e0: number, body: string): InlineComment => ({
+    file,
+    start_line: s0,
+    end_line: e0,
+    body,
+  });
+  const trio = toLocal({
+    decision: "comment",
+    body: "S",
+    comments: [cmt("a", 1, 1, "one"), cmt("a", 5, 5, "two"), cmt("a", 9, 9, "three")],
+  });
+  const lines = (r: LocalReview) =>
+    toReview(r).comments.map((x) => `${x.file}:${x.start_line}-${x.end_line} ${x.body}`);
+
+  it("takes theirs equal to mine as nothing to merge, not as a second copy", () => {
+    // A save of these edits that landed though its answer was lost.
+    const mine: LocalReview = {
+      ...trio,
+      comments: [
+        ...trio.comments.map((x) => (x[KEY] === 1 ? { ...x, start_line: 4, body: "two!" } : x)),
+        { ...cmt("b", 2, 2, "new"), [KEY]: 3 },
+      ],
+    };
+    const r = rebase(trio, mine, toReview(mine));
+    expect(r.conflicts).toEqual([]);
+    expect(lines(r.review)).toEqual(lines(mine));
+    expect(sameReview(r.review, r.base)).toBe(true);
+  });
+
+  it("keeps a comment they moved and I reworded as one comment, with both changes", () => {
+    const theirs = toReview({
+      ...trio,
+      comments: trio.comments.map((x) => (x[KEY] === 1 ? { ...x, start_line: 4 } : x)),
+    });
+    const mine: LocalReview = {
+      ...trio,
+      comments: trio.comments.map((x) => (x[KEY] === 1 ? { ...x, body: "two edited" } : x)),
+    };
+    const r = rebase(trio, mine, theirs);
+    expect(r.conflicts).toEqual([]);
+    expect(lines(r.review)).toEqual(["a:1-1 one", "a:4-5 two edited", "a:9-9 three"]);
+  });
+
+  it("shows a comment they replaced in its file as changed, and a pick leaves one", () => {
+    const theirs: Review = {
+      ...toReview(trio),
+      comments: [cmt("a", 6, 6, "other"), cmt("a", 1, 1, "one")],
+    };
+    const mine: LocalReview = {
+      ...trio,
+      comments: trio.comments.map((x) => (x[KEY] === 1 ? { ...x, body: "two edited" } : x)),
+    };
+    const r = rebase(trio, mine, theirs);
+    const c = r.conflicts.find((x) => x.kind === "comment");
+    if (c === undefined || c.kind !== "comment") throw new Error("no conflict");
+    expect([c.mine?.body, c.theirs?.body]).toEqual(["two edited", "other"]);
+    const picked = resolve(r.review, c, "mine");
+    expect(lines(picked).filter((x) => x.startsWith("a:5") || x.includes("other"))).toEqual([
+      "a:5-5 two edited",
+    ]);
+    expect(lines(resolve(picked, c, "theirs"))).toEqual(lines(r.review));
+  });
+
+  it("lands their deletion of one of two identical comments on the copy I did not edit", () => {
+    const dup = toLocal({
+      decision: "comment",
+      body: "S",
+      comments: [cmt("a", 1, 1, "dup"), cmt("a", 1, 1, "dup")],
+    });
+    const edited: LocalReview = {
+      ...dup,
+      comments: [
+        dup.comments[0] as LocalComment,
+        { ...(dup.comments[1] as LocalComment), body: "dup edited" },
+      ],
+    };
+    const r = rebase(dup, edited, { ...toReview(dup), comments: [cmt("a", 1, 1, "dup")] });
+    expect(r.conflicts).toEqual([]);
+    expect(lines(r.review)).toEqual(["a:1-1 dup edited"]);
+    // Both deleting a copy leaves one, not none.
+    const deleted: LocalReview = { ...dup, comments: [dup.comments[1] as LocalComment] };
+    const d = rebase(dup, deleted, { ...toReview(dup), comments: [cmt("a", 1, 1, "dup")] });
+    expect(lines(d.review)).toEqual(["a:1-1 dup"]);
+  });
+
+  it("matches by id where both sides carry one, and guesses nothing for them", () => {
+    const withIds = toLocal({
+      decision: "comment",
+      body: "S",
+      comments: [
+        { ...cmt("a", 1, 1, "same text"), id: "c1" },
+        { ...cmt("a", 1, 1, "same text"), id: "c2" },
+      ],
+    });
+    // They moved and reworded c2 and deleted c1; I edited c1. Without ids nothing ties the
+    // reworded comment to c2; with them it is c2, and c1's deletion meets my edit.
+    const mine: LocalReview = {
+      ...withIds,
+      comments: withIds.comments.map((x) => (x.id === "c1" ? { ...x, body: "mine" } : x)),
+    };
+    const theirs: Review = {
+      ...toReview(withIds),
+      comments: [{ ...cmt("b", 7, 7, "theirs, moved"), id: "c2" }],
+    };
+    const r = rebase(withIds, mine, theirs);
+    expect(r.base.comments.map((x) => x[KEY])).toEqual([1]);
+    expect(r.conflicts.map((x) => (x.kind === "comment" ? [x.key, x.theirs] : null))).toEqual([
+      [0, null],
+    ]);
+    // A new comment with an id is new, however much it looks like an old one.
+    const added = rebase(withIds, withIds, {
+      ...toReview(withIds),
+      comments: [...toReview(withIds).comments, { ...cmt("a", 1, 1, "same text"), id: "c3" }],
+    });
+    expect(added.base.comments.map((x) => x[KEY])).toEqual([0, 1, 2]);
+    // And Edit as JSON keys by id too.
+    const j = fromJson(JSON.stringify(theirs), withIds, withIds);
+    if (typeof j === "string") throw new Error(j);
+    expect(j.comments.map((x) => x[KEY])).toEqual([1]);
   });
 });

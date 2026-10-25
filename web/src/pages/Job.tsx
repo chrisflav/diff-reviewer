@@ -721,7 +721,11 @@ function show(v: unknown): string {
 
 function showComment(c: LocalComment | null): string {
   if (c === null) return "(deleted)";
-  return c.body + (c.suggestion === undefined ? "" : `\n\nSuggested change:\n${c.suggestion}`);
+  // The place too: a comment moved on one side reads as the same text otherwise.
+  return (
+    `${c.file}, ${rangeLabel(c)}:\n${c.body}` +
+    (c.suggestion === undefined ? "" : `\n\nSuggested change:\n${c.suggestion}`)
+  );
 }
 
 function conflictLabel(c: Conflict): string {

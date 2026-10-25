@@ -81,11 +81,51 @@ export function sameReview(a: LocalReview, b: LocalReview): boolean {
   return same(toReview(a), toReview(b));
 }
 
+/** Whether a comment carries the stable id a newer backend gives every comment. */
+function hasId(c: InlineComment): boolean {
+  return c.id !== undefined && c.id !== null;
+}
+
 /**
- * Key `other`'s comments by the comments of `known` they are: first those that are the same, then
- * those at the same place (an edited comment keeps its place). With `positional`, the comments
- * left over then pair up in order, as an edit of the same list does; without it, they are new.
- * The review has no comment ids, so this is the best a page can do, and what it gets wrong
+ * Whether `k` and `o` may be paired by a guess. Two comments that both carry ids are the same
+ * comment exactly when their ids are equal, so no guess applies to them.
+ */
+function guessable(k: InlineComment, o: InlineComment): boolean {
+  return !(hasId(k) && hasId(o));
+}
+
+/**
+ * Give each of `other`'s comments without a key yet the key of the first comment of `known` that
+ * `fits` it and is not taken; among several, the one `rank` puts lowest.
+ */
+function pair(
+  known: LocalComment[],
+  other: InlineComment[],
+  keys: (number | undefined)[],
+  used: Set<number>,
+  fits: (k: LocalComment, o: InlineComment) => boolean,
+  rank: (k: LocalComment) => number = () => 0,
+) {
+  other.forEach((o, i) => {
+    if (keys[i] !== undefined) return;
+    let best: LocalComment | undefined;
+    for (const k of known)
+      if (!used.has(k[KEY]) && fits(k, o) && (best === undefined || rank(k) < rank(best))) best = k;
+    if (best === undefined) return;
+    keys[i] = best[KEY];
+    used.add(best[KEY]);
+  });
+}
+
+const byId = (k: InlineComment, o: InlineComment) => hasId(k) && hasId(o) && same(k.id, o.id);
+const samePlace = (k: InlineComment, o: InlineComment) =>
+  k.file === o.file && k.start_line === o.start_line && k.end_line === o.end_line;
+
+/**
+ * Key `other`'s comments by the comments of `known` they are: by id where both carry one;
+ * otherwise first those that are the same, then those at the same place (an edited comment keeps
+ * its place). With `positional`, the comments left over then pair up in order, as an edit of the
+ * same list does; without it, they are new. Without ids this is a guess, and what it gets wrong
  * shows up as a conflict, not as a lost edit.
  */
 export function align(
@@ -96,19 +136,13 @@ export function align(
 ): LocalComment[] {
   const keys: (number | undefined)[] = other.map(() => undefined);
   const used = new Set<number>();
-  const pass = (fits: (k: LocalComment, o: InlineComment) => boolean) => {
-    other.forEach((o, i) => {
-      if (keys[i] !== undefined) return;
-      const k = known.find((c) => !used.has(c[KEY]) && fits(c, o));
-      if (k === undefined) return;
-      keys[i] = k[KEY];
-      used.add(k[KEY]);
-    });
-  };
-  pass((k, o) => same(withoutKey(k), o));
-  pass((k, o) => k.file === o.file && k.start_line === o.start_line && k.end_line === o.end_line);
+  const go = (fits: (k: LocalComment, o: InlineComment) => boolean) =>
+    pair(known, other, keys, used, fits);
+  go(byId);
+  go((k, o) => guessable(k, o) && same(withoutKey(k), o));
+  go((k, o) => guessable(k, o) && samePlace(k, o));
   // The first comment not yet taken, in order.
-  if (positional) pass(() => true);
+  if (positional) go(guessable);
   return other.map((o, i) => ({ ...o, [KEY]: keys[i] ?? fresh() }));
 }
 
@@ -132,7 +166,11 @@ export function fromJson(
   return { ...r, comments: align(current.comments, r.comments, true, freshKeys(current, base)) };
 }
 
-/** Where this person and another writer changed the same thing differently. */
+/**
+ * Where this person and another writer changed the same thing differently. For a comment, `key`
+ * is its key in the base; `theirs` may carry another key, when it is the comment that took its
+ * place on their side (deleted there, and one added in the same file).
+ */
 export type Conflict =
   | { kind: "field"; name: string; mine: unknown; theirs: unknown }
   | { kind: "comment"; key: number; mine: LocalComment | null; theirs: LocalComment | null };
@@ -150,30 +188,101 @@ export interface Rebased {
 }
 
 /**
+ * Three-way merge of the fields of `base` (an object), `mine` and `theirs`: what only one side
+ * changed takes that change. Answers the merge and the names both changed differently.
+ */
+function mergeFields<T extends Record<string, unknown>>(
+  base: T,
+  mine: T,
+  theirs: T,
+  skip: string[] = [],
+): [Record<string, unknown>, string[]] {
+  const out: Record<string, unknown> = { ...theirs };
+  const clashes: string[] = [];
+  const names = new Set([...Object.keys(base), ...Object.keys(mine), ...Object.keys(theirs)]);
+  for (const name of names) {
+    if (skip.includes(name)) continue;
+    const [b, m, t] = [base[name], mine[name], theirs[name]];
+    let v = t;
+    if (same(t, b)) v = m;
+    else if (!same(m, b) && !same(m, t)) clashes.push(name);
+    if (v === undefined) delete out[name];
+    else out[name] = v;
+  }
+  return [out, clashes];
+}
+
+/**
+ * Key the other writer's comments by the comments they are: those of `base`, or this person's
+ * new ones (`added`) where the other side has the very same (a save of these edits that landed
+ * though its answer was lost, or a second tab with the same edits). By id where both carry one;
+ * else, in turn: the same as in the base, the same as this person's version of it, the same as
+ * one of this person's new ones, at the same place, and — a comment moved — in the same file with
+ * the same body or suggestion. Among several equal candidates, one this person edited is taken
+ * first and one they deleted last, so that the other side's edits and deletions of identical
+ * comments land where they lose least.
+ */
+function alignTheirs(
+  base: LocalReview,
+  mine: LocalReview,
+  theirs: InlineComment[],
+  fresh: () => number,
+): LocalComment[] {
+  const inBase = new Set(base.comments.map((c) => c[KEY]));
+  const mineBy = new Map(mine.comments.map((c) => [c[KEY], c]));
+  const added = mine.comments.filter((c) => !inBase.has(c[KEY]));
+  const rank = (k: LocalComment) => {
+    const m = mineBy.get(k[KEY]);
+    return m === undefined ? 2 : same(m, k) ? 1 : 0;
+  };
+  const keys: (number | undefined)[] = theirs.map(() => undefined);
+  const used = new Set<number>();
+  const go = (
+    known: LocalComment[],
+    fits: (k: LocalComment, o: InlineComment) => boolean,
+    r?: (k: LocalComment) => number,
+  ) => pair(known, theirs, keys, used, fits, r);
+  const all = [...base.comments, ...added];
+  go(all, byId);
+  go(base.comments, (k, o) => guessable(k, o) && same(withoutKey(k), o), rank);
+  go(
+    base.comments,
+    (k, o) => {
+      const m = mineBy.get(k[KEY]);
+      return m !== undefined && guessable(m, o) && same(withoutKey(m), o);
+    },
+    rank,
+  );
+  go(added, (k, o) => guessable(k, o) && same(withoutKey(k), o));
+  go(base.comments, (k, o) => guessable(k, o) && samePlace(k, o), rank);
+  go(
+    base.comments,
+    (k, o) =>
+      guessable(k, o) &&
+      k.file === o.file &&
+      ((k.body.trim() !== "" && k.body === o.body) ||
+        (k.suggestion !== undefined && k.suggestion === o.suggestion)),
+    rank,
+  );
+  return theirs.map((o, i) => ({ ...o, [KEY]: keys[i] ?? fresh() }));
+}
+
+/**
  * Move this person's edits (`mine`, made to `base`) onto a newer version (`theirs`): what only
- * one side changed takes that side's change, what both changed alike is that, and what both
- * changed differently is a conflict, left at their version until the person picks one. Nothing
- * the other writer did is undone without the person choosing so.
+ * one side changed takes that side's change, field by field, comments included; what both changed
+ * alike is that; and what both changed differently is a conflict, left at their version until the
+ * person picks one. Nothing the other writer did is undone without the person choosing so.
  */
 export function rebase(base: LocalReview, mine: LocalReview, theirsReview: Review): Rebased {
   const theirs: LocalReview = {
     ...theirsReview,
-    comments: align(base.comments, theirsReview.comments, false, freshKeys(base, mine)),
+    comments: alignTheirs(base, mine, theirsReview.comments, freshKeys(base, mine)),
   };
   const conflicts: Conflict[] = [];
-  const review: LocalReview = { ...theirs, comments: [] };
-
-  const names = new Set([...Object.keys(base), ...Object.keys(mine), ...Object.keys(theirs)]);
-  names.delete("comments");
-  for (const name of names) {
-    const [b, m, t] = [base[name], mine[name], theirs[name]];
-    let v = t;
-    if (same(t, b)) v = m;
-    else if (!same(m, b) && !same(m, t))
-      conflicts.push({ kind: "field", name, mine: m, theirs: t });
-    if (v === undefined) delete review[name];
-    else review[name] = v;
-  }
+  const [fields, clashes] = mergeFields(base, mine, theirs, ["comments"]);
+  const review = { ...fields, comments: [] } as unknown as LocalReview;
+  for (const name of clashes)
+    conflicts.push({ kind: "field", name, mine: mine[name], theirs: theirs[name] });
 
   const byKey = (cs: LocalComment[]) => new Map(cs.map((c) => [c[KEY], c]));
   const [b, m, t] = [byKey(base.comments), byKey(mine.comments), byKey(theirs.comments)];
@@ -182,11 +291,16 @@ export function rebase(base: LocalReview, mine: LocalReview, theirsReview: Revie
     bc: LocalComment,
     mc: LocalComment | null,
     tc: LocalComment | null,
-  ) => {
+  ): LocalComment | null => {
     if (mc !== null && same(mc, bc)) return tc;
     if (tc !== null && same(tc, bc)) return mc;
     if (mc === null && tc === null) return null;
-    if (mc !== null && tc !== null && same(mc, tc)) return tc;
+    if (mc !== null && tc !== null) {
+      if (same(mc, tc)) return tc;
+      // Both changed it: field by field, a move on one side and a reword on the other is both.
+      const [merged, clash] = mergeFields(bc, mc, tc);
+      if (clash.length === 0) return { ...merged, [KEY]: key } as LocalComment;
+    }
     conflicts.push({ kind: "comment", key, mine: mc, theirs: tc });
     return tc;
   };
@@ -195,12 +309,28 @@ export function rebase(base: LocalReview, mine: LocalReview, theirsReview: Revie
     const out = bc === undefined ? tc : comment(tc[KEY], bc, m.get(tc[KEY]) ?? null, tc);
     if (out !== null) review.comments.push(out);
   }
+  // Their new comments, which may stand where a comment of the base was.
+  const stand = theirs.comments.filter((c) => !b.has(c[KEY]) && !m.has(c[KEY]));
   for (const bc of base.comments) {
     if (t.has(bc[KEY])) continue;
-    const out = comment(bc[KEY], bc, m.get(bc[KEY]) ?? null, null);
+    const mc = m.get(bc[KEY]) ?? null;
+    const at =
+      mc === null || same(mc, bc)
+        ? -1
+        : stand.findIndex((c) => c.file === bc.file && guessable(c, bc));
+    const sub = stand[at];
+    if (sub !== undefined) {
+      // Deleted on their side, with a new comment in its file, and edited on this one: most
+      // likely the same comment, changed by both. Their new one stays until the person picks.
+      stand.splice(at, 1);
+      conflicts.push({ kind: "comment", key: bc[KEY], mine: mc, theirs: sub });
+      continue;
+    }
+    const out = comment(bc[KEY], bc, mc, null);
     if (out !== null) review.comments.push(out);
   }
-  for (const mc of mine.comments) if (!b.has(mc[KEY])) review.comments.push(mc);
+  // This person's new comments; one the other side has too is there already.
+  for (const mc of mine.comments) if (!b.has(mc[KEY]) && !t.has(mc[KEY])) review.comments.push(mc);
   return { review, base: theirs, conflicts };
 }
 
@@ -213,12 +343,14 @@ export function resolve(r: LocalReview, c: Conflict, pick: "mine" | "theirs"): L
     else out[c.name] = v;
     return out;
   }
+  // Either side's comment goes, whatever its key, and the one picked takes the first's place.
+  const keys = new Set([c.key]);
+  if (c.theirs !== null) keys.add(c.theirs[KEY]);
+  if (c.mine !== null) keys.add(c.mine[KEY]);
   const v = pick === "mine" ? c.mine : c.theirs;
-  const rest = r.comments.filter((x) => x[KEY] !== c.key);
-  if (v === null) return { ...r, comments: rest };
-  const at = r.comments.findIndex((x) => x[KEY] === c.key);
-  const comments = [...rest];
-  comments.splice(at < 0 ? comments.length : at, 0, v);
+  const at = r.comments.findIndex((x) => keys.has(x[KEY]));
+  const comments = r.comments.filter((x) => !keys.has(x[KEY]));
+  if (v !== null) comments.splice(at < 0 ? comments.length : at, 0, v);
   return { ...r, comments };
 }
 
