@@ -234,6 +234,20 @@ describe("rubric stash", () => {
     expect(back?.fromProposal).toBe("p1");
     expect(reopenRubric(back!)?.edits.fromProposal).toBe("p1");
   });
+
+  it("keeps the proposal the edits from before a move adopt, with conflicts open", () => {
+    const base = toLocalRubric(doc);
+    const source = { repo: "o/n", version: 1, base, doc: base, fromProposal: "p1" };
+    const edits = { repo: "o/n", version: 2, base, doc: base, fromProposal: "p1" };
+    stashRubric(edits, { from: 1, source, picks: {} });
+    expect(unstashRubric("o/n")?.pending?.source.fromProposal).toBe("p1");
+
+    // Kept by a build that stored it with the edits alone: taken from there.
+    const j = JSON.parse(store.get("diff-reviewer:rubric:o/n")!) as { pending: object };
+    delete (j.pending as { fromProposal?: string }).fromProposal;
+    store.set("diff-reviewer:rubric:o/n", JSON.stringify(j));
+    expect(unstashRubric("o/n")?.pending?.source.fromProposal).toBe("p1");
+  });
 });
 
 describe("repo settings stash", () => {
@@ -283,6 +297,26 @@ describe("repo settings stash", () => {
   it("keeps the proposal whose style notes the edits adopt", () => {
     stashRepo({ ...edits, fromProposal: "p1" });
     expect(unstashRepo("o/n")?.fromProposal).toBe("p1");
+  });
+
+  it("keeps it for the edits from before a move too, with conflicts open", () => {
+    const source = { repo: "o/n", version: 3, base, form: base, fromProposal: "p1" };
+    stashRepo({ ...edits, fromProposal: "p1" }, { from: 3, source, picks: {} });
+    expect(unstashRepo("o/n")?.pending?.source).toEqual(source);
+
+    const j = JSON.parse(store.get("diff-reviewer:repo:o/n")!) as { pending: object };
+    delete (j.pending as { fromProposal?: string }).fromProposal;
+    store.set("diff-reviewer:repo:o/n", JSON.stringify(j));
+    expect(unstashRepo("o/n")?.pending?.source).toEqual(source);
+  });
+
+  it("keeps a share held out left empty, which JSON stores as null", () => {
+    const empty = { ...edits, form: { ...edits.form, evalShare: Number.NaN } };
+    expect(stashRepo(empty, { from: 3, source: empty, picks: {} })).toBe(true);
+    const s = unstashRepo("o/n");
+    expect(s?.form.evalShare).toBeNaN();
+    expect(s?.pending?.source.form.evalShare).toBeNaN();
+    expect(s?.base).toEqual(edits.base);
   });
 
   it("reads a stash from before the style notes, filled in alike on both sides", () => {

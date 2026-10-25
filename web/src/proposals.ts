@@ -198,7 +198,19 @@ export type Block =
   | { kind: "quote"; children: Inline[] }
   | { kind: "code"; text: string };
 
-/** The inline parts of `s`: code spans, links, strong and emphasis; everything else is text. */
+/** Whether `c` is whitespace, as `\s` reads it; false past either end. */
+function isSpace(c: string | undefined): boolean {
+  return c !== undefined && /\s/.test(c);
+}
+
+/**
+ * The inline parts of `s`: code spans, links, strong and emphasis; everything else is text.
+ *
+ * Read in one pass, each construct found by a scan forward that a failed attempt remembers: a
+ * backtick run with no closer of its length, a `[` with no `]` after it, a `**` with no closer —
+ * none of these is looked for again further on. The input is an agent's, up to 32 KB of it, and a
+ * regular expression tried at each position takes seconds on the wrong one.
+ */
 export function parseInline(s: string, depth = 0): Inline[] {
   const out: Inline[] = [];
   let text = "";
@@ -206,48 +218,112 @@ export function parseInline(s: string, depth = 0): Inline[] {
     if (text !== "") out.push({ kind: "text", text });
     text = "";
   };
+  // Backtick run lengths with no run of exactly that length after the last place looked.
+  const noCloser = new Set<number>();
+  // Where a closing run of exactly `k` backticks is at or after `from`, or -1.
+  const closer = (k: number, from: number): number => {
+    const run = "`".repeat(k);
+    let j = s.indexOf(run, from);
+    while (j !== -1) {
+      let end = j + k;
+      while (s[end] === "`") end++;
+      if (end - j === k && s[j - 1] !== "`") return j;
+      j = s.indexOf(run, end);
+    }
+    return -1;
+  };
+  // The next `]` and the next newline at or after a position, found once and reused until passed.
+  let bracket = -2;
+  let newline = -2;
+  const next = (c: string, from: number, at: number) =>
+    at === -1 || at >= from ? at : s.indexOf(c, from);
+  // The link's address and its closing `)`, from just after `](`; linear, the alternatives
+  // starting with different characters.
+  const target = /((?:[^()\s]|\([^()\s]*\))*)\)/y;
+  // Where a strong span opened by `d` closes, from the earliest place its closer can be: the
+  // first `d` after a character that is not whitespace. Remembered as for the brackets.
+  const strongAt: Record<string, { from: number; at: number }> = {};
+  const strongCloser = (d: string, from: number): number => {
+    const memo = strongAt[d];
+    if (memo !== undefined && memo.from <= from && (memo.at === -1 || memo.at >= from))
+      return memo.at;
+    let j = s.indexOf(d, from);
+    while (j !== -1 && isSpace(s[j - 1])) j = s.indexOf(d, j + 1);
+    strongAt[d] = { from, at: j };
+    return j;
+  };
+  const em = /(\*|_)(?=[^\s*_])([^*_\n]*?[^\s*_])\1(?![*_\w])/y;
   let i = 0;
   while (i < s.length) {
-    const rest = s.slice(i);
-    const code = /^(`+)([\s\S]*?[^`])\1(?!`)/.exec(rest);
-    if (code !== null) {
+    const c = s[i] as string;
+    if (c === "`") {
+      let k = 1;
+      while (s[i + k] === "`") k++;
+      const j = noCloser.has(k) ? -1 : closer(k, i + k);
+      if (j === -1) {
+        noCloser.add(k);
+        text += s.slice(i, i + k);
+        i += k;
+        continue;
+      }
       flush();
-      out.push({ kind: "code", text: (code[2] as string).trim() || (code[2] as string) });
-      i += code[0].length;
+      const body = s.slice(i + k, j);
+      out.push({ kind: "code", text: body.trim() || body });
+      i = j + k;
       continue;
     }
-    if (depth < 3) {
-      const link = /^\[([^\]\n]+)\]\(((?:[^()\s]|\([^()\s]*\))*)\)/.exec(rest);
-      if (link !== null) {
-        flush();
-        out.push({
-          kind: "link",
-          children: parseInline(link[1] as string, depth + 1),
-          target: link[2] as string,
-        });
-        i += link[0].length;
-        continue;
+    if (depth < 3 && c === "[") {
+      bracket = next("]", i + 1, bracket);
+      newline = next("\n", i + 1, newline);
+      if (bracket > i + 1 && (newline === -1 || newline > bracket) && s[bracket + 1] === "(") {
+        target.lastIndex = bracket + 2;
+        const t = target.exec(s);
+        if (t !== null) {
+          flush();
+          out.push({
+            kind: "link",
+            children: parseInline(s.slice(i + 1, bracket), depth + 1),
+            target: t[1] as string,
+          });
+          i = target.lastIndex;
+          continue;
+        }
       }
-      const strong = /^(\*\*|__)(?=\S)([\s\S]*?\S)\1/.exec(rest);
-      if (strong !== null) {
-        flush();
-        out.push({ kind: "strong", children: parseInline(strong[2] as string, depth + 1) });
-        i += strong[0].length;
-        continue;
+    }
+    if (depth < 3 && (c === "*" || c === "_") && s[i + 1] === c) {
+      const d = c + c;
+      if (s[i + 2] !== undefined && !isSpace(s[i + 2])) {
+        const j = strongCloser(d, i + 3);
+        if (j !== -1) {
+          flush();
+          out.push({ kind: "strong", children: parseInline(s.slice(i + 2, j), depth + 1) });
+          i = j + 2;
+          continue;
+        }
       }
-      const em = /^(\*|_)(?=[^\s*_])([^*_\n]*?[^\s*_])\1(?![*_\w])/.exec(rest);
-      if (em !== null && (s[i - 1] === undefined || !/\w/.test(s[i - 1] as string))) {
+    }
+    if (depth < 3 && (c === "*" || c === "_") && (i === 0 || !/\w/.test(s[i - 1] as string))) {
+      em.lastIndex = i;
+      const m = em.exec(s);
+      if (m !== null) {
         flush();
-        out.push({ kind: "em", children: parseInline(em[2] as string, depth + 1) });
-        i += em[0].length;
+        out.push({ kind: "em", children: parseInline(m[2] as string, depth + 1) });
+        i = em.lastIndex;
         continue;
       }
     }
-    text += s[i];
+    text += c;
     i++;
   }
   flush();
   return out;
+}
+
+/** A heading's text without the closing run of `#`s and the whitespace around it. */
+function headingText(t: string): string {
+  let end = t.trimEnd().length;
+  while (end > 0 && t[end - 1] === "#") end--;
+  return t.slice(0, end).trimEnd();
 }
 
 /** The blocks of markdown `md`, as far as the subset goes; the rest is paragraphs of text. */
@@ -278,13 +354,13 @@ export function parseRationale(md: string): Block[] {
       out.push({ kind: "code", text: body.join("\n") });
       continue;
     }
-    const heading = /^\s{0,3}(#{1,6})\s+(.*?)\s*#*\s*$/.exec(line);
+    const heading = /^\s{0,3}(#{1,6})\s+([\s\S]*)$/.exec(line);
     if (heading !== null) {
       flush();
       out.push({
         kind: "heading",
         level: (heading[1] as string).length,
-        children: parseInline(heading[2] as string),
+        children: parseInline(headingText(heading[2] as string)),
       });
       i++;
       continue;

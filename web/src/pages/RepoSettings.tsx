@@ -22,6 +22,7 @@ import {
   putBody,
   resolveRepoConflict,
   sameForm,
+  saveRefusal,
   type RepoConflict,
   type RepoForm,
   type RepoPicks,
@@ -99,6 +100,8 @@ function RepoSettingsView({
   // move (kept, so that the conflicts can be worked out again after a reload) and the sides picked.
   const [rebased, setRebased] = useState<Rebased | null>(null);
   const [moved, setMoved] = useState<string | null>(null);
+  // A 409 that was not about the version, as the server put it: the edits are kept as they were.
+  const [refused, setRefused] = useState<string | null>(null);
   const [saved, setSaved] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [login, setLogin] = useState("");
@@ -286,10 +289,12 @@ function RepoSettingsView({
     setBusy(true);
     setError(null);
     setMoved(null);
+    setRefused(null);
     // The fields read at the version the edits are to: a newer build's settings among them.
     const read: Repo = { ...repo, version: sent.version };
+    const body = putBody(read, sent.form, sent.fromProposal);
     api
-      .putRepoSettings(repo.owner, repo.name, putBody(read, sent.form, sent.fromProposal))
+      .putRepoSettings(repo.owner, repo.name, body)
       .then((r) => {
         setRepo(r);
         setEdits(null);
@@ -301,9 +306,9 @@ function RepoSettingsView({
               ? `; the style notes are at version ${r.styleNotesVersion}`
               : ""
           }.${
-            sent.fromProposal === undefined
+            body.fromProposal === undefined
               ? ""
-              : ` The notes record proposal ${sent.fromProposal} as what they came from, and the proposal is accepted.`
+              : ` The notes record proposal ${body.fromProposal} as what they came from, and the proposal is accepted.`
           }`,
         );
       })
@@ -311,7 +316,11 @@ function RepoSettingsView({
         if (err instanceof UnauthorizedError) return onUnauthorized();
         if (err instanceof ApiError && err.status === 409) {
           findRepo(owner, name)
-            .then((theirs) => mergeOnto(theirs, sent))
+            .then((theirs) => {
+              const why = saveRefusal(sent.version, theirs, err.message);
+              if (why === null) mergeOnto(theirs, sent);
+              else setRefused(why);
+            })
             .catch((e2: unknown) =>
               e2 instanceof UnauthorizedError
                 ? onUnauthorized()
@@ -328,7 +337,25 @@ function RepoSettingsView({
     setEdits(null);
     setRebased(null);
     setMoved(null);
+    setRefused(null);
     dropRepoStash(key);
+  };
+
+  /** Keep the changes as one's own: saved, they no longer name the proposal. */
+  const stopAdopting = () => {
+    setRefused(null);
+    setEdits((e) => {
+      if (e === null) return e;
+      const own = { ...e };
+      delete own.fromProposal;
+      return own;
+    });
+    setRebased((rb) => {
+      if (rb === null) return rb;
+      const source = { ...rb.source };
+      delete source.fromProposal;
+      return { ...rb, source };
+    });
   };
 
   const pick = (c: RepoConflict, which: "mine" | "theirs") => {
@@ -457,9 +484,18 @@ function RepoSettingsView({
             </strong>{" "}
             They are below as unsaved changes, on top of the settings at version {edits.version};
             change them as you like. Saving names the proposal: the new notes version records what
-            it was derived from, and the proposal is accepted.
+            it was derived from, and the proposal is accepted. Notes saved as they are now keep
+            nothing of it, and do not name it.
+          </p>
+          <p>
+            <strong>A pending proposal is accepted without its rubric:</strong> the rubric it
+            proposes is not written, and it cannot be accepted afterwards. To keep both, accept it
+            on its page with its style notes.
           </p>
           <div className="actions">
+            <button type="button" className="ghost" onClick={stopAdopting} disabled={busy}>
+              Stop adopting, keep the changes
+            </button>
             <button type="button" className="ghost" onClick={discard} disabled={busy}>
               Stop adopting, discard the changes
             </button>
@@ -471,6 +507,20 @@ function RepoSettingsView({
         <p className="error" role="alert">
           {error}
         </p>
+      )}
+      {refused !== null && (
+        <div className="notice warn-notice" role="alert">
+          <p>
+            Refused, nothing was saved: <span className="body">{refused}</span>
+          </p>
+          {edits?.fromProposal !== undefined && (
+            <div className="actions">
+              <button type="button" onClick={stopAdopting} disabled={busy}>
+                Stop adopting, keep the changes as my own
+              </button>
+            </div>
+          )}
+        </div>
       )}
       {moved !== null && (
         <p className="notice warn-notice" role="alert">

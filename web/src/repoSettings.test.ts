@@ -13,6 +13,7 @@ import {
   openConflicts,
   putBody,
   resolveRepoConflict,
+  saveRefusal,
   type RepoForm,
 } from "./repoSettings";
 
@@ -204,8 +205,22 @@ describe("style notes and the share held out", () => {
   });
 
   it("names the proposal the notes were taken from, when they were", () => {
-    expect(putBody(repo, formOf(repo), "p1")).toMatchObject({ fromProposal: "p1" });
-    expect(putBody(repo, formOf(repo))).not.toHaveProperty("fromProposal");
+    const taken = { ...formOf(repo), styleNotes: "Be briefer." };
+    expect(putBody(repo, taken, "p1")).toMatchObject({ fromProposal: "p1" });
+    expect(putBody(repo, taken)).not.toHaveProperty("fromProposal");
+  });
+
+  it("does not name the proposal when the notes saved are those read", () => {
+    // Nothing of the proposal is kept, and naming it would accept it, its rubric unwritten.
+    expect(putBody(repo, { ...formOf(repo), evalShare: 40 }, "p1")).not.toHaveProperty(
+      "fromProposal",
+    );
+  });
+
+  it("tells a 409 for something else from one for a newer version", () => {
+    const why = "'fromProposal': proposal p1 was rejected";
+    expect(saveRefusal(7, repo, why)).toBe(why);
+    expect(saveRefusal(6, repo, why)).toBeNull();
   });
 
   it("sends neither to a server that does not know them", () => {

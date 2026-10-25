@@ -129,6 +129,17 @@ describe("adoptionEdits", () => {
     expect(r.conflicts.map((c) => c.kind)).toEqual(["field"]);
   });
 
+  it("asks about a type the proposal and the rubric since both added under one name", () => {
+    const docs = { name: "docs", description: "Proposed.", rubric: "", categories: [] };
+    const p = { ...proposal, document: { ...proposal.document!, prTypes: [...v1.prTypes!, docs] } };
+    const e = adoptionEdits("o", "n", p, v1);
+    if (typeof e === "string") throw new Error(e);
+    const theirs = { ...v2, prTypes: [...v2.prTypes!, { ...docs, description: "Saved." }] };
+    const r = rebaseRubric(e.base, e.doc, documentOf(theirs)!);
+    expect(r.conflicts.map((c) => c.kind)).toEqual(["type"]);
+    expect(toRubricDoc(r.review).prTypes.map((t) => t.name)).toEqual(["feature", "docs"]);
+  });
+
   it("refuses a rejected proposal, and one this build cannot read", () => {
     expect(typeof adoptionEdits("o", "n", { ...proposal, status: "rejected" }, v1)).toBe("string");
     expect(typeof adoptionEdits("o", "n", { ...proposal, document: null }, v1)).toBe("string");
@@ -276,4 +287,48 @@ describe("parseRationale", () => {
       { kind: "text", text: "<script>alert(1)</script>" },
     ]);
   });
+
+  it("reads a heading without its closing #s", () => {
+    expect(parseRationale("## Why ##  ")).toEqual([
+      { kind: "heading", level: 2, children: [{ kind: "text", text: "Why" }] },
+    ]);
+    expect(parseRationale("#\tWhy #x")[0]).toMatchObject({
+      children: [{ kind: "text", text: "Why #x" }],
+    });
+  });
+
+  it("closes a code span only on a run of its own length", () => {
+    expect(parseInline("``a`b`` c")).toEqual([
+      { kind: "code", text: "a`b" },
+      { kind: "text", text: " c" },
+    ]);
+    expect(parseInline("``a`")).toEqual([{ kind: "text", text: "``a`" }]);
+  });
+});
+
+describe("parseRationale on hostile input", () => {
+  // At the 32 KB limit of a rationale; each of these took from a third of a second to minutes.
+  const limit = 32 * 1024;
+  const ticks = () => {
+    let s = "";
+    for (let k = 1; s.length < limit; k++) s += `${"`".repeat(k)}a`;
+    return s;
+  };
+  const inputs: Record<string, () => string> = {
+    "a heading padded with spaces": () => `# a${" ".repeat(limit)}b`,
+    "a heading of #s": () => `# ${"#".repeat(limit)}x`,
+    "backtick runs of distinct lengths": ticks,
+    "unclosed brackets": () => "[".repeat(limit),
+    "unclosed strong": () => "**a ".repeat(limit / 4),
+    "unclosed underscores": () => "__a ".repeat(limit / 4),
+    "a mix": () => "[`*_".repeat(limit / 4),
+  };
+
+  for (const [what, input] of Object.entries(inputs))
+    it(`reads ${what} in well under a second`, () => {
+      const s = input();
+      const t = performance.now();
+      parseRationale(s);
+      expect(performance.now() - t).toBeLessThan(250);
+    });
 });

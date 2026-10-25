@@ -2,7 +2,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import type { RubricProposal, RubricProposalDiff } from "../api";
 import { Decide } from "../pages/Proposals";
-import { ProposalDiffView, Rationale, StyleNotesDiff } from "./Proposal";
+import { ProposalDiffView, ProposedDocumentView, Rationale, StyleNotesDiff } from "./Proposal";
 
 const diff: RubricProposalDiff = {
   defaultRubric: { before: "No sorry.", after: "No sorry.\nNo admit." },
@@ -87,6 +87,18 @@ describe("ProposalDiffView", () => {
   });
 });
 
+describe("ProposedDocumentView", () => {
+  it("shows the whole document, as text, when there is no diff", () => {
+    const html = renderToStaticMarkup(
+      <ProposedDocumentView doc={{ defaultRubric: "No sorry.", prTypes: diff.typesAdded }} />,
+    );
+    expect(html).toContain("No sorry.");
+    expect(html).toContain("Types (1)");
+    expect(html).toContain("&lt;img src=x onerror=alert(1)&gt;");
+    expect(html).not.toContain("diff-added");
+  });
+});
+
 describe("Rationale", () => {
   const hostile = [
     "# Why <script>alert('h')</script>",
@@ -152,6 +164,7 @@ describe("Decide", () => {
     createdAt: "t",
     decidedAt: null,
     acceptedVersion: null,
+    document: { defaultRubric: "No sorry.", prTypes: [] },
   };
   const render = (q: RubricProposal, applyNotes = false) =>
     renderToStaticMarkup(
@@ -181,5 +194,13 @@ describe("Decide", () => {
 
   it("does not offer notes a proposal does not have", () => {
     expect(render({ ...p, proposesStyleNotes: false })).not.toContain("style notes");
+  });
+
+  it("does not offer to accept what cannot be shown", () => {
+    const unseen = render({ ...p, document: null, diff: null, diffError: "unreadable" });
+    expect(unseen).toMatch(/<button type="button" disabled="">Accept/);
+    expect(unseen).toContain("cannot be accepted from this page");
+    // The document alone is enough: the page shows it in full.
+    expect(render({ ...p, diff: null, diffError: "unreadable" })).not.toContain("disabled");
   });
 });

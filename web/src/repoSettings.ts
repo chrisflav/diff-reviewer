@@ -54,7 +54,8 @@ const derivedFields = ["styleNotesVersion"];
  * this page leaves them as they were; the form on top; and the version, so that a write over a
  * newer one is a 409. The style notes and the share held out are sent only when the server has
  * them (API 0.6.0), so that an older one is not sent fields it does not know. `fromProposal`
- * names the rubric proposal the notes were taken from.
+ * names the rubric proposal the notes were taken from, and is left out when the notes saved are
+ * the notes read: nothing of the proposal is kept, and naming it would decide it.
  */
 export function putBody(read: Repo, form: RepoForm, fromProposal?: string): RepoSettings {
   const out: Record<string, unknown> = { ...read };
@@ -66,9 +67,21 @@ export function putBody(read: Repo, form: RepoForm, fromProposal?: string): Repo
     trustedReviewers: form.trustedReviewers,
     ...("styleNotes" in read ? { styleNotes: form.styleNotes } : {}),
     ...("evalShare" in read ? { evalShare: form.evalShare } : {}),
-    ...(fromProposal === undefined ? {} : { fromProposal }),
+    ...(fromProposal === undefined || form.styleNotes === formOf(read).styleNotes
+      ? {}
+      : { fromProposal }),
     version: read.version,
   };
+}
+
+/**
+ * What a 409 refusing a write over version `sent` said, when `theirs`, the settings read after it,
+ * are still at that version: not that they moved, which a merge mends, but something else — the
+ * proposal named was decided meanwhile, say — to be shown as the server put it. Null when they
+ * moved.
+ */
+export function saveRefusal(sent: number, theirs: Repo, message: string): string | null {
+  return theirs.version === sent ? message : null;
 }
 
 /** The body that registers a repository not registered yet. */

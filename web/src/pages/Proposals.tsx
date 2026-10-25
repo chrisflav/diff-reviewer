@@ -1,7 +1,12 @@
 import { useCallback, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { api, ApiError, UnauthorizedError, type Job, type RubricProposal } from "../api";
-import { ProposalDiffView, Rationale, StyleNotesDiff } from "../components/Proposal";
+import {
+  ProposalDiffView,
+  ProposedDocumentView,
+  Rationale,
+  StyleNotesDiff,
+} from "../components/Proposal";
 import {
   acceptProposal,
   acceptRefusal,
@@ -483,6 +488,7 @@ function ProposalView({
           r={refusal}
           proposesNotes={p.proposesStyleNotes}
           canAdopt={canAdopt}
+          pending={pendingNow}
           onEditor={openEditor}
           onNotes={openNotes}
         />
@@ -529,7 +535,19 @@ function ProposalView({
             No diff: <span className="body">{p.diffError}</span>
           </p>
         )}
-        {p.diff !== undefined && p.diff !== null && <ProposalDiffView diff={p.diff} />}
+        {p.diff !== undefined && p.diff !== null ? (
+          <ProposalDiffView diff={p.diff} />
+        ) : (
+          p.document !== undefined &&
+          p.document !== null && (
+            <>
+              <p className="mute small-text">
+                The proposed document in full, as accepting writes it:
+              </p>
+              <ProposedDocumentView doc={p.document} />
+            </>
+          )
+        )}
       </section>
 
       {p.proposesStyleNotes && (
@@ -541,11 +559,14 @@ function ProposalView({
           </p>
           <StyleNotesDiff change={p.diff?.styleNotes ?? null} />
           {canAdopt && (
-            <div className="actions">
-              <button type="button" className="ghost" onClick={openNotes}>
-                Open the style notes in the settings…
-              </button>
-            </div>
+            <>
+              {pendingNow && <NotesOnlyWarning />}
+              <div className="actions">
+                <button type="button" className="ghost" onClick={openNotes}>
+                  Open the style notes in the settings…
+                </button>
+              </div>
+            </>
           )}
         </section>
       )}
@@ -565,8 +586,33 @@ function ProposalView({
 }
 
 /**
+ * What saving a pending proposal's style notes in the settings does: the save names the proposal,
+ * and the server takes that as its accept, the rubric it proposes left unwritten.
+ */
+function NotesOnlyWarning() {
+  return (
+    <p className="notice warn-notice">
+      <strong>
+        Saving the style notes in the settings accepts this proposal without its rubric:
+      </strong>{" "}
+      the rubric it proposes is not written, and it cannot be accepted afterwards. To keep both,
+      accept the rubric first: here, with "Also apply the style notes" ticked, or by saving it in
+      the editor.
+    </p>
+  );
+}
+
+/** Whether the page can show what accepting `p` writes: its diff, or else its document. */
+function acceptShown(p: Pick<RubricProposal, "diff" | "document">): boolean {
+  return (
+    (p.diff !== undefined && p.diff !== null) || (p.document !== undefined && p.document !== null)
+  );
+}
+
+/**
  * Accept or reject a pending proposal. "Also apply the style notes" is shown only when the
- * proposal has some, and is off until the person ticks it.
+ * proposal has some, and is off until the person ticks it. Accepting is not offered when neither
+ * the diff nor the document can be shown: nothing is accepted unseen.
  */
 export function Decide({
   p,
@@ -583,6 +629,7 @@ export function Decide({
   onAccept: () => void;
   onReject: () => void;
 }) {
+  const shown = acceptShown(p);
   return (
     <section aria-labelledby="decide-h" className="decide">
       <h2 id="decide-h">Decide</h2>
@@ -591,6 +638,12 @@ export function Decide({
         calibration samples its agent drew on. It is checked against the rubric you read here,
         version {p.currentVersion}: if it has moved since, nothing is written.
       </p>
+      {!shown && (
+        <p className="error small-text">
+          Neither what it changes nor the document it proposes can be shown here, so it cannot be
+          accepted from this page; it can still be rejected.
+        </p>
+      )}
       {p.proposesStyleNotes && (
         <label className="check">
           <input
@@ -603,7 +656,7 @@ export function Decide({
         </label>
       )}
       <div className="actions">
-        <button type="button" onClick={onAccept} disabled={busy}>
+        <button type="button" onClick={onAccept} disabled={busy || !shown}>
           Accept as rubric version {p.currentVersion + 1}
           {p.proposesStyleNotes && applyNotes && ", with the style notes"}
         </button>
@@ -620,12 +673,14 @@ function Refused({
   r,
   proposesNotes,
   canAdopt,
+  pending,
   onEditor,
   onNotes,
 }: {
   r: AcceptRefusal & { withNotes: boolean };
   proposesNotes: boolean;
   canAdopt: boolean;
+  pending: boolean;
   onEditor: () => void;
   onNotes: () => void;
 }) {
@@ -645,6 +700,7 @@ function Refused({
             proposesNotes &&
             " Its style notes were not applied either: open them in the settings once the rubric is saved."}
         </p>
+        {canAdopt && pending && r.withNotes && proposesNotes && <NotesOnlyWarning />}
         {canAdopt && (
           <div className="actions">
             <button type="button" onClick={onEditor}>
@@ -670,6 +726,7 @@ function Refused({
             If the style notes are what was refused, accept without them, and open them in the
             settings, where they are put on top of the notes as they are now.
           </p>
+          {pending && <NotesOnlyWarning />}
           <div className="actions">
             <button type="button" className="ghost" onClick={onNotes}>
               Open the style notes in the settings

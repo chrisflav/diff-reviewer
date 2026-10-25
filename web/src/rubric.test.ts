@@ -336,6 +336,34 @@ describe("rebaseRubric", () => {
     expect(names(r.review)).toEqual(["feature", "refactor", "perf"]);
   });
 
+  it("asks about a type both added under one name, not alike: never two of that name", () => {
+    const added = { name: "perf", description: "Mine.", rubric: "", categories: [] };
+    const mine = { ...base, prTypes: [...base.prTypes, { ...added, categories: [], [RKEY]: 9 }] };
+    const theirs = { ...doc, prTypes: [...doc.prTypes, { ...added, description: "Theirs." }] };
+    const r = rebaseRubric(base, mine, theirs);
+    expect(r.conflicts.map((c) => c.kind)).toEqual(["type"]);
+    expect(names(r.review)).toEqual(["feature", "refactor", "perf"]);
+    expect(r.review.prTypes[2]!.description).toBe("Theirs.");
+    const settled = resolveRubric(r.review, r.conflicts[0]!, "mine");
+    expect(names(settled)).toEqual(["feature", "refactor", "perf"]);
+    expect(settled.prTypes[2]!.description).toBe("Mine.");
+    expect(messages(toRubricDoc(settled))).toEqual([]);
+  });
+
+  it("asks about a category both added under one name, not alike", () => {
+    const mine = edit((d) => {
+      d.prTypes[1]!.categories.push({ name: "docs", description: "Mine." });
+      return d;
+    });
+    const theirs = structuredClone(doc);
+    theirs.prTypes[1]!.categories.push({ name: "docs", description: "Theirs." });
+    const r = rebaseRubric(base, mine, theirs);
+    expect(r.conflicts.map((c) => c.kind)).toEqual(["category"]);
+    const cats = (x: LocalRubric) => x.prTypes[1]!.categories.map((c) => c.description);
+    expect(cats(r.review)).toEqual(["Theirs."]);
+    expect(cats(resolveRubric(r.review, r.conflicts[0]!, "mine"))).toEqual(["Mine."]);
+  });
+
   it("asks when both reordered the same items differently", () => {
     const three: RubricDoc = {
       ...doc,

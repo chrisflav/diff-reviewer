@@ -1351,9 +1351,12 @@ function derivedSummary(v: Pick<RubricDocument, "derivedFrom" | "derivedFromPull
   return `${n(samples.length, "sample", "samples")}, ${n(pulls.length, "pull request", "pull requests")}`;
 }
 
-/** A pull request as the server names it, `owner/name#n`, split; null for anything else. */
+/**
+ * A pull request as the server names it, `owner/name#n`, split; null for anything else, a segment
+ * that starts with a dot among them (`..`, which would leave the repository in a link).
+ */
 function pullOf(key: string): { slug: string; pr: number } | null {
-  const m = /^([A-Za-z0-9._-]+\/[A-Za-z0-9._-]+)#([0-9]+)$/.exec(key);
+  const m = /^([A-Za-z0-9_-][A-Za-z0-9._-]*\/[A-Za-z0-9_-][A-Za-z0-9._-]*)#([0-9]+)$/.exec(key);
   return m === null ? null : { slug: m[1] as string, pr: Number(m[2]) };
 }
 

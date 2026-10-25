@@ -103,11 +103,11 @@ function Categories({ cs }: { cs: Category[] }) {
   );
 }
 
-function AddedType({ t }: { t: PrType }) {
+function ShownType({ t, added }: { t: PrType; added: boolean }) {
   return (
-    <article className="shown-type diff-added">
+    <article className={added ? "shown-type diff-added" : "shown-type"}>
       <h5 className="data">
-        <span className="sr-only">Added: </span>
+        {added && <span className="sr-only">Added: </span>}
         {t.name}
       </h5>
       {t.description !== "" && <p className="body">{t.description}</p>}
@@ -138,7 +138,7 @@ export function ProposalDiffView({ diff }: { diff: RubricProposalDiff }) {
         <section aria-labelledby="types-added-h">
           <h4 id="types-added-h">Types added ({diff.typesAdded.length})</h4>
           {diff.typesAdded.map((t, i) => (
-            <AddedType key={i} t={t} />
+            <ShownType key={i} t={t} added />
           ))}
         </section>
       )}
@@ -193,6 +193,34 @@ export function ProposalDiffView({ diff }: { diff: RubricProposalDiff }) {
           ))}
         </section>
       )}
+    </div>
+  );
+}
+
+/**
+ * A proposal's document in full, for when there is no diff to show: the default rubric and each
+ * type, all of it text.
+ */
+export function ProposedDocumentView({
+  doc,
+}: {
+  doc: { defaultRubric: string; prTypes: PrType[] };
+}) {
+  return (
+    <div className="proposal-diff">
+      <div className="change">
+        <h5>Default rubric</h5>
+        <div className="preview body">
+          {doc.defaultRubric === "" ? <span className="mute">(none)</span> : doc.defaultRubric}
+        </div>
+      </div>
+      <section aria-labelledby="types-shown-h">
+        <h4 id="types-shown-h">Types ({doc.prTypes.length})</h4>
+        {doc.prTypes.length === 0 && <p className="mute small-text">None.</p>}
+        {doc.prTypes.map((t, i) => (
+          <ShownType key={i} t={t} added={false} />
+        ))}
+      </section>
     </div>
   );
 }
