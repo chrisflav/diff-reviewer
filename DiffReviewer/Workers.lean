@@ -2,6 +2,7 @@ import DiffReviewer.Platform
 import DiffReviewer.GitHub
 import DiffReviewer.Orchestra
 import DiffReviewer.Diff
+import DiffReviewer.Calibration
 
 open Lean (Json)
 
@@ -23,6 +24,9 @@ What `serve` does without being asked, on a loop every `--interval` seconds (`st
   * **following** — read each queued or running job's entry (and whatever entry continues it) and
     move the job to `running` when the run starts, or to `failed` when it ends without the agent
     having submitted a review.
+  * **calibration** — the queued imports of past reviews read on (`Calibration.importStep`, a
+    bounded number of pull requests a pass), and every calibration job with a draft and no score
+    scored (`Calibration.scorePending`).
   * **settling** — every claim to post older than its window is settled as
     `POST /api/v1/jobs/{id}/reconcile` would settle it (`settleClaims`): a post whose outcome was
     unknown is not left holding its job until a person looks, which in a `direct` repository
@@ -55,6 +59,11 @@ after GitHub has acted on it. So:
   * while a claim stands, the job cannot leave `approved`, have its review edited or be made
     `stale` (`Job.claimBlocks`): what it says is what may have been posted. Posting it again
     settles the claim.
+
+A `calibration` job (`DiffReviewer.Calibration`) is queued and run as a review is, at its sample's
+commit and with its sample's base — the pull request is closed, so neither its state nor its head
+is checked — and is never claimed or posted: `postJob`, `reconcileJob` and `postDirect` refuse it
+before anything else, and the claim refuses it again in its transaction. Discovery leaves it alone.
 
 Only a person's `POST /api/v1/jobs/{id}/post` posts an approval or a request for changes. A
 `direct` repository's review is always posted as a comment, and so is any review of a pull request
@@ -90,6 +99,11 @@ structure Limits where
       submission and the ones after a settled claim found it had not reached GitHub; a person's
       posts are not counted. Past it a person has to post. -/
   maxDirectPostAttempts : Nat := 3
+  /-- New calibration jobs runs may make per repository in 24 hours: a cap of their own, apart from
+      `maxJobsPerDay`. -/
+  maxCalibrationJobsPerDay : Nat := 20
+  /-- Pull requests the calibration imports read in one pass, together. -/
+  importPullsPerPass : Nat := 25
 
 structure Services where
   github    : Option GitHub.Client
@@ -119,8 +133,29 @@ def Services.logOnce (s : Services) (key msg : String) : IO Unit := do
 
 /-! ## What the agent is told -/
 
+/-- The step of `prompt` that has the agent check out the commit under review. A calibration
+    job's commit is of a pull request that has since been closed, and may no longer be its head:
+    it is fetched by its id, and the agent is told to review it as it stood then, without reading
+    what was said about the pull request since — which is what it is scored against. -/
+private def checkoutStep (job : Job) : String :=
+  let slug := s!"{job.owner}/{job.name}"
+  let diff := s!"`diff-reviewer agent diff {slug} {job.prNumber} --job {job.id}` prints the diff \
+under review."
+  if job.kind? == some .calibration then
+    s!"2. The repository is checked out read-only in your working directory. The pull request may \
+have moved on or been closed since the head commit it names: fetch that commit itself (`git fetch \
+origin <headSha> && git checkout <headSha>`, or `git fetch origin pull/{job.prNumber}/head` first \
+if that fails) and review the change as it stands there, as if it were open for review now. Do not \
+read the pull request's reviews, comments or later commits on GitHub. {diff}"
+  else
+    s!"2. The repository is checked out read-only in your working directory. Check out the head \
+commit it names (`git fetch origin pull/{job.prNumber}/head && git checkout <headSha>`) and read \
+the change in context. {diff}"
+
 /-- The prompt of the orchestra task that reviews `job`. It names no head commit: the agent asks the
-    platform which one (`agent show`), so a prompt never disagrees with the job. -/
+    platform which one (`agent show`), so a prompt never disagrees with the job. A calibration job's
+    differs only in how the commit is checked out (`checkoutStep`), and says nothing of the review
+    it is scored against. -/
 def prompt (job : Job) : String :=
   let slug := s!"{job.owner}/{job.name}"
   s!"Review pull request #{job.prNumber} of {slug} for the diff-reviewer platform (job {job.id}).
@@ -128,10 +163,7 @@ def prompt (job : Job) : String :=
 1. Run `diff-reviewer agent show {slug} {job.prNumber} --job {job.id}`. It prints the pull \
 request — its head and base commits, title and description — and the instructions for the \
 review; follow them.
-2. The repository is checked out read-only in your working directory. Check out the head commit it \
-names (`git fetch origin pull/{job.prNumber}/head && git checkout <headSha>`) and read the change \
-in context. `diff-reviewer agent diff {slug} {job.prNumber} --job {job.id}` prints the diff under \
-review.
+{checkoutStep job}
 3. Pick the pull request type, of the `prTypes` it printed, whose description fits the change, \
 and review the change by that type's `rubric` together with the `instructions` (with no `prTypes`, \
 by the `instructions` alone). Give every inline comment a `severity` (`nit`, `minor`, `major` or \
@@ -348,6 +380,7 @@ def postJob (s : Services) (id : String) (version : Option Nat := none) (direct 
   unless claimed do return .error (.conflict s!"job {id} is being posted already")
   try
     let some job ← Platform.findJob id | return .error .notFound
+    if let some why := job.notPostable then return .error (.conflict why)
     unless job.status? == some .approved do
       return .error (.conflict s!"job {id} is {job.statusRaw}; only an approved review is posted")
     if let some v := version then
@@ -398,6 +431,7 @@ could not be read to tell ({e.message})" true
     -- claim the one read — so of two processes that read the same job, one claims it.
     let now ← nowEpoch
     let claim ← Platform.updateJob id fun j => do
+      if let some why := j.notPostable then throw (.conflict why)
       unless j.status? == some .approved do
         throw (.conflict s!"job {id} is {j.statusRaw}; only an approved review is posted")
       unless j.version == job.version && j.postStartedAt == job.postStartedAt do
@@ -411,7 +445,7 @@ could not be read to tell ({e.message})" true
     match ← gh.postReview job.owner job.name job.prNumber (withMarker id review) (some head)
         (some event) with
     | .ok r => markPosted r note (some event)
-    | .error (.definite why) => failed s!"posting failed: {why}" false
+    | .error (.definite why) | .error (.rateLimited why) => failed s!"posting failed: {why}" false
     | .error e =>
       -- No answer, or a 5xx: the review may yet appear. The claim is kept either way, until it is
       -- found or a later attempt, past the claim's window, has looked and not found it.
@@ -437,6 +471,7 @@ def reconcileJob (s : Services) (id : String) (version : Nat) : IO (Except PostE
   unless claimed do return .error (.conflict s!"job {id} is being posted right now")
   try
     let some job ← Platform.findJob id | return .error .notFound
+    if let some why := job.notPostable then return .error (.conflict why)
     unless job.status? == some .approved && job.version == version do
       return .error (.conflict s!"job {id} is {job.statusRaw} at version {job.version}, not an \
 approved job at version {version}; reload it")
@@ -474,6 +509,7 @@ way; try again in a few minutes")
     it, as a comment. -/
 def postDirect (s : Services) (id : String) (version : Nat) : IO (Except PostError Job) := do
   let approved ← Platform.updateJob id fun j => do
+    if let some why := j.notPostable then throw (.conflict why)
     unless j.status? == some .draft && j.version == version do
       throw (.conflict s!"job {id} changed before it could be posted")
     return { j with statusRaw := JobStatus.approved.toString }
@@ -513,7 +549,9 @@ private def supersedable : List JobStatus := [.pending, .queued, .running, .draf
 
 /-- Discovery: a job for every new head of an open pull request of an `autoReview` repository, up
     to `maxJobsPerDay` a day, and `stale` for the jobs of heads that are no longer the pull
-    request's. GitHub draft pull requests are left until they are marked ready for review. -/
+    request's. GitHub draft pull requests are left until they are marked ready for review. Only
+    review jobs are looked at: a calibration job is of a past commit by design, and is neither a
+    reason to make no job for a head nor ever made `stale` here. -/
 def discover (s : Services) : IO Unit := do
   let repos := (← Platform.listRepos).filter (·.autoReview)
   if repos.isEmpty then return
@@ -528,7 +566,7 @@ repositories with autoReview are not searched for pull requests"
       let mut made ← Platform.jobsSince repo.owner repo.name (isoOfEpoch (now - 86400))
       for p in pulls do
         if p.draft then continue
-        let jobs ← Platform.jobsOfPull repo.owner repo.name p.number
+        let jobs := (← Platform.jobsOfPull repo.owner repo.name p.number).filter (·.isReview)
         unless jobs.any (·.headSha == some p.headSha) do
           if made ≥ s.limits.maxJobsPerDay then
             s.logOnce s!"cap-{repo.slug}-{now / 86400}" s!"{repo.slug} has had \
@@ -553,7 +591,10 @@ def externalId (id : String) (attempts : Nat) : String :=
   if attempts == 0 then id else s!"{id}.{attempts + 1}"
 
 /-- Queueing: every `pending` job of a registered repository whose head is still its pull
-    request's, onto orchestra, once its diff has been fetched and found small enough. -/
+    request's, onto orchestra, once its diff has been fetched and found small enough. A calibration
+    job is of a past commit of a closed pull request, which it knows with its base from its
+    sample: neither the pull request's state nor its head is checked, only its diff. A job of a
+    kind this build does not know is left alone. -/
 def queuePending (s : Services) : IO Unit := do
   let jobs ← Platform.jobsWithStatus [.pending]
   if jobs.isEmpty then return
@@ -562,6 +603,7 @@ def queuePending (s : Services) : IO Unit := do
 DIFF_REVIEWER_ORCHESTRA_TOKEN_FILE); pending jobs stay pending"
   for job in jobs do
     if (← Platform.findRepo job.owner job.name).isNone then continue
+    if job.kind?.isNone then continue
     let mut job := job
     match s.github with
     | none =>
@@ -570,18 +612,23 @@ DIFF_REVIEWER_ORCHESTRA_TOKEN_FILE); pending jobs stay pending"
 and GitHub is not configured to read them"
         continue
     | some gh =>
-      match ← gh.getPull job.owner job.name job.prNumber with
-      | .error e =>
-        recordError job.id .pending s!"reading the pull request: {e.message}"
-        continue
-      | .ok p =>
-        if p.state != "open" then
-          retire s job .stale s!"the pull request is {p.state}"
+      if job.kind? == some .calibration then
+        unless hasPull job do
+          retire s job .failed "the calibration job does not know its commit, base and title"
           continue
-        if job.headSha.any (· != p.headSha) then
-          retire s job .stale s!"the pull request moved on to {p.headSha}"
+      else
+        match ← gh.getPull job.owner job.name job.prNumber with
+        | .error e =>
+          recordError job.id .pending s!"reading the pull request: {e.message}"
           continue
-        job := setPull job p
+        | .ok p =>
+          if p.state != "open" then
+            retire s job .stale s!"the pull request is {p.state}"
+            continue
+          if job.headSha.any (· != p.headSha) then
+            retire s job .stale s!"the pull request moved on to {p.headSha}"
+            continue
+          job := setPull job p
       match ← diffOf s job with
       | .ok _ => pure ()
       | .error (.tooLarge why) =>
@@ -712,9 +759,14 @@ def tick (s : Services) : IO Unit := do
     let before := isoOfEpoch ((← nowEpoch) - s.limits.diffRetentionDays * 86400)
     let n ← Platform.pruneDiffs before
     if n > 0 then s.log s!"dropped {n} kept diff(s)"
+  let calibrate : IO Unit := do
+    if let some gh := s.github then
+      Calibration.importStep gh s.log s.limits.importPullsPerPass
+    let n ← Calibration.scorePending
+    if n > 0 then s.log s!"scored {n} calibration job(s)"
   for (what, step) in [("discovery", discover s), ("queueing", queuePending s),
                        ("following", follow s), ("settling claims", settleClaims s),
-                       ("pruning diffs", prune)] do
+                       ("calibration", calibrate), ("pruning diffs", prune)] do
     try step catch e => s.log s!"{what}: {e}"
 
 /-- Run `tick` every `interval` seconds, on a thread of its own, for as long as the process. A pass

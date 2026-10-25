@@ -17,7 +17,8 @@ open Std.Http.Server (Handler)
 
   * `GET /api/openapi.json` — the API's own description, uncredentialed.
   * `POST /api/login`, `POST /api/logout`, `GET /api/session` — the authentication surface.
-  * `/api/v1/…` — the repositories and review jobs; see `docs/openapi.json`.
+  * `/api/v1/…` — the repositories and review jobs, and calibration
+    (`/api/v1/repos/{owner}/{name}/calibration/…`); see `docs/openapi.json`.
   * `/api/agent/v1/…` — what a reviewing agent reads and submits, through kleis.
   * everything else — the front-end built into `web/dist` (`--site`), with a single-page-app
     fallback.
@@ -376,6 +377,11 @@ private def page (query : String) (xs : Array Json) : IO Reply := do
 private def parseBody (body : String) : Except String Json :=
   (Json.parse body).mapError (s!"the body is not valid JSON: " ++ ·)
 
+/-- Register a repository or change its settings. Every field is optional. `mode` and
+    `autoReview` take their defaults when left out, as they always have; `trustedReviewers` keeps
+    what it was, so that a client that does not know it cannot wipe it. `version`, when given, is
+    the version of the settings last read (0 for a repository not registered), and the write is a
+    `409` if they have changed since. -/
 private def putRepo (owner name body : String) : IO Reply := do
   unless validSlugPart owner && validSlugPart name do
     return .error s!"'{owner}/{name}' is not a GitHub repository name" .badRequest
@@ -392,10 +398,27 @@ private def putRepo (owner name body : String) : IO Reply := do
     | .error _ | .ok .null => pure false
     | .ok (.bool b) => pure b
     | .ok _ => return .error "'autoReview' must be true or false" .badRequest
-  let existed ← Platform.putRepo owner name mode autoReview
-  let some repo ← Platform.findRepo owner.toLower name.toLower
-    | return .error "the repository was written and could not be read back" .internalServerError
-  return .json repo.toJson (if existed then .ok else .created)
+  let trusted ← match j.getObjVal? "trustedReviewers" with
+    | .error _ | .ok .null => pure none
+    | .ok (.arr xs) =>
+      let some logins := xs.toList.mapM (·.getStr?.toOption)
+        | return .error "'trustedReviewers' must be an array of GitHub logins" .badRequest
+      if let some bad := logins.find? (!validLogin ·) then
+        return .error s!"'{bad}' is not a GitHub login" .badRequest
+      if logins.length > maxTrustedReviewers then
+        return .error s!"'trustedReviewers' names {logins.length} logins; at most \
+{maxTrustedReviewers}" .badRequest
+      pure (some logins)
+    | .ok _ => return .error "'trustedReviewers' must be an array of GitHub logins" .badRequest
+  let expected ← match j.getObjVal? "version" with
+    | .error _ | .ok .null => pure none
+    | .ok v => match v.getNat? with
+      | .ok n => pure (some n)
+      | .error _ => return .error "'version' must be a whole number" .badRequest
+  match ← Platform.putRepo owner name
+      { mode, autoReview, trustedReviewers := trusted, expected } with
+  | .ok (existed, repo) => return .json repo.toJson (if existed then .ok else .created)
+  | .error why => return .error why .conflict
 
 private def createJob (body : String) : IO Reply := do
   let j ← match parseBody body with
@@ -479,6 +502,9 @@ private def putReview (id body : String) : IO Reply := do
   let editable (job : Job) : Except Platform.UpdateError Unit := do
     let st ← current job version
     if let some why := job.claimBlocks then throw (.conflict why)
+    -- A calibration job's review is what the agent submitted, scored as it was.
+    unless job.isReview do
+      throw (.conflict s!"job {id} is a {job.kindRaw.getD "review"} job; its review is not edited")
     unless st.personCanEdit do
       throw (.conflict s!"job {id} is {st.toString}; its review is not edited now")
     if let some (.error e) := job.review? then
@@ -523,6 +549,7 @@ private def setStatus (id body : String) : IO Reply := do
     unless st.personCanMove to do
       throw (.conflict s!"job {id} is {st.toString} and cannot be made {to.toString} from here")
     if to == .approved then
+      if let some why := job.notPostable then throw (.conflict why)
       match job.review? with
       | some (.ok _) => pure ()
       | some (.error e) => throw (.conflict s!"job {id}'s review does not parse ({e})")
@@ -603,6 +630,75 @@ private def putRubric (owner name body : String) : IO Reply := do
   | .error (.conflict why) => return .error why .conflict
   | .error (.invalid why) => return .error why .badRequest
 
+/-! ## Calibration -/
+
+/-- Answer `k` for registered repository `owner/name`, or `404`. -/
+private def withRepo (owner name : String) (k : Repo → IO Reply) : IO Reply := do
+  match ← Platform.findRepo owner.toLower name.toLower with
+  | some repo => k repo
+  | none => return .error "not found" .notFound
+
+/-- Queue an import of past reviews. The body is `{"limit": n}`, every field optional: the `n`
+    most recently updated closed pull requests (50 unless it says, at most 200). `202` with the
+    import; `409` with the import under way while one is, or when the repository names no trusted
+    reviewers. -/
+private def calibrationImport (st : State) (owner name body : String) : IO Reply :=
+  withRepo owner name fun repo => do
+    let j ← match parseBody body with
+      | .ok j => pure j
+      | .error e => return .error e .badRequest
+    let limit ← match j.getObjVal? "limit" with
+      | .error _ | .ok .null => pure Calibration.defaultImportLimit
+      | .ok v => match v.getNat? with
+        | .ok n =>
+          unless 1 ≤ n && n ≤ Calibration.maxImportLimit do
+            return .error s!"'limit' must be between 1 and {Calibration.maxImportLimit}" .badRequest
+          pure n
+        | .error _ => return .error "'limit' must be a whole number" .badRequest
+    if repo.trustedReviewers.isEmpty then
+      return .error s!"{repo.slug} names no trusted reviewers; set 'trustedReviewers' first"
+        .conflict
+    if st.services.github.isNone then
+      return .error "GitHub is not configured (DIFF_REVIEWER_GITHUB_TOKEN_FILE)" .serviceUnavailable
+    match ← Calibration.requestImport repo limit with
+    | .ok i => return .json i.toJson .accepted
+    | .error cur =>
+      return .json (.mkObj [("error", s!"import {cur.id} of {repo.slug} is under way"),
+                            ("import", cur.toJson)]) .conflict
+
+/-- Ask for a calibration run. The body is `{"samples": [id, …]}`, or `{"count": n}` for the `n`
+    samples reviewed by the fewest runs so far; at most `Calibration.maxRunSamples` either way.
+    `201` with the run; `429` when its jobs would pass the daily cap of calibration jobs. -/
+private def calibrationRun (st : State) (owner name body : String) : IO Reply :=
+  withRepo owner name fun repo => do
+    let j ← match parseBody body with
+      | .ok j => pure j
+      | .error e => return .error e .badRequest
+    let most := Calibration.maxRunSamples
+    let ids ← match j.getObjVal? "samples", j.getObjVal? "count" with
+      | .ok (.arr xs), .error _ =>
+        let some ids := xs.toList.mapM (·.getStr?.toOption)
+          | return .error "'samples' must be an array of sample ids" .badRequest
+        if ids.eraseDups.length != ids.length then
+          return .error "'samples' names a sample twice" .badRequest
+        pure ids
+      | .error _, .ok v => match v.getNat? with
+        | .ok n =>
+          unless 1 ≤ n && n ≤ most do
+            return .error s!"'count' must be between 1 and {most}" .badRequest
+          Calibration.pickSamples repo.owner repo.name n
+        | .error _ => return .error "'count' must be a whole number" .badRequest
+      | .ok _, .error _ => return .error "'samples' must be an array of sample ids" .badRequest
+      | _, _ => return .error "the body names either 'samples' or a 'count'" .badRequest
+    if ids.isEmpty then
+      return .error s!"{repo.slug} has no samples to review; import some first" .badRequest
+    if ids.length > most then
+      return .error s!"a run reviews at most {most} samples" .badRequest
+    match ← Calibration.createRun repo ids st.services.limits.maxCalibrationJobsPerDay with
+    | .ok (run, _) => return .json (← Calibration.runJson run (detail := true)) .created
+    | .error (.invalid why) => return .error why .badRequest
+    | .error (.capped why) => return .error why .tooManyRequests
+
 /-- Every route under `/api/v1/`, with the methods it answers. `DiffReviewerTest.Server` checks
     this against `docs/openapi.json`, so a route without a spec entry fails the suite. -/
 def apiRoutes : Array (String × Array String) :=
@@ -617,7 +713,13 @@ def apiRoutes : Array (String × Array String) :=
     ("jobs/{id}/diff",           #["get"]),
     ("jobs/{id}/revisions",      #["get"]),
     ("repos/{owner}/{name}/rubrics",         #["get", "put"]),
-    ("repos/{owner}/{name}/rubrics/history", #["get"])]
+    ("repos/{owner}/{name}/rubrics/history", #["get"]),
+    ("repos/{owner}/{name}/calibration/import",       #["get", "post"]),
+    ("repos/{owner}/{name}/calibration/samples",      #["get"]),
+    ("repos/{owner}/{name}/calibration/samples/{id}", #["get", "delete"]),
+    ("repos/{owner}/{name}/calibration/runs",         #["get", "post"]),
+    ("repos/{owner}/{name}/calibration/runs/{id}",    #["get"]),
+    ("repos/{owner}/{name}/calibration/summary",      #["get"])]
 
 private def apiRoute (st : State) (r : Req) (segs : List String) : IO Reply := do
   match segs, r.method with
@@ -628,7 +730,15 @@ private def apiRoute (st : State) (r : Req) (segs : List String) : IO Reply := d
     if ← Platform.deleteRepo owner name then return .noContent
     else return .error "not found" .notFound
   | ["jobs"], .get =>
-    return .json (items ((← Platform.listJobs).map (·.toJson)))
+    -- Review jobs unless `kind` says otherwise: calibration jobs are never acted on, and are read
+    -- with their runs.
+    let kind := queryParam r.query "kind"
+    let keep ← match kind with
+      | none | some "review" => pure fun (j : Job) => j.isReview
+      | some "calibration" => pure fun (j : Job) => j.kind? == some .calibration
+      | some "all" => pure fun (_ : Job) => true
+      | some k => return .error s!"'kind' must be review, calibration or all, not '{k}'" .badRequest
+    return .json (items (((← Platform.listJobs).filter keep).map (·.toJson)))
   | ["jobs"], .post => createJob r.body
   | ["jobs", id], .get =>
     match ← Platform.findJob id with
@@ -656,6 +766,44 @@ private def apiRoute (st : State) (r : Req) (segs : List String) : IO Reply := d
     let (owner, name) := (owner.toLower, name.toLower)
     if (← Platform.findRepo owner name).isNone then return .error "not found" .notFound
     page r.query ((← Platform.rubricHistory owner name).map (·.toJson))
+  | ["repos", owner, name, "calibration", "import"], .post =>
+    calibrationImport st owner.toLower name.toLower r.body
+  | ["repos", owner, name, "calibration", "import"], .get =>
+    withRepo owner name fun repo => do
+      page r.query ((← Calibration.importsOf repo.owner repo.name).map (·.toJson))
+  | ["repos", owner, name, "calibration", "samples"], .get =>
+    withRepo owner name fun repo => do
+      page r.query ((← Calibration.listSamples repo.owner repo.name).map (·.toJson))
+  | ["repos", owner, name, "calibration", "samples", id], .get =>
+    withRepo owner name fun repo => do
+      match ← Calibration.findSample id with
+      | some s =>
+        if s.owner == repo.owner && s.name == repo.name && s.deletedAt.isNone then
+          return .json s.toJson
+        return .error "not found" .notFound
+      | none => return .error "not found" .notFound
+  | ["repos", owner, name, "calibration", "samples", id], .delete =>
+    withRepo owner name fun repo => do
+      if ← Calibration.deleteSample repo.owner repo.name id then return .noContent
+      return .error "not found" .notFound
+  | ["repos", owner, name, "calibration", "runs"], .post =>
+    calibrationRun st owner.toLower name.toLower r.body
+  | ["repos", owner, name, "calibration", "runs"], .get =>
+    withRepo owner name fun repo => do
+      let runs ← Calibration.runsOf repo.owner repo.name
+      page r.query (← runs.mapM (Calibration.runJson · (detail := false)))
+  | ["repos", owner, name, "calibration", "runs", id], .get =>
+    withRepo owner name fun repo => do
+      match ← Calibration.findRun repo.owner repo.name id with
+      | some run => return .json (← Calibration.runJson run (detail := true))
+      | none => return .error "not found" .notFound
+  | ["repos", owner, name, "calibration", "summary"], .get =>
+    withRepo owner name fun repo => do
+      return .json (← Calibration.summaryJson repo.owner repo.name)
+  | ["repos", _, _, "calibration", "import"], _ | ["repos", _, _, "calibration", "samples"], _
+  | ["repos", _, _, "calibration", "samples", _], _ | ["repos", _, _, "calibration", "runs"], _
+  | ["repos", _, _, "calibration", "runs", _], _ | ["repos", _, _, "calibration", "summary"], _ =>
+    return .error "method not allowed" .methodNotAllowed
   | ["repos"], _ | ["repos", _, _], _ | ["jobs"], _ | ["jobs", _], _
   | ["jobs", _, "review"], _ | ["jobs", _, "status"], _ | ["jobs", _, "post"], _
   | ["jobs", _, "reconcile"], _ | ["jobs", _, "revisions"], _
@@ -742,7 +890,8 @@ private def agentShow (job : Job) : IO Reply := do
     rubric's version, comments without an id are given one, and the review is the first revision
     of the job's history. A `direct` repository's review is then posted at once; if that fails the
     job is left `approved` with the reason, for a person to post again, and the submission still
-    stands. -/
+    stands. A calibration job's review is never posted, in any mode: it is scored against its
+    sample instead. -/
 private def agentSubmit (st : State) (job : Job) (body : String) : IO Reply := do
   let j ← match parseBody body with
     | .ok j => pure j
@@ -781,9 +930,15 @@ show` first")
   let job ← match drafted with
     | .ok j => pure j
     | .error e => return updateReply (.error e)
+  if job.kind? == some .calibration then
+    try
+      let _ ← Calibration.scoreJob job
+    catch e =>
+      -- The workers score it on their next pass.
+      IO.eprintln s!"diff-reviewer: scoring job {job.id}: {e}"
   let job ← match ← Platform.findRepo job.owner job.name with
     | some repo =>
-      if repo.mode != .direct then pure job else
+      if repo.mode != .direct || !job.isReview then pure job else
       match ← Workers.postDirect st.services job.id job.version with
       | .ok j => pure j
       | .error _ => pure ((← Platform.findJob job.id).getD job)

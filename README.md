@@ -58,13 +58,16 @@ It is built in milestones. The first three are here:
   The agent's draft beside what was posted is what calibration will learn from. It is bounded: the
   agent's first draft, every revision GitHub holds, and the last 100 are kept. It and the rubric
   history are paged (`?limit=…&offset=…`, 50 by default).
+- **Calibration** (`/api/v1/repos/{owner}/{name}/calibration/…`): the agent's reviews of past
+  commits, scored against the reviews the repository's trusted reviewers wrote of the same commits.
+  See [Calibration](#calibration).
 - **A web front-end** (`web/`): sign in, register repositories, request a review, read a review,
   edit it, approve or reject it. Every write names the version of the job it was made on, so a
   stale page is refused rather than overwriting.
 - **The command-line tools** it started as: `diff-reviewer github` posts a review JSON to a pull
   request, and `diff-reviewer from-git` turns a commit range into one.
 
-Next: calibration from past human reviews, and learned review style.
+Next: learned review style.
 
 ## Running it
 
@@ -85,7 +88,9 @@ It listens on `127.0.0.1:8090` (`--host`, `--port`) and runs the workers every 6
 `--secure-cookie`, and name the reverse proxy with `--trusted-proxy <ip>`: failed logins are
 counted per client address — an IPv6 client per /64 — which is the socket's peer unless the
 request comes from that proxy, when it is the last address of `X-Forwarded-For`. `--max-jobs-per-day` (default 50) bounds the
-jobs discovery makes per repository, and `--max-diff-bytes` (default 5242880) the diff reviewed.
+jobs discovery makes per repository, `--max-calibration-jobs-per-day` (default 20) the calibration
+jobs runs make per repository, apart from it, and `--max-diff-bytes` (default 5242880) the diff
+reviewed.
 
 Releases (`v*` tags) attach a Linux x86_64 binary and its sha256 to the GitHub release; it runs on
 Debian bookworm and newer. They also publish the image review tasks run in on orchestra,
@@ -219,6 +224,8 @@ The platform holds no real credential of GitHub, and agents hold none of the pla
   `CURL_CA_BUNDLE`), and `DIFF_REVIEWER_GITHUB_TOKEN_FILE` holding `kleis`. kleis's
   `diff-reviewer-poster` grant injects the operator's PAT for reading pull requests and posting
   reviews on the repositories it lists, so approved reviews appear under your own name.
+  Calibration's imports read only under `/repos/{owner}/{name}/` too — the closed pull requests,
+  their reviews and review comments, and a compare of two commits — which the same grant allows.
 
 ## Rubrics
 
@@ -281,6 +288,88 @@ one to each comment written without one, when the review is submitted or edited,
 comments have — so keep them when editing, and a comment can be followed from the agent's draft to
 what was posted. A review stored before ids existed gets them on its next write, never on a read.
 
+## Calibration
+
+How close are the agent's reviews to the ones the people you trust write? Calibration measures it
+on the repository's own past: the agent reviews commits that a trusted reviewer has already
+reviewed, without being shown that review, and the two are compared.
+
+### How to calibrate
+
+1. **Say whose reviews count.** `PUT /api/v1/repos/{owner}/{name}` with
+   `{"trustedReviewers": ["alice", "bob"]}` (alongside `mode` and `autoReview`, which the write
+   replaces as always). Leaving `trustedReviewers` out of a later write keeps them. The settings
+   are versioned: send the `version` you read, and a write over a newer one is a `409`.
+2. **Import.** `POST …/calibration/import` with `{"limit": 50}` (the default; at most 200) queues
+   an import of that many of the most recently updated closed pull requests. The workers read it
+   on, 25 pull requests a pass (`GET …/calibration/import` shows how far). Every submitted review
+   by a trusted reviewer becomes a **sample** (`GET …/calibration/samples`): the commit it was of,
+   the merge base of the pull request's base and that commit (the base its diff had there), the
+   reviewer, the review's state and body, and its inline comments on the new side of that commit.
+   Comments on the old side, comments not placed on a line of that commit, and replies in a thread
+   are dropped and counted (`dropped`); so is a review that leaves nothing to compare — no body and
+   no comment kept. A comment GitHub now shows as *outdated* is kept, at the line it was written
+   on: it is outdated only against later commits, and those are the comments the author acted on.
+   Importing again adds only reviews not stored yet; a sample you delete
+   (`DELETE …/calibration/samples/{id}`) stays deleted. When GitHub says its rate limit is
+   reached the import stops where it is and goes on by itself on the next pass.
+3. **Run.** `POST …/calibration/runs` with `{"samples": ["<id>", …]}`, or `{"count": 10}` for
+   the samples run least so far (at most 20 either way). Each sample gets a `calibration` job at
+   its commit, with its base for the diff, which is queued on orchestra and reviewed exactly as a
+   review job is — the same prompt, apart from fetching the commit by its id and not reading the
+   pull request's later history on GitHub, and the repository's current rubric. The prompt and
+   what the agent reads name no sample and quote nothing of the person's review. A calibration
+   job is **never posted**: it cannot be approved, edited, claimed, posted or reconciled (`409`),
+   in a `direct` repository too; discovery never makes it `stale`; and it counts toward
+   `--max-calibration-jobs-per-day`, not `--max-jobs-per-day` (`429` past it). `GET /api/v1/jobs`
+   lists review jobs unless asked `?kind=calibration` or `?kind=all`.
+4. **Read.** When the agent submits, its draft is scored against the sample, and kept with the
+   job. `GET …/calibration/runs/{id}` shows each sample's result and the run's aggregate,
+   `GET …/calibration/runs` every run's aggregate over time, and `GET …/calibration/summary` the
+   aggregate over all runs, and by the rubric version the jobs were reviewed against — so that a
+   rubric change can be judged by whether the numbers moved.
+
+### What the numbers mean
+
+The agent's and the person's inline comments are paired one to one, greedily, closest first: two
+comments can pair when they are on the same file and their line ranges overlap or are at most 3
+lines apart.
+
+- **precision** — paired agent comments over all agent comments: how much of what the agent says
+  is on something the person also commented on. Also given **per category** and **per severity**
+  of the agent's comments, which shows whether, say, its `blocker`s land more often than its
+  `nit`s.
+- **recall** — paired person comments over all person comments: how much of what the person
+  raised the agent found.
+- **decision agreement** — whether the agent's decision is the person's (`APPROVED`,
+  `CHANGES_REQUESTED`, `COMMENTED`), with the full agent-by-person matrix; a `DISMISSED` review is
+  not compared.
+- the **pairs**, and the comments left unpaired on each side, to read what was missed and what
+  was extra.
+
+Aggregates add counts first and divide last, so every comment weighs the same, however many its
+review had. Ratios are to four decimals, and `null` when there is nothing to divide by.
+
+### Their limits
+
+- **Pairing is by place only.** Two comments on the same lines may say different things, and two
+  that say the same may be a screen apart; a comment the person put on the call site and the agent
+  on the definition is a miss on both sides. Read precision and recall as how often the agent
+  looks where a person looks, not as how often it is right. Every score records the
+  `matcherVersion` that made it, and every pair is named by its two comments' ids (`key`), so a
+  later judge of what the comments say can add a verdict per pair, and a new matcher scores of its
+  own version, beside the old ones and never over them; only scores of the current version are
+  aggregated, and the workers score every job again when it changes.
+- **A person's review is not ground truth.** People skip what is fine, comment on what an agent
+  is told not to, and spread one review over several. An agent comment with no pair may be right,
+  and a person's that the agent missed may be a matter of taste. Few samples make for noisy
+  numbers.
+- **The agent can still look.** It reads GitHub read-only to check the code out, and is told not
+  to read the pull request's reviews or later commits; nothing enforces that.
+- **The base is reconstructed.** It is the merge base of the base the closed pull request has now
+  and the reviewed commit, which is the base GitHub's diff showed for any history but a rewritten
+  base branch; a commit lost to a force-push cannot be compared and is counted as `unreachable`.
+
 ## Tests
 
 ```sh
@@ -295,8 +384,11 @@ direct mode, settling claims on their own and posting a direct review again at m
 against a fake GitHub and a fake orchestra, rubrics and their versions, the agent's submission
 checked against them, comment ids and unknown fields kept through every round trip (of reviews and
 rubrics), the history of a review from draft to post, the checks of a review against its diff,
-the agent CLI against the server on loopback, and that `docs/openapi.json` documents exactly the
-routes the server answers. Nothing in it reaches the network.
+the agent CLI against the server on loopback, calibration — trusted reviewers as a versioned
+setting, the import of past reviews (what it keeps and drops, idempotence, deleted samples, the rate
+limit and the budget of a pass), the matcher, runs and their cap, calibration jobs left alone by
+discovery and never posted by any path, and the aggregates — and that `docs/openapi.json`
+documents exactly the routes the server answers. Nothing in it reaches the network.
 
 `docs/openapi.json` is embedded in the binary with `include_str`, and Lake rebuilds a module when
 its own source changes, not when a file it includes does: after editing the spec, touch

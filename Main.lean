@@ -19,14 +19,15 @@ USAGE:
   diff-reviewer serve [--db <path>] [--host <ip>] [--port <n>] [--site <dir>]
                       [--secure-cookie] [--interval <seconds>]
                       [--trusted-proxy <ip>] [--max-jobs-per-day <n>]
-                      [--max-diff-bytes <n>]
+                      [--max-diff-bytes <n>] [--max-calibration-jobs-per-day <n>]
       Run the review platform: the HTTP API, the front-end built into <dir>
       (web/dist), and the workers that find pull requests, queue reviews on
       orchestra and follow them, every --interval seconds. Configured by the
       environment; see the README. Defaults: --db diff-reviewer.db,
       --host 127.0.0.1, --port 8090, --interval 60, --max-jobs-per-day 50,
-      --max-diff-bytes 5242880. --trusted-proxy is the reverse proxy whose
-      X-Forwarded-For names the client, for the login rate limit.
+      --max-diff-bytes 5242880, --max-calibration-jobs-per-day 20. --trusted-proxy
+      is the reverse proxy whose X-Forwarded-For names the client, for the login
+      rate limit.
 
   diff-reviewer agent show   <owner/repo> <pr-number> [--job <id>]
   diff-reviewer agent diff   <owner/repo> <pr-number> [--job <id>]
@@ -115,6 +116,10 @@ private def serveFlags : List String → Except String (Server.Config → Server
     let some n := v.toNat? | .error s!"--max-diff-bytes: '{v}' is not a number of bytes"
     let f ← serveFlags rest
     return fun c => f { c with limits.maxDiffBytes := n }
+  | "--max-calibration-jobs-per-day" :: v :: rest => do
+    let some n := v.toNat? | .error s!"--max-calibration-jobs-per-day: '{v}' is not a number"
+    let f ← serveFlags rest
+    return fun c => f { c with limits.maxCalibrationJobsPerDay := n }
   | flag :: _ => .error s!"unknown flag '{flag}'"
 
 /-- The token in the file `var` names, if it is set. -/
