@@ -1,5 +1,14 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import { KEY, toLocal, toReview } from "./review";
+import {
+  conflictId,
+  freshKeys,
+  KEY,
+  rebase,
+  resolve,
+  sameReview,
+  toLocal,
+  toReview,
+} from "./review";
 import {
   freshRubricKeys,
   RKEY,
@@ -13,6 +22,7 @@ import {
 } from "./rubric";
 import {
   dropStash,
+  reopen,
   reopenRubric,
   rubricStashKey,
   stash,
@@ -63,6 +73,66 @@ describe("stash", () => {
     expect(unstash("j1")).toBeNull();
     store.set("diff-reviewer:edits:j1", JSON.stringify({ jobId: "other", version: 1 }));
     expect(unstash("j1")).toBeNull();
+  });
+});
+
+describe("stash with open conflicts", () => {
+  beforeEach(() => {
+    store.clear();
+    full = false;
+  });
+
+  it("brings back open conflicts, the sides picked and the edits made since, after a 401", () => {
+    // Version 1 edited here; version 2 saved elsewhere meanwhile; a 409, and the edits are moved.
+    const base = toLocal({ ...review, comments: [{ ...review.comments[0]!, id: "c1" }] });
+    const mine = {
+      ...base,
+      body: "mine",
+      comments: base.comments.map((c) => ({ ...c, body: "mine" })),
+    };
+    const theirs = {
+      ...toReview(base),
+      body: "theirs",
+      comments: toReview(base).comments.map((c) => ({ ...c, body: "theirs" })),
+    };
+    const r = rebase(base, mine, theirs);
+    expect(r.conflicts.map(conflictId)).toEqual([
+      "field:body",
+      `comment:${base.comments[0]![KEY]}`,
+    ]);
+    const source = { jobId: "j1", version: 1, base, review: mine };
+    // One side picked, and a comment added since; the other conflict still open.
+    const first = r.conflicts[0]!;
+    const picks = { [conflictId(first)]: "mine" as const };
+    const picked = resolve(r.review, first, "mine");
+    const added = { file: "b", start_line: 2, end_line: 2, body: "new" };
+    const now = {
+      ...picked,
+      comments: [...picked.comments, { ...added, [KEY]: freshKeys(picked, r.base)() }],
+    };
+    expect(
+      stash({ jobId: "j1", version: 2, base: r.base, review: now }, { from: 1, source, picks }),
+    ).toBe(true);
+
+    // The page is gone: everything comes back from storage alone.
+    const back = unstash("j1");
+    expect(back?.pending?.picks).toEqual(picks);
+    const reopened = reopen(back!);
+    expect(reopened).not.toBeNull();
+    expect(sameReview(reopened!.edits.review, now)).toBe(true);
+    expect(toReview(reopened!.edits.review).body).toBe("mine");
+    expect(reopened!.rebased?.conflicts.map(conflictId)).toEqual(r.conflicts.map(conflictId));
+    expect(reopened!.rebased?.picks).toEqual(picks);
+    const open = reopened!.rebased!.conflicts[1]!;
+    expect(toReview(resolve(reopened!.edits.review, open, "mine")).comments[0]!.body).toBe("mine");
+  });
+
+  it("reopens edits without conflicts as they were", () => {
+    const base = toLocal(review);
+    stash({ jobId: "j1", version: 1, base, review: { ...base, body: "x" } });
+    const back = unstash("j1");
+    expect(back?.pending).toBeNull();
+    expect(reopen(back!)?.rebased).toBeNull();
   });
 });
 

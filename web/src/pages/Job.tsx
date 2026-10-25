@@ -56,7 +56,7 @@ import {
   rubricVersionOfJob,
   storedCategories,
 } from "../rubric";
-import { dropStash, stash, unstash, type Edits, type Stashed } from "../stash";
+import { dropStash, reopen, stash, unstash, type Edits, type Stashed } from "../stash";
 import { UnsavedContext } from "../unsaved";
 import { useLoad } from "../useLoad";
 
@@ -139,7 +139,7 @@ function JobView({ id, onUnauthorized }: { id: string; onUnauthorized: () => voi
   // Edits an earlier page of this job left in the tab's storage, until restored or discarded.
   const [offer, setOffer] = useState<Stashed | null>(() => {
     const s = unstash(id);
-    return s !== null && !sameReview(s.base, s.review) ? s : null;
+    return s !== null && (s.pending !== null || !sameReview(s.base, s.review)) ? s : null;
   });
 
   const saved = useMemo(() => toLocal(job?.review ?? emptyReview), [job?.review]);
@@ -200,7 +200,13 @@ function JobView({ id, onUnauthorized }: { id: string; onUnauthorized: () => voi
   const [memoryOnly, setMemoryOnly] = useState(false);
   useEffect(() => {
     if (edits === null) return;
-    setMemoryOnly(!stash(unresolved && rebased !== null ? rebased.source : edits));
+    // With the conflicts still open and the sides picked so far, so that a 401 or a reload brings
+    // back the page as it was.
+    const pending =
+      unresolved && rebased !== null
+        ? { from: rebased.from, source: rebased.source, picks: rebased.picks }
+        : null;
+    setMemoryOnly(!stash(edits, pending));
   }, [edits, rebased, unresolved]);
 
   const unsaved = useContext(UnsavedContext);
@@ -423,7 +429,22 @@ function JobView({ id, onUnauthorized }: { id: string; onUnauthorized: () => voi
   const restore = () => {
     if (offer === null) return;
     setOffer(null);
-    mergeOnto(job, offer, offer.version !== job.version);
+    if (offer.pending === null) {
+      mergeOnto(job, offer, offer.version !== job.version);
+      return;
+    }
+    const back = reopen(offer);
+    if (back === null) {
+      // The open conflicts cannot be worked out again: the edits from before them are moved anew.
+      mergeOnto(job, offer.pending.source, true);
+      return;
+    }
+    setEdits(back.edits);
+    setRebased(back.rebased);
+    if (offer.version !== job.version)
+      setError(
+        `The job is at version ${job.version} now. Settle the conflicts above first; saving then offers to move your edits onto version ${job.version}.`,
+      );
   };
 
   const dropOffer = () => {
