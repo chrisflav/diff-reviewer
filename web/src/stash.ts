@@ -26,6 +26,7 @@ import {
   type RubricPick,
 } from "./rubric";
 import {
+  DEFAULT_EVAL_SHARE,
   mergeRepoSettings,
   type RepoConflict,
   type RepoForm,
@@ -194,6 +195,8 @@ export interface RubricEdits {
   version: number;
   base: LocalRubric;
   doc: LocalRubric;
+  /** The rubric proposal the edits adopt: the save names it (`fromProposal`). */
+  fromProposal?: string;
 }
 
 /**
@@ -226,6 +229,7 @@ export function stashRubric(e: RubricEdits, pending: PendingRubric | null = null
     version: e.version,
     base: freezeRubric(e.base),
     doc: freezeRubric(e.doc),
+    ...(e.fromProposal === undefined ? {} : { fromProposal: e.fromProposal }),
     savedAt: new Date().toISOString(),
     pending:
       pending === null
@@ -235,12 +239,29 @@ export function stashRubric(e: RubricEdits, pending: PendingRubric | null = null
             version: pending.source.version,
             base: freezeRubric(pending.source.base),
             doc: freezeRubric(pending.source.doc),
+            ...(pending.source.fromProposal === undefined
+              ? {}
+              : { fromProposal: pending.source.fromProposal }),
             picks: pending.picks,
           },
   }));
 }
 
-function thawPending(repo: string, j: unknown): PendingRubric | null | undefined {
+/**
+ * The proposal edits from before a move adopted: as stored with them, or else, kept by a build
+ * that did not store it there, the proposal the edits after the move adopt, which are the same
+ * edits moved.
+ */
+function fromProposalOf(p: Record<string, unknown>, outer: unknown): { fromProposal?: string } {
+  const from = typeof p.fromProposal === "string" ? p.fromProposal : outer;
+  return typeof from === "string" ? { fromProposal: from } : {};
+}
+
+function thawPending(
+  repo: string,
+  j: unknown,
+  outerFrom?: unknown,
+): PendingRubric | null | undefined {
   if (j === null || j === undefined) return null;
   if (typeof j !== "object") return undefined;
   const p = j as Record<string, unknown>;
@@ -254,12 +275,13 @@ function thawPending(repo: string, j: unknown): PendingRubric | null | undefined
     doc === null ||
     typeof picks !== "object" ||
     picks === null ||
-    !Object.values(picks).every((v) => v === "mine" || v === "theirs")
+    !Object.values(picks).every((v) => v === "mine" || v === "theirs") ||
+    (p.fromProposal !== undefined && typeof p.fromProposal !== "string")
   )
     return undefined;
   return {
     from: p.from,
-    source: { repo, version: p.version, base, doc },
+    source: { repo, version: p.version, base, doc, ...fromProposalOf(p, outerFrom) },
     picks: picks as Record<string, RubricPick>,
   };
 }
@@ -271,17 +293,26 @@ export function unstashRubric(repo: string): StashedRubric | null {
     const j = JSON.parse(text) as Record<string, unknown>;
     const base = thawRubric(j.base);
     const doc = thawRubric(j.doc);
-    const pending = thawPending(repo, j.pending);
+    const pending = thawPending(repo, j.pending, j.fromProposal);
     if (
       j.repo !== repo ||
       typeof j.version !== "number" ||
       typeof j.savedAt !== "string" ||
       base === null ||
       doc === null ||
-      pending === undefined
+      pending === undefined ||
+      (j.fromProposal !== undefined && typeof j.fromProposal !== "string")
     )
       return null;
-    return { repo, version: j.version, base, doc, savedAt: j.savedAt, pending };
+    return {
+      repo,
+      version: j.version,
+      base,
+      doc,
+      savedAt: j.savedAt,
+      pending,
+      ...(typeof j.fromProposal === "string" ? { fromProposal: j.fromProposal } : {}),
+    };
   } catch {
     return null;
   }
@@ -315,7 +346,13 @@ export interface Reopened {
  * (stored by another build): then the edits from before the move are what is left to restore.
  */
 export function reopenRubric(s: StashedRubric): Reopened | null {
-  const edits: RubricEdits = { repo: s.repo, version: s.version, base: s.base, doc: s.doc };
+  const edits: RubricEdits = {
+    repo: s.repo,
+    version: s.version,
+    base: s.base,
+    doc: s.doc,
+    ...(s.fromProposal === undefined ? {} : { fromProposal: s.fromProposal }),
+  };
   const p = s.pending;
   if (p === null) return { edits, rebased: null };
   const r = rebaseRubric(p.source.base, p.source.doc, toRubricDoc(s.base));
@@ -338,6 +375,8 @@ export interface RepoEdits {
   version: number;
   base: RepoForm;
   form: RepoForm;
+  /** The rubric proposal whose style notes the edits adopt: the save names it. */
+  fromProposal?: string;
 }
 
 /**
@@ -354,6 +393,12 @@ export interface PendingRepo {
 export interface StashedRepo extends RepoEdits {
   savedAt: string;
   pending: PendingRepo | null;
+  /**
+   * Kept by a build that did not know the style notes and the share held out: they were filled in
+   * alike on both sides, so that restoring moves the edits onto the settings as they are rather
+   * than writing those fields.
+   */
+  legacy?: boolean;
 }
 
 const repoPrefix = "diff-reviewer:repo:";
@@ -371,22 +416,48 @@ export function stashRepo(e: RepoEdits, pending: PendingRepo | null = null): boo
             version: pending.source.version,
             base: pending.source.base,
             form: pending.source.form,
+            ...(pending.source.fromProposal === undefined
+              ? {}
+              : { fromProposal: pending.source.fromProposal }),
             picks: pending.picks,
           },
   }));
 }
 
-function thawForm(j: unknown): RepoForm | null {
+/**
+ * A stored form; one from before the style notes has them empty, and says so (`legacy`). A share
+ * held out left empty is `NaN` in the form, which JSON stores as null: it is `NaN` again.
+ */
+function thawForm(j: unknown): (RepoForm & { legacy: boolean }) | null {
   if (typeof j !== "object" || j === null) return null;
   const f = j as Record<string, unknown>;
   if (f.mode !== "staged" && f.mode !== "direct") return null;
   if (typeof f.autoReview !== "boolean") return null;
   const t = f.trustedReviewers;
   if (!Array.isArray(t) || !t.every((l) => typeof l === "string")) return null;
-  return { mode: f.mode, autoReview: f.autoReview, trustedReviewers: t as string[] };
+  const legacy = f.styleNotes === undefined && f.evalShare === undefined;
+  const share = f.evalShare === null ? Number.NaN : f.evalShare;
+  if (!legacy && (typeof f.styleNotes !== "string" || typeof share !== "number")) return null;
+  return {
+    mode: f.mode,
+    autoReview: f.autoReview,
+    trustedReviewers: t as string[],
+    styleNotes: legacy ? "" : (f.styleNotes as string),
+    evalShare: legacy ? DEFAULT_EVAL_SHARE : (share as number),
+    legacy,
+  };
 }
 
-function thawRepoPending(repo: string, j: unknown): PendingRepo | null | undefined {
+function plain(f: RepoForm & { legacy: boolean }): RepoForm {
+  const { legacy: _, ...rest } = f;
+  return rest;
+}
+
+function thawRepoPending(
+  repo: string,
+  j: unknown,
+  outerFrom?: unknown,
+): PendingRepo | null | undefined {
   if (j === null || j === undefined) return null;
   if (typeof j !== "object") return undefined;
   const p = j as Record<string, unknown>;
@@ -400,12 +471,19 @@ function thawRepoPending(repo: string, j: unknown): PendingRepo | null | undefin
     form === null ||
     typeof picks !== "object" ||
     picks === null ||
-    !Object.values(picks).every((v) => v === "mine" || v === "theirs")
+    !Object.values(picks).every((v) => v === "mine" || v === "theirs") ||
+    (p.fromProposal !== undefined && typeof p.fromProposal !== "string")
   )
     return undefined;
   return {
     from: p.from,
-    source: { repo, version: p.version, base, form },
+    source: {
+      repo,
+      version: p.version,
+      base: plain(base),
+      form: plain(form),
+      ...fromProposalOf(p, outerFrom),
+    },
     picks: picks as RepoPicks,
   };
 }
@@ -417,17 +495,28 @@ export function unstashRepo(repo: string): StashedRepo | null {
     const j = JSON.parse(text) as Record<string, unknown>;
     const base = thawForm(j.base);
     const form = thawForm(j.form);
-    const pending = thawRepoPending(repo, j.pending);
+    const pending = thawRepoPending(repo, j.pending, j.fromProposal);
     if (
       j.repo !== repo ||
       typeof j.version !== "number" ||
       typeof j.savedAt !== "string" ||
       base === null ||
       form === null ||
-      pending === undefined
+      pending === undefined ||
+      base.legacy !== form.legacy ||
+      (j.fromProposal !== undefined && typeof j.fromProposal !== "string")
     )
       return null;
-    return { repo, version: j.version, base, form, savedAt: j.savedAt, pending };
+    return {
+      repo,
+      version: j.version,
+      base: plain(base),
+      form: plain(form),
+      savedAt: j.savedAt,
+      pending,
+      ...(typeof j.fromProposal === "string" ? { fromProposal: j.fromProposal } : {}),
+      ...(base.legacy ? { legacy: true } : {}),
+    };
   } catch {
     return null;
   }
@@ -442,7 +531,13 @@ export function unstashRepo(repo: string): StashedRepo | null {
 export function reopenRepo(
   s: StashedRepo,
 ): { edits: RepoEdits; pending: PendingRepo | null; conflicts: RepoConflict[] } | null {
-  const edits: RepoEdits = { repo: s.repo, version: s.version, base: s.base, form: s.form };
+  const edits: RepoEdits = {
+    repo: s.repo,
+    version: s.version,
+    base: s.base,
+    form: s.form,
+    ...(s.fromProposal === undefined ? {} : { fromProposal: s.fromProposal }),
+  };
   const p = s.pending;
   if (p === null) return { edits, pending: null, conflicts: [] };
   const m = mergeRepoSettings(p.source.base, p.source.form, s.base);

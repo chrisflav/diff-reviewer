@@ -3,7 +3,7 @@ import { useNavigate, useParams } from "react-router-dom";
 import { api, UnauthorizedError } from "../api";
 import { lines, scopeMeans } from "../calibration";
 import { useLoad } from "../useLoad";
-import { CalibrationCrumbs, repoPath } from "./Calibration";
+import { CalibrationCrumbs, repoPath, SplitTag } from "./Calibration";
 
 export function CalibrationSamplePage({ onUnauthorized }: { onUnauthorized: () => void }) {
   const { owner = "", name = "", id = "" } = useParams();
@@ -51,6 +51,21 @@ export function CalibrationSamplePage({ onUnauthorized }: { onUnauthorized: () =
           <dl className="facts">
             <dt>Sample</dt>
             <dd className="data">{s.id}</dd>
+            {s.split !== undefined && (
+              <>
+                <dt>Split</dt>
+                <dd>
+                  <SplitTag split={s.split} />{" "}
+                  <span className="mute small-text">
+                    {s.split === "eval"
+                      ? "held out: what calibration measures by, never learned from"
+                      : s.split === "pool"
+                        ? "what the style examples and rubric proposals learn from; runs of it are never counted"
+                        : "given one the first time it is read for a run"}
+                  </span>
+                </dd>
+              </>
+            )}
             <dt>State</dt>
             <dd className="data">{s.state}</dd>
             <dt>Scope</dt>

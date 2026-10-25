@@ -105,7 +105,11 @@ export function JobsPage({ onUnauthorized }: { onUnauthorized: () => void }) {
         <p className="mute">Loading…</p>
       ) : jobs.length === 0 ? (
         <p className="mute">
-          {kind === "calibration" ? "No calibration jobs yet." : "No reviews yet."}
+          {kind === "calibration"
+            ? "No calibration jobs yet."
+            : kind === "proposal"
+              ? "No proposal jobs yet."
+              : "No reviews yet."}
         </p>
       ) : (
         <div className="table-scroll">
@@ -165,12 +169,13 @@ export function JobsPage({ onUnauthorized }: { onUnauthorized: () => void }) {
 const kinds: { value: JobKind | "all"; label: string }[] = [
   { value: "review", label: "Reviews" },
   { value: "calibration", label: "Calibration jobs (never posted)" },
+  { value: "proposal", label: "Proposal jobs (never posted)" },
   { value: "all", label: "All" },
 ];
 
 /** The kind of jobs `?kind=` asks for: reviews unless it names another. */
 function kindOf(k: string | null): JobKind | "all" {
-  return k === "calibration" || k === "all" ? k : "review";
+  return k === "calibration" || k === "proposal" || k === "all" ? k : "review";
 }
 
 /** How many blockers and majors a review carries, said in words as well as numbers. */

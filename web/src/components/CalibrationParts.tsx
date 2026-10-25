@@ -43,6 +43,10 @@ export function AggregateFigures({ a }: { a: CalibrationAggregate }) {
           (a.staleIncluded
             ? `${a.staleScores} stale ${a.staleScores === 1 ? "score is" : "scores are"} counted.`
             : `${a.staleScores} stale ${a.staleScores === 1 ? "score is" : "scores are"} left out.`)}{" "}
+        {(a.derivedScores ?? 0) > 0 &&
+          (a.derivedIncluded === true
+            ? `${a.derivedScores} derived ${a.derivedScores === 1 ? "score is" : "scores are"} counted.`
+            : `${a.derivedScores} derived ${a.derivedScores === 1 ? "score is" : "scores are"} left out.`)}{" "}
         Matcher version <span className="data">{a.matcherVersion}</span>.
       </p>
     </>
@@ -343,6 +347,18 @@ export function Limits({ open = false }: { open?: boolean }) {
           <strong>Stale scores.</strong> A review imported after a run scored its sample joins the
           sample; the earlier score is kept as it was and marked stale. Aggregates leave stale
           scores out unless asked to include them. A fresh score needs a fresh run.
+        </li>
+        <li>
+          <strong>Derived scores.</strong> A rubric or style notes version made from a rubric
+          proposal records the pull requests the proposal drew on. A score of one of them, made
+          under that version, is derived: what measures the rubric would be what it learned from.
+          Aggregates leave derived scores out unless asked to include them.
+        </li>
+        <li>
+          <strong>Held out.</strong> Each pull request's samples are <code>eval</code> or{" "}
+          <code>pool</code>, once and for good. Runs and aggregates are of <code>eval</code>{" "}
+          samples; the pool is what the style examples and rubric proposals learn from, and a run of
+          it is never counted.
         </li>
         <li>
           <strong>Deleted samples</strong> are left out of every aggregate, and still shown, marked,

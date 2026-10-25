@@ -28,6 +28,7 @@ import {
 import { DiffView, type Selection } from "../components/DiffView";
 import { History } from "../components/History";
 import { parseDiff, type DiffFile } from "../diff";
+import { proposalsPath } from "../proposals";
 import {
   canKeepBoth,
   conflictId,
@@ -120,9 +121,11 @@ function JobView({ id, onUnauthorized }: { id: string; onUnauthorized: () => voi
   // Fetched once the job is known, and again when its head moves; a status move leaves it be.
   const loaded = job !== null;
   const headSha = job?.headSha;
+  // A proposal job is of the repository, not of a pull request: it has no diff.
+  const proposalJob = job?.kind === "proposal";
   const fetchDiff = useCallback(
-    () => (loaded ? api.diff(id) : Promise.resolve(null)),
-    [id, loaded, headSha],
+    () => (loaded && !proposalJob ? api.diff(id) : Promise.resolve(null)),
+    [id, loaded, headSha, proposalJob],
   );
   const { data: diff, error: diffError } = useLoad<JobDiff | null>(fetchDiff, onUnauthorized);
   const files = useMemo<DiffFile[] | null>(
@@ -469,6 +472,8 @@ function JobView({ id, onUnauthorized }: { id: string; onUnauthorized: () => voi
       <p className="crumbs">
         {reviewJob ? (
           <Link to="/">Reviews</Link>
+        ) : job.kind === "proposal" ? (
+          <Link to="/?kind=proposal">Proposal jobs</Link>
         ) : (
           <Link to="/?kind=calibration">Calibration jobs</Link>
         )}
@@ -515,6 +520,20 @@ function JobView({ id, onUnauthorized }: { id: string; onUnauthorized: () => voi
             </Link>
           )}
         </dd>
+        {job.notesVersion !== undefined && (
+          <>
+            <dt>Style notes</dt>
+            <dd>
+              {job.notesVersion === null ? (
+                <span className="mute">not recorded</span>
+              ) : job.notesVersion === 0 ? (
+                <span className="mute">none (the agent was given no style notes)</span>
+              ) : (
+                <span className="data">version {job.notesVersion}</span>
+              )}
+            </dd>
+          </>
+        )}
         <dt>Attempts</dt>
         <dd className="data">{job.attempts}</dd>
         <dt>Queue entry</dt>
@@ -682,8 +701,8 @@ function JobView({ id, onUnauthorized }: { id: string; onUnauthorized: () => voi
         />
       )}
 
-      <h2>Review</h2>
-      {job.reviewError !== null ? (
+      {!proposalJob && <h2>Review</h2>}
+      {proposalJob ? null : job.reviewError !== null ? (
         <p className="error">The stored review cannot be read by this version: {job.reviewError}</p>
       ) : job.review === null && !editable && edits === null ? (
         <p className="mute">No review yet.</p>
@@ -691,9 +710,11 @@ function JobView({ id, onUnauthorized }: { id: string; onUnauthorized: () => voi
         <Summary review={current} editable={editable} modify={modify} />
       )}
 
-      {job.reviewError === null && <CommentList comments={current.comments} onShow={showComment} />}
+      {job.reviewError === null && !proposalJob && (
+        <CommentList comments={current.comments} onShow={showComment} />
+      )}
 
-      {job.reviewError === null && (
+      {job.reviewError === null && !proposalJob && (
         <CategoryContext.Provider value={rules}>
           <DiffSection
             job={job}
@@ -762,6 +783,20 @@ function JobView({ id, onUnauthorized }: { id: string; onUnauthorized: () => voi
 /** What a job that is not a review is: never posted, and for a calibration job, what it is of. */
 function CalibrationNotice({ job }: { job: Job }) {
   const base = `/repos/${encodeURIComponent(job.owner)}/${encodeURIComponent(job.name)}/calibration`;
+  if (job.kind === "proposal")
+    return (
+      <div className="notice calibration-notice">
+        <p>
+          <strong>A rubric proposal job: never posted.</strong> An agent reads the repository's
+          calibration data and the people's edits of its drafts, and proposes a rubric for a person
+          to accept or reject. It is of the repository, not of a pull request.
+        </p>
+        <p>
+          <Link to={proposalsPath(job.owner, job.name)}>The repository's rubric proposals</Link>
+          {["pending", "queued", "running"].includes(job.status) && " · It can be cancelled there."}
+        </p>
+      </div>
+    );
   if (job.kind !== "calibration")
     return (
       <p className="notice warn-notice">

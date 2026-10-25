@@ -150,6 +150,12 @@ export function ReposPage({ onUnauthorized }: { onUnauthorized: () => void }) {
                       >
                         Calibration
                       </Link>
+                      <Link
+                        to={`${repoPath(r.owner, r.name)}/proposals`}
+                        aria-label={`Rubric proposals of ${r.owner}/${r.name}`}
+                      >
+                        Proposals
+                      </Link>
                     </span>
                   </td>
                   <td className="data mute">{r.createdAt}</td>

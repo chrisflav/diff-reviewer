@@ -1556,3 +1556,156 @@ svg.chart .hit {
     grid-template-columns: minmax(0, 1fr);
   }
 }
+
+/* M4: style notes, held-out splits, derived scores, rubric proposals. */
+
+.tag.flag-derived {
+  color: var(--info);
+  border-color: currentColor;
+  border-style: dashed;
+  margin-left: 4px;
+}
+
+.tag.split-eval {
+  color: var(--accent);
+  border-color: currentColor;
+}
+
+.tag.split-pool {
+  color: var(--warn);
+  border-color: currentColor;
+  margin-left: 4px;
+}
+
+fieldset.split-pick {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  margin: 12px 0 8px;
+}
+
+fieldset.split-pick legend {
+  padding: 0 4px;
+  color: var(--mute);
+  font-size: 0.9em;
+}
+
+textarea.notes {
+  width: 100%;
+  margin-top: 4px;
+}
+
+.adopt-notice {
+  border-left: 3px solid var(--info);
+}
+
+.adopt-notice h2 {
+  margin: 0 0 8px;
+  font-size: 1.1em;
+}
+
+.p-pending {
+  color: var(--warn);
+}
+
+.p-accepted {
+  color: var(--accent);
+}
+
+.p-rejected {
+  color: var(--danger);
+}
+
+.rationale {
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  background: var(--raised);
+  padding: 4px 14px;
+  overflow-wrap: anywhere;
+}
+
+.rationale pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  background: var(--page);
+  border: 1px solid var(--rule);
+  border-radius: 4px;
+  padding: 6px 8px;
+}
+
+.rationale blockquote {
+  margin: 8px 0;
+  padding-left: 12px;
+  border-left: 3px solid var(--rule);
+  color: var(--mute);
+}
+
+.rationale h4,
+.rationale h5,
+.rationale h6 {
+  margin: 12px 0 4px;
+}
+
+.inert-link {
+  text-decoration: underline dotted;
+  text-underline-offset: 2px;
+}
+
+/* The address beside a link's text: right-to-left in it is kept from reordering what is around. */
+.inert-link .data {
+  unicode-bidi: isolate;
+}
+
+ul.chips {
+  list-style: none;
+  padding: 0;
+  margin: 4px 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+ul.chips li {
+  border: 1px solid var(--rule);
+  border-radius: 999px;
+  padding: 1px 10px;
+  background: var(--raised);
+  font-size: 0.9em;
+  overflow-wrap: anywhere;
+}
+
+ul.chips.removed li {
+  text-decoration: line-through;
+  text-decoration-color: var(--mute);
+  border-style: dashed;
+}
+
+.proposal-diff .change h5 {
+  margin: 10px 0 2px;
+  font-size: 0.95em;
+}
+
+.shown-type.diff-added {
+  border-left: 3px solid var(--accent);
+  padding-left: 10px;
+}
+
+.shown-type.diff-changed {
+  border-left: 3px solid var(--warn);
+  padding-left: 10px;
+}
+
+section.decide {
+  border-top: 1px solid var(--rule);
+  margin-top: 20px;
+}
+
+section.provenance h5 {
+  margin: 8px 0 2px;
+}
+
+ul.failed-jobs {
+  padding-left: 20px;
+}

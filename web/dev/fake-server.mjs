@@ -29,6 +29,15 @@
  *
  *     curl -X POST 127.0.0.1:8091/__fake/repo-bump       # someone else changes the settings
  *     curl -X POST '127.0.0.1:8091/__fake/calibration-cap?charged=20' # the daily cap is reached
+ *
+ * API 0.6.0: the settings carry style notes (versioned) and the share held out; every sample is
+ * `eval` or `pool`; rubric version 2 was made from an accepted proposal, so the scores of its pull
+ * requests under it are derived. Rubric proposals: one accepted, one rejected and one pending,
+ * written from version 1 (so accepting it is a 409, and it is rebased in the editor). Asking for
+ * another is a 409 while it is pending; past two a day, a 429. A job asked for is written by:
+ *
+ *     curl -X POST 127.0.0.1:8091/__fake/proposal-write  # the live job submits, at the current version
+ *     curl -X POST 127.0.0.1:8091/__fake/notes-bump      # someone else changes the style notes
  */
 
 import { createServer } from "node:http";
@@ -193,6 +202,7 @@ for (const [id, status, prNumber, r] of [
     error: status === "failed" ? "the run ended without a submission" : null,
     prType: status === "failed" ? null : "feature",
     rubricVersion: status === "failed" ? null : status === "posted" ? 1 : 2,
+    notesVersion: status === "failed" ? null : 1,
     directPosts: 0,
     postDirect: false,
     attempts: status === "failed" ? 2 : 1,
@@ -277,6 +287,9 @@ const rubrics = new Map([
           ],
           reviewers: ["kim"],
         },
+        // Made from proposal p-accepted: what its context drew on.
+        derivedFrom: ["s-04", "s-05"],
+        derivedFromPulls: ["chrisflav/diff-reviewer#104", "chrisflav/diff-reviewer#105"],
       },
     ],
   ],
@@ -309,7 +322,38 @@ function rubricVersion(owner, name, i) {
       prTypes: null,
       documentError: v.documentError,
     };
-  return { ...v.doc, owner, name, version: i + 1, createdAt: v.createdAt, documentError: null };
+  return {
+    ...v.doc,
+    owner,
+    name,
+    version: i + 1,
+    createdAt: v.createdAt,
+    documentError: null,
+    derivedFrom: v.derivedFrom ?? [],
+    derivedFromPulls: v.derivedFromPulls ?? [],
+  };
+}
+
+/** What version `n` (1-based) of a repository's rubric was derived from; nothing for 0. */
+function derivedOf(owner, name, n) {
+  const v = (rubrics.get(`${owner}/${name}`) ?? [])[n - 1];
+  return { samples: v?.derivedFrom ?? [], prs: v?.derivedFromPulls ?? [] };
+}
+
+const union = (a, b) => [...new Set([...a, ...b])];
+
+/** Push a rubric version over the last, keeping every earlier version's provenance and `more`. */
+function pushRubric(owner, name, doc, more = { samples: [], prs: [] }) {
+  const vs = rubrics.get(`${owner}/${name}`) ?? [];
+  const last = derivedOf(owner, name, vs.length);
+  vs.push({
+    createdAt: now(),
+    doc,
+    derivedFrom: union(last.samples, more.samples),
+    derivedFromPulls: union(last.prs, more.prs),
+  });
+  rubrics.set(`${owner}/${name}`, vs);
+  return currentRubric(owner, name);
 }
 
 function currentRubric(owner, name) {
@@ -365,6 +409,9 @@ const repos = new Map([
       mode: "staged",
       autoReview: false,
       trustedReviewers: ["alice", "bob"],
+      styleNotes: "One sentence a comment.\nNo praise.",
+      evalShare: 50,
+      styleNotesVersion: 1,
       version: 3,
       createdAt: now(),
     },
@@ -377,11 +424,17 @@ const repos = new Map([
       mode: "staged",
       autoReview: false,
       trustedReviewers: [],
+      styleNotes: "",
+      evalShare: 50,
+      styleNotesVersion: 0,
       version: 1,
       createdAt: now(),
     },
   ],
 ]);
+
+/** The provenance of each repository's latest style notes version, as `NotesRow` keeps it. */
+const notesDerived = new Map([["chrisflav/diff-reviewer", { samples: [], prs: [] }]]);
 
 /** `validLogin` in Lean. */
 const validLogin = (s) =>
@@ -410,6 +463,22 @@ function putRepo(owner, name, body) {
       return [400, { error: `'trustedReviewers' names ${t.length} logins; at most 50` }];
     trusted = [...new Set(t.map((l) => l.toLowerCase()))];
   }
+  let styleNotes = old?.styleNotes ?? "";
+  if (body.styleNotes !== undefined && body.styleNotes !== null) {
+    if (typeof body.styleNotes !== "string")
+      return [400, { error: "'styleNotes' must be a string" }];
+    if (Buffer.byteLength(body.styleNotes, "utf8") > 16384)
+      return [400, { error: "'styleNotes' is longer than 16384 bytes" }];
+    styleNotes = body.styleNotes;
+  }
+  let evalShare = old?.evalShare ?? 50;
+  if (body.evalShare !== undefined && body.evalShare !== null) {
+    if (!Number.isInteger(body.evalShare))
+      return [400, { error: "'evalShare' must be a whole number of percent" }];
+    if (body.evalShare < 0 || body.evalShare > 100)
+      return [400, { error: "'evalShare' must be between 0 and 100" }];
+    evalShare = body.evalShare;
+  }
   if (body.version !== undefined && body.version !== null && body.version !== current)
     return [
       409,
@@ -417,17 +486,42 @@ function putRepo(owner, name, body) {
         error: `the settings of ${key} have changed since they were read (version ${body.version}, now ${current}); reload them`,
       },
     ];
+  let provenance = { samples: [], prs: [] };
+  if (body.fromProposal !== undefined && body.fromProposal !== null) {
+    const r = adoptProposal(key, body.fromProposal, null);
+    if (r.error !== undefined) return [r.status, { error: r.error }];
+    provenance = r.context;
+  }
   const repo = {
     owner: owner.toLowerCase(),
     name: name.toLowerCase(),
     mode: body.mode ?? "staged",
     autoReview: body.autoReview ?? false,
     trustedReviewers: trusted,
+    styleNotes,
+    evalShare,
+    styleNotesVersion: old?.styleNotesVersion ?? 0,
     version: current + 1,
     createdAt: old?.createdAt ?? now(),
   };
+  writeNotes(repo, old?.styleNotes ?? "", provenance);
   repos.set(key, repo);
   return [old === undefined ? 201 : 200, repo];
+}
+
+/** `writeNotesIn`: a new notes version when the notes, or what they are derived from, change. */
+function writeNotes(repo, before, more) {
+  const key = `${repo.owner}/${repo.name}`;
+  const last = notesDerived.get(key) ?? { samples: [], prs: [] };
+  const prov = { samples: union(last.samples, more.samples), prs: union(last.prs, more.prs) };
+  const same =
+    repo.styleNotes === before &&
+    prov.samples.length === last.samples.length &&
+    prov.prs.length === last.prs.length;
+  if (same || (repo.styleNotesVersion === 0 && repo.styleNotes === "" && more.prs.length === 0))
+    return;
+  repo.styleNotesVersion += 1;
+  notesDerived.set(key, prov);
 }
 
 // Calibration: samples, imports, runs and their calibration jobs, of chrisflav/diff-reviewer.
@@ -480,7 +574,19 @@ for (let i = 0; i < 32; i++) {
     deletedAt: null,
     // A review joined it after its first score: that score is stale.
     joinedAt: i === 1 ? now() : null,
+    split: splitOf("chrisflav", "diff-reviewer", 100 + i),
   });
+}
+
+/** `eval` or `pool`, by FNV-1a of `owner/name#pr` against the repository's `evalShare`. */
+function splitOf(owner, name, pr) {
+  let h = 0x811c9dc5;
+  for (const ch of Buffer.from(`${owner}/${name}#${pr}`, "utf8")) {
+    h ^= ch;
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  const share = repos.get(`${owner}/${name}`)?.evalShare ?? 50;
+  return h % 100 < share ? "eval" : "pool";
 }
 calib.imports.push({
   id: "imp-1",
@@ -593,15 +699,23 @@ function scoreOf(s, draft) {
   };
 }
 
-/** `aggregateOf` in Lean: counts first, ratios last, deleted samples and (unless asked) stale left out. */
-function aggregate(results, includeStale) {
+/**
+ * `aggregateOf` in Lean: counts first, ratios last; deleted samples and the pool left out, and
+ * (unless asked) stale and derived scores.
+ */
+function aggregate(results, includeStale, includeDerived = false) {
   const ratio = (a, b) => (b === 0 ? null : Math.round((a / b) * 10000) / 10000);
-  const live = results.filter(
-    (r) =>
-      r.score !== null && !("unscorable" in r.score) && sampleById(r.sampleId)?.deletedAt === null,
-  );
+  const live = results.filter((r) => {
+    const s = sampleById(r.sampleId);
+    return (
+      r.score !== null && !("unscorable" in r.score) && s?.deletedAt === null && s?.split === "eval"
+    );
+  });
   const staleScores = live.filter((r) => r.scoreStale).length;
-  const rows = live.filter((r) => includeStale || !r.scoreStale);
+  const derivedScores = live.filter((r) => isDerived(r)).length;
+  const rows = live.filter(
+    (r) => (includeStale || !r.scoreStale) && (includeDerived || !isDerived(r)),
+  );
   const full = rows.filter((r) => r.score.scope === "full");
   const sum = (f) => full.reduce((n, r) => n + r.score[f], 0);
   const merge = (field) => {
@@ -645,7 +759,18 @@ function aggregate(results, includeStale) {
     },
     staleScores,
     staleIncluded: includeStale,
+    derivedScores,
+    derivedIncluded: includeDerived,
   };
+}
+
+/** Whether a result's sample's pull request is one its job's rubric version learned from. */
+function isDerived(r) {
+  const job = jobs.get(r.jobId);
+  const s = sampleById(r.sampleId);
+  if (job === undefined || s === undefined || job.rubricVersion === null) return false;
+  const key = `${s.owner}/${s.name}#${s.prNumber}`;
+  return derivedOf(s.owner, s.name, job.rubricVersion).prs.includes(key);
 }
 
 const sampleById = (id) => calib.samples.find((s) => s.id === id);
@@ -681,6 +806,7 @@ function calibrationJob(run, s, status, createdAt) {
     error: status === "failed" ? "the run ended without a submission" : null,
     prType: draft === null ? null : "feature",
     rubricVersion: draft === null ? null : run.rubricVersion,
+    notesVersion: draft === null ? null : 1,
     directPosts: 0,
     postDirect: false,
     attempts: 1,
@@ -740,7 +866,7 @@ makeRun("run-4", ids(4, 4), 1, 2, (k) => (k === 0 ? "running" : k === 1 ? "faile
 // A deleted sample: still shown, marked, in its runs, and left out of the aggregates.
 calib.samples[5].deletedAt = now();
 
-function runJson(run, detail, includeStale) {
+function runJson(run, detail, includeStale, includeDerived = false) {
   const counts = {};
   for (const r of run.results) {
     const st = jobs.get(r.jobId)?.status ?? "pending";
@@ -753,7 +879,7 @@ function runJson(run, detail, includeStale) {
     createdAt: run.createdAt,
     samples: run.results.length,
     jobs: counts,
-    aggregate: aggregate(run.results, includeStale),
+    aggregate: aggregate(run.results, includeStale, includeDerived),
   };
   if (detail)
     out.results = run.results.map((r) => {
@@ -778,9 +904,11 @@ function runJson(run, detail, includeStale) {
                 comments: s.comments.length,
                 deleted: s.deletedAt !== null,
                 scope: s.scope,
+                split: s.split,
               },
         score: r.score,
         scoreStale: r.scoreStale,
+        scoreDerived: r.score !== null && isDerived(r),
       };
     });
   return out;
@@ -817,6 +945,7 @@ function calibrationRoute(req, res, url, parts, body) {
   if (repo === undefined) return send(res, 404, { error: `${owner}/${name} is not registered` });
   const mine = (x) => x.owner === owner && x.name === name;
   const includeStale = url.searchParams.get("stale") === "include";
+  const includeDerived = url.searchParams.get("derived") === "include";
   const what = parts[6];
   const id = parts[7];
   if (what === "import") {
@@ -883,27 +1012,33 @@ function calibrationRoute(req, res, url, parts, body) {
         res,
         200,
         page(
-          runs.map((r) => runJson(r, false, includeStale)),
+          runs.map((r) => runJson(r, false, includeStale, includeDerived)),
           url,
         ),
       );
     if (req.method === "GET") {
       const r = runs.find((x) => x.id === id);
       if (r === undefined) return send(res, 404, { error: "not found" });
-      return send(res, 200, runJson(r, true, includeStale));
+      return send(res, 200, runJson(r, true, includeStale, includeDerived));
     }
     if (req.method === "POST") {
       const busy = (sid) =>
         [...jobs.values()].some(
           (j) => j.sampleId === sid && ["pending", "queued", "running"].includes(j.status),
         );
-      const live = calib.samples.filter((s) => mine(s) && s.deletedAt === null);
+      const split = body.split ?? "eval";
+      if (split !== "eval" && split !== "pool")
+        return send(res, 400, { error: "'split' must be eval or pool" });
+      const live = calib.samples.filter(
+        (s) => mine(s) && s.deletedAt === null && s.split === split,
+      );
       let chosen;
       if (Array.isArray(body.samples)) {
         if (body.samples.length < 1 || body.samples.length > 20)
           return send(res, 400, { error: "'samples' names 1 to 20 samples" });
         for (const sid of body.samples) {
-          if (!live.some((s) => s.id === sid)) return send(res, 404, { error: `no sample ${sid}` });
+          if (!live.some((s) => s.id === sid))
+            return send(res, 400, { error: `sample ${sid} is not a live ${split} sample` });
           if (busy(sid))
             return send(res, 409, {
               error: `sample ${sid} is being reviewed by a live calibration job`,
@@ -918,13 +1053,23 @@ function calibrationRoute(req, res, url, parts, body) {
           .slice(0, body.count)
           .map((s) => s.id);
       } else return send(res, 400, { error: "name 'samples' or a 'count'" });
+      if (chosen.length === 0)
+        return send(res, 400, {
+          error: `${owner}/${name} has no ${split} samples to review; import some first`,
+        });
       if (calib.charged + chosen.length > calib.cap)
         return send(res, 429, {
           error: `${owner}/${name} has had ${calib.charged} calibration jobs today; ${chosen.length} more would pass the cap of ${calib.cap} (--max-calibration-jobs-per-day)`,
         });
       calib.charged += chosen.length;
-      const run = makeRun(`run-${calib.runs.length + 1}`, chosen, 0, 2, "pending");
-      return send(res, 201, runJson(run, false, false));
+      const run = makeRun(
+        `run-${calib.runs.length + 1}`,
+        chosen,
+        0,
+        (rubrics.get(`${owner}/${name}`) ?? []).length,
+        "pending",
+      );
+      return send(res, 201, runJson(run, true, false));
     }
   }
   if (what === "summary" && req.method === "GET") {
@@ -933,20 +1078,361 @@ function calibrationRoute(req, res, url, parts, body) {
     return send(res, 200, {
       owner,
       name,
+      split: "eval",
       runs: calib.runs.filter(mine).length,
       samples: calib.samples.filter((s) => mine(s) && s.deletedAt === null).length,
-      overall: aggregate(all, includeStale),
+      overall: aggregate(all, includeStale, includeDerived),
       byRubricVersion: versions.map((v) => ({
         rubricVersion: v,
         aggregate: aggregate(
           all.filter((x) => x.run.rubricVersion === v),
           includeStale,
+          includeDerived,
         ),
       })),
     });
   }
   return send(res, 404, { error: "no such route" });
 }
+// Rubric proposals, of chrisflav/diff-reviewer: one accepted (rubric version 2), one rejected,
+// and one pending, written from version 1, which the rubric has moved on from.
+const proposals = [];
+/** `--max-proposals-per-day`. */
+const proposalCap = 2;
+
+function proposalJob(id, status, createdAt, error = null) {
+  const job = {
+    id,
+    owner: "chrisflav",
+    name: "diff-reviewer",
+    prNumber: 0,
+    headSha: null,
+    status,
+    queueEntry: null,
+    review: null,
+    reviewError: null,
+    version: 1,
+    createdAt,
+    updatedAt: createdAt,
+    baseSha: null,
+    title: null,
+    prBody: null,
+    error,
+    prType: null,
+    rubricVersion: status === "draft" ? 1 : null,
+    notesVersion: status === "draft" ? 1 : null,
+    directPosts: 0,
+    postDirect: false,
+    attempts: 1,
+    postStartedAt: null,
+    postedUrl: null,
+    postNote: null,
+    postedReview: null,
+    kind: "proposal",
+    sampleId: null,
+    runId: null,
+  };
+  jobs.set(id, job);
+  revisions.set(id, []);
+  return job;
+}
+
+const hostileRationale = `## What changed
+
+The agent **missed** missing docstrings on new definitions in 6 of 9 runs, and people asked for
+them every time (#104, #105). So the \`feature\` rubric now asks for one, and a \`docs\` category
+files those comments.
+
+- Default rubric: also forbid \`admit\`.
+- \`naming\`: tightened to the naming convention.
+
+> One reviewer wrote "<script>alert('a quote is text')</script>" — noted, not followed.
+
+A comment said to [click here](javascript:alert(1)) and <img src=x onerror=alert(2)>: both are
+shown as text.
+
+\`\`\`
+<b>code is text too</b>
+\`\`\``;
+
+function addProposal(p) {
+  proposals.unshift({
+    owner: "chrisflav",
+    name: "diff-reviewer",
+    decidedAt: null,
+    acceptedVersion: null,
+    context: {
+      samples: ["s-04", "s-05"],
+      prs: ["chrisflav/diff-reviewer#104", "chrisflav/diff-reviewer#105"],
+    },
+    ...p,
+  });
+}
+{
+  const v1 = rubrics.get("chrisflav/diff-reviewer")[0].doc;
+  const v2 = rubrics.get("chrisflav/diff-reviewer")[1].doc;
+  proposalJob("pj-1", "draft", new Date(Date.now() - 5 * day).toISOString());
+  addProposal({
+    id: "p-accepted",
+    jobId: "pj-1",
+    baseVersion: 1,
+    document: (() => {
+      const d = structuredClone(v2);
+      delete d.reviewers;
+      return d;
+    })(),
+    styleNotes: null,
+    baseStyleNotes: "One sentence a comment.\nNo praise.",
+    rationale: "Docs keep being asked for: add a `docs` category.",
+    status: "accepted",
+    createdAt: new Date(Date.now() - 5 * day).toISOString(),
+    decidedAt: new Date(Date.now() - 4 * day).toISOString(),
+    acceptedVersion: 2,
+  });
+  proposalJob("pj-2", "draft", new Date(Date.now() - 3 * day).toISOString());
+  addProposal({
+    id: "p-rejected",
+    jobId: "pj-2",
+    baseVersion: 2,
+    document: { ...structuredClone(v2), prTypes: [] },
+    styleNotes: null,
+    baseStyleNotes: "One sentence a comment.\nNo praise.",
+    rationale: "Drop every type; one rubric is enough.",
+    status: "rejected",
+    createdAt: new Date(Date.now() - 3 * day).toISOString(),
+    decidedAt: new Date(Date.now() - 3 * day).toISOString(),
+  });
+  proposalJob(
+    "pj-3",
+    "failed",
+    new Date(Date.now() - 2 * day).toISOString(),
+    "cancelled by a person",
+  );
+  proposalJob("pj-4", "draft", new Date(Date.now() - 2 * 3600000).toISOString());
+  addProposal({
+    id: "p-pending",
+    jobId: "pj-4",
+    baseVersion: 1,
+    document: {
+      defaultRubric: "Proofs must not use `sorry`.\nNor `admit`.",
+      prTypes: [
+        {
+          ...structuredClone(v1.prTypes[0]),
+          rubric:
+            "Check the names against the naming convention, and that every new definition has a docstring.\n\nA new definition without a docstring is a `docs` comment.",
+          categories: [
+            ...structuredClone(v1.prTypes[0].categories).map((c) =>
+              c.name === "naming"
+                ? { ...c, description: "Against the naming convention, or a misleading name." }
+                : c,
+            ),
+            { name: "docs", description: "Missing documentation." },
+          ],
+        },
+        {
+          name: "chore",
+          description: "CI, build files and tooling only.",
+          rubric: "Check that nothing proved changes. <img src=x onerror=alert(3)>",
+          categories: [],
+        },
+      ],
+    },
+    styleNotes: "One sentence a comment.\nNo praise.\nSuggest a fix, do not ask a question.",
+    baseStyleNotes: "One sentence a comment.\nNo praise.",
+    rationale: hostileRationale,
+    status: "pending",
+    createdAt: new Date(Date.now() - 2 * 3600000).toISOString(),
+  });
+}
+
+const textChange = (b, a) => (b === a ? null : { before: b, after: a });
+
+/** `Proposal.diffJson` in Lean. */
+function proposalDiff(before, after, notes) {
+  const find = (d, n) => d.prTypes.find((t) => t.name === n);
+  const typesChanged = after.prTypes.flatMap((a) => {
+    const b = find(before, a.name);
+    if (b === undefined) return [];
+    const bc = b.categories ?? [];
+    const ac = a.categories ?? [];
+    const added = ac.filter((c) => !bc.some((x) => x.name === c.name));
+    const removed = bc.filter((c) => !ac.some((x) => x.name === c.name));
+    const changed = ac.flatMap((c) => {
+      const o = bc.find((x) => x.name === c.name);
+      return o === undefined || o.description === c.description
+        ? []
+        : [{ name: c.name, before: o.description, after: c.description }];
+    });
+    if (
+      b.description === a.description &&
+      b.rubric === a.rubric &&
+      added.length + removed.length + changed.length === 0
+    )
+      return [];
+    return [
+      {
+        name: a.name,
+        description: textChange(b.description, a.description),
+        rubric: textChange(b.rubric, a.rubric),
+        categoriesAdded: added,
+        categoriesRemoved: removed.map((c) => c.name),
+        categoriesChanged: changed,
+      },
+    ];
+  });
+  return {
+    defaultRubric: textChange(before.defaultRubric, after.defaultRubric),
+    typesAdded: after.prTypes.filter((t) => find(before, t.name) === undefined),
+    typesRemoved: before.prTypes
+      .filter((t) => find(after, t.name) === undefined)
+      .map((t) => t.name),
+    typesChanged,
+    styleNotes: notes === null ? null : textChange(notes[0], notes[1]),
+  };
+}
+
+function proposalJson(p, detail) {
+  const current = (rubrics.get(`${p.owner}/${p.name}`) ?? []).length;
+  const out = {
+    id: p.id,
+    owner: p.owner,
+    name: p.name,
+    jobId: p.jobId,
+    status: p.status,
+    baseVersion: p.baseVersion,
+    currentVersion: current,
+    rebaseNeeded: p.status === "pending" && current !== p.baseVersion,
+    rationale: p.rationale,
+    proposesStyleNotes: p.styleNotes !== null,
+    createdAt: p.createdAt,
+    decidedAt: p.decidedAt,
+    acceptedVersion: p.acceptedVersion,
+  };
+  if (!detail) return out;
+  const base =
+    p.baseVersion === 0
+      ? { defaultRubric: "", prTypes: [] }
+      : rubrics.get(`${p.owner}/${p.name}`)[p.baseVersion - 1].doc;
+  return {
+    ...out,
+    document: p.document,
+    documentError: null,
+    styleNotes: p.styleNotes,
+    baseStyleNotes: p.baseStyleNotes,
+    diff: proposalDiff(
+      base,
+      p.document,
+      p.styleNotes === null ? null : [p.baseStyleNotes ?? "", p.styleNotes],
+    ),
+    diffError: null,
+  };
+}
+
+/** `Proposal.adoptIn`: a rubric or settings write naming proposal `id`; marks it accepted. */
+function adoptProposal(key, id, rubricVersion) {
+  const p = proposals.find((x) => `${x.owner}/${x.name}` === key && x.id === id);
+  if (p === undefined)
+    return { status: 400, error: `'fromProposal': ${id} is not a proposal of ${key}` };
+  if (p.status === "rejected")
+    return { status: 409, error: `'fromProposal': proposal ${id} was rejected` };
+  p.status = "accepted";
+  p.decidedAt ??= now();
+  p.acceptedVersion ??= rubricVersion;
+  return { context: p.context };
+}
+
+function proposalsRoute(req, res, url, parts, body) {
+  const [owner, name] = [parts[3].toLowerCase(), parts[4].toLowerCase()];
+  const key = `${owner}/${name}`;
+  const repo = repos.get(key);
+  if (repo === undefined) return send(res, 404, { error: `${key} is not registered` });
+  const mine = proposals.filter((p) => `${p.owner}/${p.name}` === key);
+  const pjobs = [...jobs.values()].filter(
+    (j) => j.kind === "proposal" && `${j.owner}/${j.name}` === key,
+  );
+  if (parts.length === 6 && req.method === "GET")
+    return send(
+      res,
+      200,
+      page(
+        mine.map((p) => proposalJson(p, false)),
+        url,
+      ),
+    );
+  if (parts.length === 6 && req.method === "POST") {
+    const live = pjobs.find((j) => ["pending", "queued", "running"].includes(j.status));
+    if (live !== undefined)
+      return send(res, 409, {
+        error: `${key} has a proposal being written already, by job ${live.id}`,
+      });
+    const waiting = mine.find((p) => p.status === "pending");
+    if (waiting !== undefined)
+      return send(res, 409, {
+        error: `${key} has a proposal waiting for a decision, ${waiting.id}; accept or reject it first`,
+      });
+    const made = pjobs.filter((j) => Date.now() - Date.parse(j.createdAt) < day).length;
+    if (made + 1 > proposalCap)
+      return send(res, 429, {
+        error: `${key} has had ${made} rubric proposal(s) in the last 24 hours, the most allowed (${proposalCap}, --max-proposals-per-day)`,
+      });
+    return send(res, 201, proposalJob(`pj-${randomBytes(3).toString("hex")}`, "queued", now()));
+  }
+  if (parts[6] === "jobs" && parts[8] === "cancel" && req.method === "POST") {
+    const job = pjobs.find((j) => j.id === parts[7]);
+    if (job === undefined) return send(res, 404, { error: "not found" });
+    if (!["pending", "queued", "running"].includes(job.status))
+      return send(res, 409, { error: `job ${job.id} is ${job.status}, not live` });
+    return send(res, 200, bump(job, { status: "failed", error: "cancelled by a person" }));
+  }
+  const p = mine.find((x) => x.id === parts[6]);
+  if (p === undefined) return send(res, 404, { error: "not found" });
+  if (parts.length === 7 && req.method === "GET") return send(res, 200, proposalJson(p, true));
+  if (parts[7] === "reject" && req.method === "POST") {
+    if (p.status !== "pending")
+      return send(res, 409, { error: `proposal ${p.id} is ${p.status} already` });
+    Object.assign(p, { status: "rejected", decidedAt: now() });
+    return send(res, 200, proposalJson(p, false));
+  }
+  if (parts[7] === "accept" && req.method === "POST") {
+    if (!Number.isInteger(body.version) || body.version < 0)
+      return send(res, 400, { error: "the body must name the rubric 'version' read" });
+    if (p.status !== "pending")
+      return send(res, 409, { error: `proposal ${p.id} is ${p.status} already` });
+    const current = (rubrics.get(key) ?? []).length;
+    if (current !== p.baseVersion)
+      return send(res, 409, {
+        error: `the rubric of ${key} is at version ${current}, and proposal ${p.id} was written from version ${p.baseVersion}; rebase it on the current rubric in the editor and save that with "fromProposal": "${p.id}"`,
+        baseVersion: p.baseVersion,
+        currentVersion: current,
+      });
+    if (body.version !== current)
+      return send(res, 409, {
+        error: `the rubric of ${key} has changed since it was read (version ${body.version}, now ${current}); reload it, or rebase the proposal in the editor and save that with "fromProposal": "${p.id}"`,
+        baseVersion: p.baseVersion,
+        currentVersion: current,
+      });
+    if (body.applyStyleNotes === true) {
+      if (p.styleNotes === null)
+        return send(res, 409, {
+          error: `proposal ${p.id} proposes no style notes; accept it without 'applyStyleNotes'`,
+        });
+      if (p.baseStyleNotes !== repo.styleNotes)
+        return send(res, 409, {
+          error: `the style notes of ${key} have changed since the agent of proposal ${p.id} read them; accept it without 'applyStyleNotes', and copy what you want of its notes into the settings`,
+        });
+    }
+    const written = pushRubric(owner, name, structuredClone(p.document), p.context);
+    if (body.applyStyleNotes === true) {
+      const before = repo.styleNotes;
+      repo.styleNotes = p.styleNotes;
+      writeNotes(repo, before, p.context);
+    }
+    Object.assign(p, { status: "accepted", decidedAt: now(), acceptedVersion: written.version });
+    return send(res, 200, { proposal: proposalJson(p, false), rubric: written });
+  }
+  return send(res, 404, { error: "no such route" });
+}
+
 // What the next post does: "ok", "refuse" (GitHub says no: 502 with the job) or "hang" (the post
 // may have reached GitHub: the claim stays, and the answer is a 502).
 let postOutcome = "ok";
@@ -1022,7 +1508,7 @@ createServer(async (req, res) => {
     last.defaultRubric += "\nSomeone else's line.";
     const feature = last.prTypes.find((t) => t.name === "feature");
     if (feature !== undefined) feature.description += " (Someone else's words.)";
-    vs.push({ createdAt: now(), doc: last });
+    pushRubric("chrisflav", "diff-reviewer", last);
     return send(res, 200, {});
   }
   if (url.pathname === "/__fake/repo-bump") {
@@ -1034,6 +1520,41 @@ createServer(async (req, res) => {
       version: r.version + 1,
     });
     return send(res, 200, r);
+  }
+  if (url.pathname === "/__fake/notes-bump") {
+    // Someone else changes the style notes: the pending proposal's notes no longer apply.
+    const r = repos.get("chrisflav/diff-reviewer");
+    const before = r.styleNotes;
+    r.styleNotes += "\nSomeone else's line.";
+    r.version += 1;
+    writeNotes(r, before, { samples: [], prs: [] });
+    return send(res, 200, r);
+  }
+  if (url.pathname === "/__fake/proposal-write") {
+    // The live proposal job of chrisflav/diff-reviewer submits, at the current rubric version.
+    const job = [...jobs.values()].find(
+      (j) => j.kind === "proposal" && ["pending", "queued", "running"].includes(j.status),
+    );
+    if (job === undefined) return send(res, 409, { error: "no proposal job is live" });
+    const vs = rubrics.get("chrisflav/diff-reviewer");
+    const doc = structuredClone(vs[vs.length - 1].doc);
+    delete doc.reviewers;
+    doc.defaultRubric += "\nNo `admit` either.";
+    const repo = repos.get("chrisflav/diff-reviewer");
+    addProposal({
+      id: `p-${randomBytes(3).toString("hex")}`,
+      jobId: job.id,
+      baseVersion: vs.length,
+      document: doc,
+      styleNotes: `${repo.styleNotes}\nSuggest, don't ask.`,
+      baseStyleNotes: repo.styleNotes,
+      rationale: "People asked for `admit` to go too, in #106 and #107.",
+      status: "pending",
+      createdAt: now(),
+      context: { samples: ["s-06"], prs: ["chrisflav/diff-reviewer#106"] },
+    });
+    bump(job, { status: "draft", rubricVersion: vs.length, notesVersion: repo.styleNotesVersion });
+    return send(res, 200, proposalJson(proposals[0], false));
   }
   if (url.pathname === "/__fake/calibration-cap") {
     calib.charged = Number(url.searchParams.get("charged") ?? calib.cap);
@@ -1056,6 +1577,12 @@ createServer(async (req, res) => {
   if (!signedIn) return send(res, 401, { error: "unauthorized" });
   if (req.method !== "GET" && delay > 0) await new Promise((r) => setTimeout(r, delay));
   if (url.pathname === "/api/v1/repos") return send(res, 200, { items: [...repos.values()] });
+  if (parts[2] === "repos" && parts.length === 5 && req.method === "GET") {
+    const r = repos.get(`${parts[3]}/${parts[4]}`.toLowerCase());
+    return r === undefined ? send(res, 404, { error: "not found" }) : send(res, 200, r);
+  }
+  if (parts[2] === "repos" && parts[5] === "proposals")
+    return proposalsRoute(req, res, url, parts, body);
   if (parts[2] === "repos" && parts[5] === "rubrics") {
     const [owner, name] = [parts[3].toLowerCase(), parts[4].toLowerCase()];
     if (!repos.has(`${owner}/${name}`))
@@ -1083,11 +1610,18 @@ createServer(async (req, res) => {
         categories: [],
         ...t,
       }));
+      delete doc.fromProposal;
+      delete doc.derivedFrom;
+      delete doc.derivedFromPulls;
       const why = rubricProblem(doc);
       if (why !== null) return send(res, 400, { error: why });
-      vs.push({ createdAt: now(), doc });
-      rubrics.set(`${owner}/${name}`, vs);
-      return send(res, 200, currentRubric(owner, name));
+      let more = { samples: [], prs: [] };
+      if (typeof body.fromProposal === "string") {
+        const r = adoptProposal(`${owner}/${name}`, body.fromProposal, vs.length + 1);
+        if (r.error !== undefined) return send(res, r.status, { error: r.error });
+        more = r.context;
+      }
+      return send(res, 200, pushRubric(owner, name, doc, more));
     }
   }
   if (parts[2] === "repos" && parts.length === 5 && req.method === "PUT") {
@@ -1103,8 +1637,8 @@ createServer(async (req, res) => {
     return calibrationRoute(req, res, url, parts, body);
   if (url.pathname === "/api/v1/jobs" && req.method === "GET") {
     const kind = url.searchParams.get("kind") ?? "review";
-    if (!["review", "calibration", "all"].includes(kind))
-      return send(res, 400, { error: "'kind' must be review, calibration or all" });
+    if (!["review", "calibration", "proposal", "all"].includes(kind))
+      return send(res, 400, { error: "'kind' must be review, calibration, proposal or all" });
     const all = [...jobs.values()];
     return send(res, 200, {
       items: kind === "all" ? all : all.filter((j) => (j.kind ?? "review") === kind),

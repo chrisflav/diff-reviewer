@@ -47,8 +47,19 @@ export interface LocalRubric {
   [field: string]: unknown;
 }
 
-/** The fields of a `GET`'s answer that are about the version, not the document. */
-const metaFields = ["owner", "name", "version", "createdAt", "documentError"];
+/**
+ * The fields of a `GET`'s answer that are about the version, not the document: what it was
+ * derived from among them, which the server records and ignores when sent back.
+ */
+const metaFields = [
+  "owner",
+  "name",
+  "version",
+  "createdAt",
+  "documentError",
+  "derivedFrom",
+  "derivedFromPulls",
+];
 
 /** The document a version holds, or `null` when this build cannot read it. */
 export function documentOf(v: RubricDocument): RubricDoc | null {
@@ -477,25 +488,33 @@ function putBack<T extends Keyed>(xs: T[], item: T, order: number[]): T[] {
 }
 
 /**
- * Three-way merge of a list of keyed items. Items both sides added alike are one. `item` merges
- * one item that is in the base (`b`) and on either side; a new one is taken as it is.
+ * Three-way merge of a list of keyed items. Items both sides added alike are one. Items both added
+ * with one name but not alike are one too, as names are matched, and `added` says what to do with
+ * them: they are never two items of the same name. `item` merges one item that is in the base
+ * (`b`) and on either side; a new one is taken as it is.
  */
 function mergeList<T extends Keyed & { name: string }>(
   base: T[],
   mineIn: T[],
   theirs: T[],
   item: (key: number, b: T, m: T | null, t: T | null, order: number[]) => T | null,
+  added: (key: number, m: T, t: T, order: number[]) => T,
   onOrderClash: (mine: T[], theirs: T[]) => void,
 ): T[] {
   const inBase = new Set(base.map((x) => x[RKEY]));
   const theirNew = theirs.filter((x) => !inBase.has(x[RKEY]));
   const taken = new Set<number>();
-  const mine = mineIn.flatMap((m) => {
-    if (inBase.has(m[RKEY])) return [m];
-    const twin = theirNew.find((t) => !taken.has(t[RKEY]) && same(strip(t), strip(m)));
-    if (twin === undefined) return [m];
+  // Their new items that mine has under the same name, not alike: one item, which `added` merges.
+  const namesakes = new Set<number>();
+  const mine = mineIn.map((m) => {
+    if (inBase.has(m[RKEY])) return m;
+    const free = theirNew.filter((t) => !taken.has(t[RKEY]));
+    const twin = free.find((t) => same(strip(t), strip(m))) ?? free.find((t) => t.name === m.name);
+    if (twin === undefined) return m;
     taken.add(twin[RKEY]);
-    return [twin];
+    if (same(strip(twin), strip(m))) return twin;
+    namesakes.add(twin[RKEY]);
+    return { ...m, [RKEY]: twin[RKEY] };
   });
   const keys = (xs: T[]) => xs.map((x) => x[RKEY]);
   const { order, clash } = mergeOrder(keys(base), keys(mine), keys(theirs));
@@ -504,7 +523,12 @@ function mergeList<T extends Keyed & { name: string }>(
   const [bm, mm, tm] = [by(base), by(mine), by(theirs)];
   return order.flatMap((k) => {
     const [b, m, t] = [bm.get(k), mm.get(k) ?? null, tm.get(k) ?? null];
-    const out = b === undefined ? (t ?? m) : item(k, b, m, t, order);
+    const out =
+      b !== undefined
+        ? item(k, b, m, t, order)
+        : namesakes.has(k) && m !== null && t !== null
+          ? added(k, m, t, order)
+          : (t ?? m);
     return out === null ? [] : [out];
   });
 }
@@ -601,6 +625,18 @@ export function rebaseRubric(
             });
           return { ...cf, [RKEY]: ck } as LocalCategory;
         },
+        (ck, mc, tc, corder) => {
+          conflicts.push({
+            kind: "category",
+            type: key,
+            category: ck,
+            label: `${label}: ${tc.name}`,
+            mine: mc,
+            theirs: tc,
+            order: corder,
+          });
+          return tc;
+        },
         (mc, tc) =>
           conflicts.push({
             kind: "order",
@@ -613,6 +649,10 @@ export function rebaseRubric(
           }),
       );
       return { ...tf, categories, [RKEY]: key } as LocalType;
+    },
+    (key, m, t, order) => {
+      conflicts.push({ kind: "type", type: key, label: t.name, mine: m, theirs: t, order });
+      return t;
     },
     (mt, tt) =>
       conflicts.push({
