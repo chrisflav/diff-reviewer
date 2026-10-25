@@ -659,7 +659,7 @@ ask for a new one" .conflict
     -- Another run: the entry of the last one is history, and so is why it failed.
     if to == .pending then
       return { job with statusRaw := to.toString, queueEntry := none, error := none
-                        postDirect := false, fanoutRound := none }
+                        postDirect := false, fanoutRound := none, incrementalHead := none }
     -- A person's move ends the platform's own attempts to post.
     return { job with statusRaw := to.toString, postDirect := false }
 
@@ -1180,7 +1180,13 @@ private def incrementalJson (job : Job) (ref : String) : IO Json := do
   let prev ← match job.previousJob with
     | some id => Platform.findJob id
     | none => pure none
-  let posted : Json := (prev.bind (·.postedReview) |>.bind (Json.parse · |>.toOption)).getD .null
+  -- The body as a person reads it on GitHub, without the platform's hidden marker.
+  let postedRaw := prev.bind (·.postedReview) |>.bind (Json.parse · |>.toOption)
+  let posted : Json := match prev, postedRaw with
+    | some p, some j => match j.getObjValAs? String "body" with
+      | .ok b => j.setObjVal! "body" (Workers.stripMarker p.id b)
+      | .error _ => j
+    | _, _ => .null
   -- The comments as posted: GitHub's revision of the job, or its own review failing that.
   let revs ← match prev with
     | some p => Platform.revisions p.id
@@ -1451,7 +1457,8 @@ private def agentSubmit (st : State) (job : Job) (sub : Option (Fanout.SubRun ×
   -- since its previous review; the agent is told now, while it can still fix it.
   if let .error e ← Workers.checkDiffs st.services job review then
     return .error s!"'review': {e}" .badRequest
-  let review ← review.assignIds
+  -- An incremental re-review's draft names the review it follows up, for a person to read.
+  let review ← Workers.followUp job (← review.assignIds)
   let headSha := headSha.toLower
   let drafted ← Platform.updateJob job.id (revision := Job.revisionBy .agent) fun j => do
     unless j.status? == some .running do

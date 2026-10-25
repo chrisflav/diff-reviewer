@@ -31,16 +31,29 @@ inductive Compare where
   | refused
   | unreachable
 
+/-- How many times the fake was asked to compare, since the last `posted`. -/
+initialize compareCalls : IO.Ref Nat ← IO.mkRef 0
+
+/-- Whether the fake refuses the diff from `headA`. -/
+initialize rangeFails : IO.Ref Bool ← IO.mkRef false
+
+/-- 150 commits from `headA` to `headB`, oldest first, as GitHub lists them. -/
+def commitsSince : Array (String × String) :=
+  ((Array.range 149).map fun i => (s!"c{i}", s!"Commit {i}")).push (headB, "Fix the names")
+
 /-- `gh`'s client, comparing as `cmp` says and answering the diff from `headA` as `rangeDiff`. -/
 def client (gh : FakeGitHub) (cmp : IO.Ref Compare) : GitHub.Client :=
   { gh.client with
     diff := fun _ _ base _ => do
       gh.diffCalls.modify (· + 1)
-      if base == headA then return .ok rangeDiff
+      if base == headA then
+        if ← rangeFails.get then return .error (.indefinite "GitHub answered 502")
+        return .ok rangeDiff
       return .ok (← gh.diffText.get)
     compare := fun _ _ _ _ => do
+      compareCalls.modify (· + 1)
       match ← cmp.get with
-      | .ahead => return .ok { status := "ahead", commits := #[(headB, "Fix the names")] }
+      | .ahead => return .ok { status := "ahead", commits := commitsSince }
       | .diverged => return .ok { status := "diverged", commits := #[] }
       | .refused => return .error (.definite "GitHub answered 404: No common ancestor")
       | .unreachable => return .error (.indefinite "GitHub answered 502") }
@@ -59,6 +72,8 @@ def has (s t : String) : Bool := (s.splitOn t).length > 1
     services, the server, the orchestra, the GitHub, and the two jobs' ids. -/
 def posted (cmp : Compare) (repo : String := "{\"mode\": \"staged\"}") :
     IO (Workers.Services × State × FakeOrchestra × FakeGitHub × String × String) := do
+  compareCalls.set 0
+  rangeFails.set false
   let gh ← FakeGitHub.new #[pull7 headA]
   let orch ← FakeOrchestra.new
   let cmpRef ← IO.mkRef cmp
@@ -102,18 +117,31 @@ def anIncrementalReReview : Test := withTempDb do
   let submitted ← routeAgent st (agentReq .post "/review"
     (submission headB (reviewWith [commentJson 16 "A new problem."])))
   let some drafted ← Platform.findJob b | return #["the job is gone"]
+  let draftBody := ((drafted.review?.bind (·.toOption)).map (·.body)).getD ""
   let approved ← route st (req .post s!"/api/v1/jobs/{b}/status"
     (statusBody "approved" drafted.version))
+  -- The diff since cannot be had: the post is refused, not made unchecked.
+  Store.run do
+    let db ← read
+    SQLite.exec db s!"DELETE FROM pull_diff WHERE base_sha = '{headA}'"
+  rangeFails.set true
+  let unchecked ← route st (req .post s!"/api/v1/jobs/{b}/post"
+    s!"\{\"version\": {versionOf approved}}")
+  rangeFails.set false
   let postedB ← route st (req .post s!"/api/v1/jobs/{b}/post"
     s!"\{\"version\": {versionOf approved}}")
   let bodies := (← gh.posted.get).map (·.2.1.body)
   let url := prev.postedUrl.getD ""
   let str (j : Json) (k : String) := (j.getObjValAs? String k).toOption
-  let commits := ((job |> bodyJson).getObjVal? "incrementalCommits").toOption.bind
-    (·.getArr?.toOption) |>.map (·.toList.filterMap (str · "sha"))
+  let commits := (((job |> bodyJson).getObjVal? "incrementalCommits").toOption.bind
+    (·.getArr?.toOption) |>.map (·.toList.filterMap (str · "sha"))).getD []
+  let postedBody := ((incremental.getObjVal? "postedReview").toOption.bind
+    (str · "body")).getD "<none>"
   return checkEq (field job "previousJob") (some a) "the job it follows up"
     ++ checkEq (field job "incrementalSince") (some headA) "the head that review was of"
-    ++ checkEq commits (some [headB]) "the commits since"
+    ++ checkEq commits.length 100 "the commits since, at most 100"
+    ++ checkEq (commits.head?, commits.getLast?) (some "c50", some headB) "the newest"
+    ++ checkEq (← compareCalls.get) 1 "compared once"
     ++ checkEq (field job "fullReviewReason") none "no reason to review it in full"
     ++ check (has prompt s!"--since {headA} --job {b}") "the prompt asks for the changes since"
     ++ check (has prompt "Do not repeat a point the earlier review made") "and not to repeat"
@@ -123,6 +151,8 @@ def anIncrementalReReview : Test := withTempDb do
     ++ checkEq ((incremental.getObjVal? "postedReview").toOption.bind (str · "url"))
       prev.postedUrl "the posted review, as GitHub holds it"
     ++ check (has (incremental.compress) "Rename x.") "with its comments"
+    ++ check (!has postedBody "diff-reviewer job" && has postedBody "Better.")
+      "and its body without the hidden marker"
     ++ check (has (incremental.compress) "Fix the names") "and the commits since"
     ++ check ((str shownJson "instructions").any (has · "follows up an earlier one"))
       "its instructions say so"
@@ -134,14 +164,27 @@ def anIncrementalReReview : Test := withTempDb do
     ++ check (has (String.fromUTF8! offRange.body) "since") "saying why"
     ++ check kept.isSome "the diff since is kept while the job is live"
     ++ checkStatus submitted 200 "a comment on them"
+    ++ check (has draftBody s!"Follow-up to [the earlier review]({url})")
+      "the draft links the earlier review, for a person to read and approve"
+    ++ checkStatus unchecked 409 "posting when the diff since cannot be checked"
     ++ checkStatus postedB 200 "posting it"
-    ++ check (bodies[1]?.any (has · s!"Follow-up to [the earlier review]({url})"))
-      "the posted body links the earlier review"
+    ++ checkEq ((bodies[1]?.map (·.splitOn "Follow-up to")).map (·.length)) (some 2)
+      "the posted body links the earlier review, once"
 
 /-- A force-push — the reviewed head no ancestor of the new — falls back to a full review, with
     why on the job; so does a head GitHub refuses to compare. GitHub not answering keeps the job
     waiting, recorded once. -/
 def aForcePushIsReviewedInFull : Test := withTempDb do
+  let failing : Orchestra.Client :=
+    { queue := fun _ => return .error "orchestra answered 503", entry := fun _ => return .error ""
+      cancel := fun _ => return .ok () }
+  let (svc0, _, _, _, _, b0) ← posted .diverged
+  let svcF := { svc0 with orchestra := some failing }
+  Workers.queuePending svcF
+  Workers.queuePending svcF
+  let decidedOnce ← compareCalls.get
+  let some held ← Platform.findJob b0 | return #["the job is gone"]
+  let _ ← Platform.updateJob b0 fun j => return { j with statusRaw := "rejected" }
   let (svc, st, orch, _, _, b) ← posted .diverged
   Workers.queuePending svc
   let some job ← Platform.findJob b | return #["the job is gone"]
@@ -158,7 +201,10 @@ def aForcePushIsReviewedInFull : Test := withTempDb do
   let some waiting ← Platform.findJob b3 | return #["the third job is gone"]
   Workers.queuePending svc3
   let some still ← Platform.findJob b3 | return #["the third job is gone"]
-  return checkEq job.incrementalSince none "a force-push is not incremental"
+  return checkEq decidedOnce 1 "decided once, though the job waits on orchestra"
+    ++ checkEq held.statusRaw "pending" "the job that waits"
+    ++ check (held.fullReviewReason.any (has · "force-push")) "keeps the decision"
+    ++ checkEq job.incrementalSince none "a force-push is not incremental"
     ++ check (job.fullReviewReason.any (has · "force-push")) "and the job says why"
     ++ checkEq job.statusRaw "queued" "queued, to be reviewed in full"
     ++ check (!has prompt "--since") "the prompt asks for the whole diff"
@@ -211,7 +257,8 @@ def theAgentAsksForTheChangesSince : Test := do
                              , round := 0, position := 1, key := "naming"
                              , category := some "naming", externalBase := "j1", createdAt := ""
                              , updatedAt := "" }
-  let scope : Workers.Scope := { sub := sub, category := some { name := "naming" }, others := [] }
+  let scope : Workers.Scope :=
+    { sub := sub, category := some { name := "naming" }, others := [], ref := "j1.naming" }
   let inScope := Workers.prompt job (some scope)
   return checkEq (Agent.diffFlags ["--since", headA, "--job", "j1"]) (some (some headA, some "j1"))
       "--since before --job"

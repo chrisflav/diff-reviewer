@@ -186,7 +186,8 @@ def aFanoutIsQueued : Test := withTempDb do
     ++ checkEq (field job "status") (some "queued") "the job, fanned out"
     ++ checkEq (field job "queueEntry") none "with no entry of its own"
     ++ checkEq (field job "prType") (some "feature") "of the fixed type"
-    ++ checkEq (versionOf job) 2 "fanned out in one write"
+    ++ checkEq (versionOf job) 3
+      "its incremental decision kept, then fanned out in one write"
     ++ checkEq ((subRunsOf job).map (strOf · "key")) [some "default", some "correctness",
       some "naming"] "its sub-runs"
     ++ checkEq ((subRunsOf job).map (strOf · "status")) [some "queued", some "queued",

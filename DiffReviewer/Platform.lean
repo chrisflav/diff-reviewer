@@ -340,6 +340,8 @@ structure Job where
   incrementalCommitsRaw : Option String := none
   /-- Why a review that would have been incremental is a full one (a force-push). -/
   fullReviewReason : Option String := none
+  /-- The head the incremental decision was made at: it is made once a head. -/
+  incrementalHead : Option String := none
 
 def Job.status? (j : Job) : Option JobStatus := JobStatus.ofString? j.statusRaw
 
@@ -418,7 +420,8 @@ def Job.ofRow (row : Store.JobRow) : Job :=
   , notesVersion := row.notes_version.map (·.toNat)
   , fanoutRound := row.fanout_round.map (·.toNat)
   , previousJob := row.previous_job, incrementalSince := row.incremental_since
-  , incrementalCommitsRaw := row.incremental_commits, fullReviewReason := row.full_review_reason }
+  , incrementalCommitsRaw := row.incremental_commits, fullReviewReason := row.full_review_reason
+  , incrementalHead := row.incremental_head }
 
 def Job.toRow (j : Job) : Store.JobRow :=
   { id := j.id, owner := j.owner, name := j.name, pr_number := j.prNumber
@@ -434,7 +437,8 @@ def Job.toRow (j : Job) : Store.JobRow :=
   , notes_version := j.notesVersion.map Int.ofNat
   , fanout_round := j.fanoutRound.map Int.ofNat
   , previous_job := j.previousJob, incremental_since := j.incrementalSince
-  , incremental_commits := j.incrementalCommitsRaw, full_review_reason := j.fullReviewReason }
+  , incremental_commits := j.incrementalCommitsRaw, full_review_reason := j.fullReviewReason
+  , incremental_head := j.incrementalHead }
 
 /-- The largest pull request number accepted: what fits a 32-bit column with room to spare. -/
 def maxPrNumber : Nat := 2147483647

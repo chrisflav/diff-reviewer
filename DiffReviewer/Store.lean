@@ -130,6 +130,9 @@ structure JobRow where
   /-- Why a review that would have been incremental is a full one: the head the last review was
       of is not an ancestor of this one (a force-push) (`0007`). -/
   full_review_reason : Option String
+  /-- The head the incremental decision above was made at (`0007`): made once a head, not on
+      every pass a job waits; none before it is made. -/
+  incremental_head : Option String
   deriving Repr
 
 /-- The diff of a pull request at one head commit, as GitHub gave it. A commit's diff never
@@ -698,7 +701,8 @@ def migration0007 : Db.Migration.Migration where
     .addColumn "review_job" "previous_job" { type := .text, nullable := true },
     .addColumn "review_job" "incremental_since" { type := .text, nullable := true },
     .addColumn "review_job" "incremental_commits" { type := .text, nullable := true },
-    .addColumn "review_job" "full_review_reason" { type := .text, nullable := true }]
+    .addColumn "review_job" "full_review_reason" { type := .text, nullable := true },
+    .addColumn "review_job" "incremental_head" { type := .text, nullable := true }]
 
 /-- The migrations, in the order they are applied. Appended to, never edited. -/
 def migrations : List Db.Migration.Migration :=
