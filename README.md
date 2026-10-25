@@ -359,7 +359,9 @@ reviewed, without being shown that review, and the two are compared.
    settings and their `version`) with
    `{"trustedReviewers": ["alice", "bob"]}` (alongside `mode` and `autoReview`, which the write
    replaces as always). Leaving `trustedReviewers` out of a later write keeps them. The settings
-   are versioned: send the `version` you read, and a write over a newer one is a `409`.
+   are versioned: send the `version` you read, and a write over a newer one is a `409`. Versions
+   never repeat for one repository: deleted and registered again (with `version` 0), it goes on
+   from the version it had, so a page that read the old registration is refused by the new.
 2. **Import.** `POST …/calibration/import` with `{"limit": 50}` (the default; at most 200) queues
    an import of that many of the most recently updated closed pull requests. The workers read it
    on, 25 pull requests a pass (`GET …/calibration/import` shows how far;

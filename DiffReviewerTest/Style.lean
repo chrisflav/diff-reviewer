@@ -466,6 +466,41 @@ def theUiReadsWhatItNeeds : Test := withTempDb do
     ++ checkEq (str resumed ["status"]) (some "done") "it goes on"
     ++ checkEq (resumed.getObjVal? "resetAt" |>.toOption) (some .null) "and the reset is cleared"
 
+/-- A repository deleted and registered again goes on from the version it had: a page that read a
+    version of the old registration is refused by the new one rather than overwriting it; and the
+    deleted one is gone from every lookup meanwhile. -/
+def versionsNeverRepeat : Test := withTempDb do
+  let st ← State.new cfg
+  let first ← putRepo st "{\"version\": 0, \"trustedReviewers\": [\"alice\"]}"
+  let second ← putRepo st "{\"version\": 1, \"trustedReviewers\": [\"alice\", \"bob\"]}"
+  let deleted ← route st (req .delete repoPath)
+  let gone ← route st (req .get repoPath)
+  let listed := items (← route st (req .get "/api/v1/repos"))
+  let job ← route st (req .post "/api/v1/jobs"
+    "{\"owner\": \"acme\", \"name\": \"widgets\", \"prNumber\": 7}")
+  let proposalOf ← route st (req .post s!"{repoPath}/proposals" "{}")
+  let staleBefore ← putRepo st "{\"version\": 1, \"trustedReviewers\": [\"mallory\"]}"
+  let again ← putRepo st "{\"version\": 0, \"trustedReviewers\": [\"carol\"]}"
+  let stale ← putRepo st "{\"version\": 1, \"trustedReviewers\": [\"mallory\"]}"
+  let staleZero ← putRepo st "{\"version\": 0, \"trustedReviewers\": [\"mallory\"]}"
+  let deletedTwice ← route st (req .delete "/api/v1/repos/acme/nope")
+  let now ← route st (req .get repoPath)
+  let trusted (r : Reply) : List String :=
+    (listOf (bodyJson r) ["trustedReviewers"]).filterMap (·.getStr?.toOption)
+  return checkEq (versionOf first, versionOf second) (1, 2) "the first registration's versions"
+    ++ checkStatus deleted 204 "deleting it"
+    ++ checkStatus gone 404 "it is gone"
+    ++ checkEq listed.length 0 "from the list too"
+    ++ checkStatus job 404 "no job is made for it"
+    ++ checkStatus proposalOf 404 "nor a proposal"
+    ++ checkStatus staleBefore 409 "a write of an old version before it is registered again"
+    ++ checkStatus again 201 "registered again"
+    ++ checkEq (versionOf again) 3 "at the version after the last it had"
+    ++ checkStatus stale 409 "a page of the old registration's version 1"
+    ++ checkStatus staleZero 409 "a second registration from a page that never saw the first"
+    ++ checkEq (trusted now) ["carol"] "the new registration's trusted reviewers, untouched"
+    ++ checkStatus deletedTwice 404 "deleting a repository that is not registered"
+
 def all : List (String × Test) :=
   [("examplesAreVaried", examplesAreVaried),
    ("examplesLeaveOutThePullUnderReview", examplesLeaveOutThePullUnderReview),
@@ -475,6 +510,7 @@ def all : List (String × Test) :=
    ("aProposalReadsTheEvidence", aProposalReadsTheEvidence),
    ("proposalsWaitForTheirClient", proposalsWaitForTheirClient),
    ("theProposalCliChecksItsInput", theProposalCliChecksItsInput),
-   ("theUiReadsWhatItNeeds", theUiReadsWhatItNeeds)]
+   ("theUiReadsWhatItNeeds", theUiReadsWhatItNeeds),
+   ("versionsNeverRepeat", versionsNeverRepeat)]
 
 end DiffReviewerTest.Style

@@ -471,6 +471,15 @@ structure RepoUpdate where
       `none` writes whatever is there. -/
   expected         : Option Nat := none
 
+/-- The last settings version of `owner/name` when it was deleted, if it ever was. -/
+private def fetchTombstone (owner name : String) : Sqlite.M (Option Store.TombstoneRow) := do
+  let rows ← HasModel.fetch <| query% do
+    let t ← from Store.TombstoneRow
+    guard t.owner = owner
+    guard t.name = name
+    select t
+  return rows[0]?
+
 /-- Create or update a repository: a versioned write, the check and the write in one transaction.
     Answers whether it existed before, and the repository as written. Names are stored in lower
     case, as GitHub compares them, so `Acme/Widgets` and `acme/widgets` are one repository; so are
@@ -486,18 +495,21 @@ def putRepo (owner name : String) (u : RepoUpdate) : IO (Except String (Bool × 
       guard r.name = name
       select r
     let existing := rows[0]?.map Repo.ofRow
+    -- A registration is version 0 to a client, but goes on from the last version a deleted one of
+    -- the same name had: versions never repeat, so a page of the old one is refused by the new.
     let current := (existing.map (·.version)).getD 0
+    let last := ((← fetchTombstone owner name).map (·.version.toNat)).getD 0
     if let some v := u.expected then
       unless v == current do
         return .error s!"the settings of {owner}/{name} have changed since they were read \
 (version {v}, now {current}); reload them"
-    let old : Repo := existing.getD { owner, name, createdAt := now, version := 0 }
+    let old : Repo := existing.getD { owner, name, createdAt := now, version := last }
     let trusted := (u.trustedReviewers.map (·.map String.toLower |>.eraseDups)).getD
       old.trustedReviewers
     let repo : Repo :=
       { old with mode := u.mode.getD old.mode, autoReview := u.autoReview.getD old.autoReview
                  trustedReviewers := trusted, styleNotes := u.styleNotes.getD old.styleNotes
-                 version := current + 1 }
+                 version := old.version + 1 }
     HasModel.save repo.toRow
     return .ok (existing.isSome, repo)
 
@@ -519,12 +531,21 @@ def saveStyleNotes (repo : Repo) (notes : String) : Sqlite.M Repo := do
 
 /-- Delete a repository. Its jobs are kept: they are the record of reviews that happened. So are
     its rubric versions, which those jobs name (`rubricVersion`): registering the repository again
-    picks up its rubric where it was. -/
+    picks up its rubric where it was. Its row goes — every lookup, listing, worker and agent route
+    finds it gone — and the version its settings had is kept apart (`Store.TombstoneRow`), for
+    registering it again to go on from. -/
 def deleteRepo (owner name : String) : IO Bool := do
-  let n ← Store.run <| HasModel.delete (α := Store.RepoRow)
-    (.and (.eq (.var Store.RepoRowIndex.owner .text) (.text owner.toLower))
-          (.eq (.var Store.RepoRowIndex.name .text) (.text name.toLower)))
-  return n > 0
+  let (owner, name) := (owner.toLower, name.toLower)
+  let now ← nowIso
+  Store.transact do
+    let some repo ← fetchRepo owner name | return false
+    let _ ← HasModel.delete (α := Store.RepoRow)
+      (.and (.eq (.var Store.RepoRowIndex.owner .text) (.text owner))
+            (.eq (.var Store.RepoRowIndex.name .text) (.text name)))
+    -- What registering it again goes on from (`putRepo`).
+    HasModel.save ({ owner, name, version := repo.version, deleted_at := now }
+      : Store.TombstoneRow)
+    return true
 
 def listJobs : IO (Array Job) := do
   let rows ← Store.run <| HasModel.fetch <| query% do

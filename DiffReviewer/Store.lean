@@ -262,6 +262,17 @@ structure ScoreRow where
   stale : Option Bool
   deriving Repr
 
+/-- The last version of a deleted repository's settings (`0005`), so that registering it again
+    goes on from there: a version is never given twice to one `owner/name`, and a page that read a
+    version of the old registration cannot have its write taken for one of the new. -/
+@[model (dbName := "repo_tombstone") (primaryKey := ["owner", "name"]) reviewdb]
+structure TombstoneRow where
+  owner : String
+  name : String
+  version : Int
+  deleted_at : String
+  deriving Repr
+
 /-- A rubric document an agent proposed for a repository, from its calibration data, and what a
     person made of it (`0005`). Written once by the agent's submission; a person's decision sets
     `status` and `decided_at`, and an accepted one the rubric version it became. -/
@@ -471,7 +482,8 @@ def migration0004 : Db.Migration.Migration where
     .createIndex "review_job" jobKindIndex]
 
 /-- `0005_m4`: learned review style — a repository's style notes, and the rubric proposals agents
-    write from the calibration data — and when the rate limit an import waits for resets. The new
+    write from the calibration data — when the rate limit an import waits for resets, and the last
+    settings version of each deleted repository, which registering it again goes on from. The new
     columns are nullable: a repository written before has no style notes, and an import no reset
     to wait for. -/
 def migration0005 : Db.Migration.Migration where
@@ -479,6 +491,13 @@ def migration0005 : Db.Migration.Migration where
   steps := [
     .addColumn "repo" "style_notes" { type := .text, nullable := true },
     .addColumn "calibration_import" "reset_at" { type := .text, nullable := true },
+    .createTable "repo_tombstone"
+      { columns := .ofList
+          [("owner", { type := .text, nullable := false }),
+           ("name", { type := .text, nullable := false }),
+           ("version", { type := .int, nullable := false }),
+           ("deleted_at", { type := .text, nullable := false })],
+        primaryKey := ["owner", "name"] },
     .createTable "rubric_proposal"
       { columns := .ofList
           [("id", { type := .text, nullable := false }),

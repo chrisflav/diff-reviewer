@@ -227,7 +227,7 @@
                   "version": {
                     "type": "integer",
                     "minimum": 0,
-                    "description": "The version of the settings last read, 0 for a repository not registered yet. Given, the write is a `409` if the settings have changed since; left out, it is not checked."
+                    "description": "The version of the settings last read, 0 for a repository not registered (now). Given, the write is a `409` if the settings have changed since; left out, it is not checked. A repository registered again after being deleted goes on from the version it had, so no version is given twice to one name."
                   }
                 }
               }
@@ -272,7 +272,7 @@
       },
       "delete": {
         "summary": "Unregister a repository",
-        "description": "Its jobs are kept: they are the record of reviews that happened. So are its rubric versions, which those jobs name: registering the repository again picks its rubric up where it was.",
+        "description": "Its jobs are kept: they are the record of reviews that happened. So are its rubric versions, which those jobs name: registering the repository again picks its rubric up where it was. Versions of its settings never repeat: registering it again goes on from the version it had, so a page of the old registration is refused (`409`) by the new one.",
         "operationId": "deleteRepo",
         "responses": {
           "204": {
