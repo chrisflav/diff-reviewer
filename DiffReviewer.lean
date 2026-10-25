@@ -1,4 +1,5 @@
 import DiffReviewer.Types
+import DiffReviewer.Rubric
 import DiffReviewer.Http
 import DiffReviewer.Diff
 import DiffReviewer.Orchestra

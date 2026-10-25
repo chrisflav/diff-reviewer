@@ -3,3 +3,4 @@ import DiffReviewerTest.Platform
 import DiffReviewerTest.Server
 import DiffReviewerTest.Workers
 import DiffReviewerTest.Safety
+import DiffReviewerTest.Rubrics

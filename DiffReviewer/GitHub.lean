@@ -55,6 +55,9 @@ structure PostedReview where
   url    : String
   /-- The login of the review's author. -/
   author : String := ""
+  /-- What GitHub says the review is: `APPROVED`, `CHANGES_REQUESTED`, `COMMENTED`, … ; empty
+      when it did not say. -/
+  state  : String := ""
   deriving Repr, BEq
 
 def PostedReview.ofJson (j : Json) : Except String PostedReview := do
@@ -62,7 +65,16 @@ def PostedReview.ofJson (j : Json) : Except String PostedReview := do
   let body := (j.getObjValAs? String "body").toOption.getD ""
   let url := (j.getObjValAs? String "html_url").toOption.getD ""
   let author := ((j.getObjVal? "user").bind (·.getObjValAs? String "login")).toOption.getD ""
-  return { id, body, url, author }
+  let state := (j.getObjValAs? String "state").toOption.getD ""
+  return { id, body, url, author, state }
+
+/-- The decision a review GitHub holds is, by its `state`, when that is one. -/
+def PostedReview.decision? (r : PostedReview) : Option Decision :=
+  match r.state with
+  | "APPROVED" => some .approve
+  | "CHANGES_REQUESTED" => some .requestChanges
+  | "COMMENTED" => some .comment
+  | _ => none
 
 def PostedReview.toJson (r : PostedReview) : Json :=
   .mkObj [("id", r.id), ("url", r.url), ("body", r.body)]

@@ -73,6 +73,16 @@ structure JobRow where
   /-- The review as GitHub holds it, `{"id", "url", "body"}`: what was posted, which after a
       reconciliation may not be the job's own review (`0002`). -/
   posted_review : Option String
+  /-- The version of the repository's rubric the review was checked against, 0 for none (`0003`).
+      Null for a job reviewed before rubrics existed. -/
+  rubric_version : Option Int
+  /-- How many times the platform has posted the review on its own, in a `direct` repository: each
+      a claim, and a request to GitHub (`0003`); none is 0. A person's posts are not counted. -/
+  direct_posts : Option Int
+  /-- Whether the last claim to post was the platform's own, in a `direct` repository, and so a
+      post the platform may make again once the claim is settled as not having reached GitHub
+      (`0003`); none is `false`. -/
+  post_direct : Option Bool
   deriving Repr
 
 /-- The diff of a pull request at one head commit, as GitHub gave it. A commit's diff never
@@ -86,6 +96,29 @@ structure DiffRow where
   head_sha : String
   diff : String
   fetched_at : String
+  deriving Repr
+
+/-- One version of a repository's rubric document, as `Rubric.toJson` (`0003`). Never changed once
+    written: a change is the next version. -/
+@[model (dbName := "repo_rubric") (primaryKey := ["owner", "name", "version"]) reviewdb]
+structure RubricRow where
+  owner : String
+  name : String
+  version : Int
+  document : String
+  created_at : String
+  deriving Repr
+
+/-- One write of a job's review: who wrote it — the agent, a person, or GitHub, as what it holds
+    once posted — and the review as written (`0003`). `version` is the job's version the write
+    made, so a revision is named by the job's history and no two share one. -/
+@[model (dbName := "review_revision") (primaryKey := ["job_id", "version"]) reviewdb]
+structure RevisionRow where
+  job_id : String
+  version : Int
+  author : String
+  review : String
+  created_at : String
   deriving Repr
 
 def target : DatabaseRecipe :=
@@ -145,8 +178,35 @@ def migration0002 : Db.Migration.Migration where
            ("fetched_at", { type := .text, nullable := false })],
         primaryKey := ["owner", "name", "base_sha", "head_sha"] }]
 
+/-- `0003_m2`: rubrics, and the history of each job's review — the rubric versions of a repository,
+    a job's revisions, the rubric version a job was reviewed against, and the platform's own posts
+    of it. The new columns are nullable: `rubric_version` is null for a job written before rubrics
+    existed (a job reviewed against no rubric has 0), and the posting columns read as none yet. -/
+def migration0003 : Db.Migration.Migration where
+  name := "0003_m2"
+  steps := [
+    .addColumn "review_job" "rubric_version" { type := .int, nullable := true },
+    .addColumn "review_job" "direct_posts" { type := .int, nullable := true },
+    .addColumn "review_job" "post_direct" { type := .bool, nullable := true },
+    .createTable "repo_rubric"
+      { columns := .ofList
+          [("owner", { type := .text, nullable := false }),
+           ("name", { type := .text, nullable := false }),
+           ("version", { type := .int, nullable := false }),
+           ("document", { type := .text, nullable := false }),
+           ("created_at", { type := .text, nullable := false })],
+        primaryKey := ["owner", "name", "version"] },
+    .createTable "review_revision"
+      { columns := .ofList
+          [("job_id", { type := .text, nullable := false }),
+           ("version", { type := .int, nullable := false }),
+           ("author", { type := .text, nullable := false }),
+           ("review", { type := .text, nullable := false }),
+           ("created_at", { type := .text, nullable := false })],
+        primaryKey := ["job_id", "version"] }]
+
 /-- The migrations, in the order they are applied. Appended to, never edited. -/
-def migrations : List Db.Migration.Migration := [migration0001, migration0002]
+def migrations : List Db.Migration.Migration := [migration0001, migration0002, migration0003]
 
 /-- Where the database is. Set once at start-up (`serve --db`), and by the tests. -/
 initialize pathRef : IO.Ref System.FilePath ← IO.mkRef (System.FilePath.mk "diff-reviewer.db")

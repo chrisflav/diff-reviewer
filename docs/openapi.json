@@ -2,8 +2,8 @@
   "openapi": "3.1.0",
   "info": {
     "title": "diff-reviewer platform API",
-    "version": "0.3.0",
-    "description": "The review platform: the repositories whose pull requests it reviews, and one review job per review. A job moves `pending → queued → running → draft → approved → posted`; `rejected` is a discarded draft, `stale` a draft whose pull request has moved on, and `failed` a run that ended without a review.\n\nThree credentials, none standing in for another. The password (`$DIFF_REVIEWER_PASSWORD`) is accepted only by `POST /api/login`, which sets the session cookie; failed password logins are rate-limited (an immediate `429` with `Retry-After`), and the API token signs in there too, unlimited. Every route under `/api/v1/` needs the session cookie or the API token (`$DIFF_REVIEWER_API_TOKEN_FILE`) as `Authorization: Bearer <token>`. Every route under `/api/agent/v1/` needs the agent token (`$DIFF_REVIEWER_AGENT_TOKEN_FILE`) as a bearer, and nothing else reaches it; an agent's requests go through kleis, which supplies it.\n\nEvery write must be `application/json` (`415` otherwise). Every write to a job under `/api/v1/` names the job's `version` as last read, and is a `409` if the job has changed since. A request the server fails on is a `500` whose reason goes to the server log; a method a route does not answer is a `405`. Collections answer `{\"items\": [...]}`. Instants are RFC 3339 in UTC; an absent value is `null`."
+    "version": "0.4.0",
+    "description": "The review platform: the repositories whose pull requests it reviews, and one review job per review. A job moves `pending → queued → running → draft → approved → posted`; `rejected` is a discarded draft, `stale` a draft whose pull request has moved on, and `failed` a run that ended without a review.\n\nThree credentials, none standing in for another. The password (`$DIFF_REVIEWER_PASSWORD`) is accepted only by `POST /api/login`, which sets the session cookie; failed password logins are rate-limited (an immediate `429` with `Retry-After`), and the API token signs in there too, unlimited. Every route under `/api/v1/` needs the session cookie or the API token (`$DIFF_REVIEWER_API_TOKEN_FILE`) as `Authorization: Bearer <token>`. Every route under `/api/agent/v1/` needs the agent token (`$DIFF_REVIEWER_AGENT_TOKEN_FILE`) as a bearer, and nothing else reaches it; an agent's requests go through kleis, which supplies it.\n\nEvery write must be `application/json` (`415` otherwise). Every write to a job under `/api/v1/` names the job's `version` as last read, and is a `409` if the job has changed since. A request the server fails on is a `500` whose reason goes to the server log; a method a route does not answer is a `405`. Collections answer `{\"items\": [...]}`. Instants are RFC 3339 in UTC; an absent value is `null`.\n\nEach repository has a rubric document — a default rubric and the pull request types its reviews tell apart, each with a rubric and the categories its comments are filed under — written whole and versioned (`/api/v1/repos/{owner}/{name}/rubrics`). Every write of a job's review, by the agent, a person or (once posted) GitHub, is kept as a revision (`/api/v1/jobs/{id}/revisions`)."
   },
   "security": [
     {
@@ -229,7 +229,7 @@
       },
       "delete": {
         "summary": "Unregister a repository",
-        "description": "Its jobs are kept: they are the record of reviews that happened.",
+        "description": "Its jobs are kept: they are the record of reviews that happened. So are its rubric versions, which those jobs name: registering the repository again picks its rubric up where it was.",
         "operationId": "deleteRepo",
         "responses": {
           "204": {
@@ -391,7 +391,7 @@
       ],
       "put": {
         "summary": "Replace a job's review",
-        "description": "The body is `{\"version\": n, \"review\": {...}}`. Allowed while the job is `pending`, `draft`, `approved` or `rejected` (`409` otherwise: the agent may still be writing it, or it is history), and makes it a `draft`: an approval was of the review as it was. Each comment must name a file and lines `1 ≤ start_line ≤ end_line`, and say something. `409` while a post of the job may have reached GitHub (`postStartedAt` is set).",
+        "description": "The body is `{\"version\": n, \"review\": {...}}`. Allowed while the job is `pending`, `draft`, `approved` or `rejected` (`409` otherwise: the agent may still be writing it, or it is history), and makes it a `draft`: an approval was of the review as it was. Each comment must name a file and lines `1 ≤ start_line ≤ end_line`, and say something. `409` while a post of the job may have reached GitHub (`postStartedAt` is set). Each comment's `category` is checked against the rubric version the job was reviewed against (the current one if none). Comments without an `id` are given one, and the review is appended to the job's revisions as a person's.",
         "operationId": "putReview",
         "requestBody": {
           "required": true,
@@ -702,7 +702,7 @@
       ],
       "get": {
         "summary": "The review the agent is running",
-        "description": "The job the agent runs (see `X-Diff-Reviewer-Job`), `queued` or `running`; reading a `queued` one moves it to `running`. `404` when no review of the pull request is being run.",
+        "description": "The job the agent runs (see `X-Diff-Reviewer-Job`), `queued` or `running`; reading a `queued` one moves it to `running`. `404` when no review of the pull request is being run. `409` too when the repository's rubric cannot be read by this build.",
         "operationId": "agentShow",
         "security": [
           {
@@ -849,7 +849,7 @@
       ],
       "post": {
         "summary": "Submit the review",
-        "description": "The job must be `running` and `headSha` must be its head (`409` otherwise). The review must be one GitHub would take (`400`, saying what to fix): at most 200 inline comments, a summary unless it approves, and every comment's lines in one hunk of the diff's new side. The job becomes a `draft`. For a repository in `direct` mode the platform then posts it — always as a comment, whatever its decision, which the job keeps; if posting fails the job is left `approved` with the reason in `error`, and the submission still stands.",
+        "description": "The job must be `running` and `headSha` must be its head (`409` otherwise). The review must be one GitHub would take (`400`, saying what to fix): at most 200 inline comments, a summary unless it approves, and every comment's lines in one hunk of the diff's new side. `prType` must be one of the rubric's pull request types, or null when it names none, and each comment's `category` one of that type's categories (see `InlineComment`) (`400`). Comments without an `id` are given one. The job becomes a `draft`, recording `prType` and the rubric's version (0 for none), and the review is the first of its revisions. For a repository in `direct` mode the platform then posts it — always as a comment, whatever its decision, which the job keeps; if posting fails the job is left `approved` with the reason in `error`, and the submission still stands; when the post's outcome was unknown and it is found not to have reached GitHub, the workers post it again, if the pull request is still open at the job's head, up to 3 posts in all.",
         "operationId": "agentSubmit",
         "security": [
           {
@@ -874,7 +874,8 @@
                     "type": [
                       "string",
                       "null"
-                    ]
+                    ],
+                    "description": "The name of the pull request type reviewed, one of `prTypes`; null when there are none."
                   },
                   "review": {
                     "$ref": "#/components/schemas/Review"
@@ -946,7 +947,7 @@
       ],
       "post": {
         "summary": "Settle a post whose outcome is unknown, without posting",
-        "description": "For a job whose `postStartedAt` is set — a post that may have reached GitHub. The pull request's reviews by the operator are searched for the job's marker. Found, the job is `posted`, with GitHub's record in `postedReview`. Not found and the claim older than its window (three times the post's timeout), the claim is cleared and the job left `approved`, free to be moved back to `draft`, rejected, posted again or made `stale`. Not found within the window, a `409`: the post may still be under way. Reviews that cannot be read leave the claim as it is: a `502` that carries the job. `409` too for a job that is not `approved`, not at `version`, or has no claim.",
+        "description": "For a job whose `postStartedAt` is set — a post that may have reached GitHub. The pull request's reviews by the operator are searched for the job's marker. Found, the job is `posted`, with GitHub's record in `postedReview`. Not found and the claim older than its window (three times the post's timeout), the claim is cleared and the job left `approved`, free to be moved back to `draft`, rejected, posted again or made `stale`. Not found within the window, a `409`: the post may still be under way. Reviews that cannot be read leave the claim as it is: a `502` that carries the job. `409` too for a job that is not `approved`, not at `version`, or has no claim. The workers do the same on every pass for every claim past its window, so a claim is settled without this too. In a `direct` repository the workers then post a review of their own that did not reach GitHub again, as a comment, if its pull request is still open at the job's head (otherwise the job is made `stale`), up to 3 posts by the platform; past that it is left `approved` with the reason in `error`. A post a person started is never posted again by the workers.",
         "operationId": "reconcileJob",
         "requestBody": {
           "required": true,
@@ -1018,6 +1019,282 @@
             "$ref": "#/components/responses/Error"
           }
         }
+      }
+    },
+    "/api/v1/jobs/{id}/revisions": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "get": {
+        "summary": "The history of a job's review",
+        "description": "Every write of the job's review, oldest first: the agent's submission, each person's edit, and what GitHub holds once it is posted. What the agent drafted beside what was posted. Paged: `limit` (default 50, at most 200) and `offset`; `400` for a `limit` or `offset` that is not one. The history is bounded: the agent's first draft, every `github` revision (what was posted) and the last 100 revisions are kept, and older edits between them are dropped.",
+        "operationId": "listRevisions",
+        "responses": {
+          "200": {
+            "description": "The revisions.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "items",
+                    "nextOffset"
+                  ],
+                  "properties": {
+                    "items": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Revision"
+                      }
+                    },
+                    "nextOffset": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ],
+                      "description": "The `offset` of the next page; null on the last."
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 200,
+              "default": 50
+            },
+            "description": "The most items in the page."
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0
+            },
+            "description": "How many items to skip."
+          }
+        ]
+      }
+    },
+    "/api/v1/repos/{owner}/{name}/rubrics": {
+      "parameters": [
+        {
+          "name": "owner",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "name",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "get": {
+        "summary": "A repository's rubric document",
+        "description": "The current version; version 0 with an empty document when there is none yet. `404` for a repository that is not registered.",
+        "operationId": "getRubrics",
+        "responses": {
+          "200": {
+            "description": "The document.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RubricDocument"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "put": {
+        "summary": "Replace a repository's rubric document",
+        "description": "The body is the whole document with the version it replaces, as last read (`409` if that is no longer the current one). It becomes the next version, and the one it replaces stays in the history. A type's `description`, `rubric` and `categories` default to empty. `400` for a type or category without a name or with the name of another, past 50 types or 50 categories a type, or a rubric past 65536 bytes. The answer of a `GET` may be sent back as it is, edited: its `owner`, `name`, `createdAt` and `documentError` are not kept as the document's, and fields this build does not know, on the document, a type or a category, are kept. A field may be left out (it is then empty) but not `null` (`400`). `409` too while the current version cannot be read by this build (`documentError`): it is left for a build that can.",
+        "operationId": "putRubrics",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "version"
+                ],
+                "properties": {
+                  "version": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "The version last read; 0 when the repository had none."
+                  },
+                  "defaultRubric": {
+                    "type": "string"
+                  },
+                  "prTypes": {
+                    "type": "array",
+                    "items": {
+                      "$ref": "#/components/schemas/PrType"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The new version.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RubricDocument"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "415": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/v1/repos/{owner}/{name}/rubrics/history": {
+      "parameters": [
+        {
+          "name": "owner",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "name",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "get": {
+        "summary": "Every version of a repository's rubric document",
+        "description": "Newest first. A job's `rubricVersion` names one of them. Paged: `limit` (default 50, at most 200) and `offset`; `400` for a `limit` or `offset` that is not one.",
+        "operationId": "getRubricHistory",
+        "responses": {
+          "200": {
+            "description": "The versions.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "items",
+                    "nextOffset"
+                  ],
+                  "properties": {
+                    "items": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/RubricDocument"
+                      }
+                    },
+                    "nextOffset": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ],
+                      "description": "The `offset` of the next page; null on the last."
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 200,
+              "default": 50
+            },
+            "description": "The most items in the page."
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0
+            },
+            "description": "How many items to skip."
+          }
+        ]
       }
     }
   },
@@ -1135,7 +1412,10 @@
           "postStartedAt",
           "postedUrl",
           "postNote",
-          "postedReview"
+          "postedReview",
+          "rubricVersion",
+          "directPosts",
+          "postDirect"
         ],
         "properties": {
           "id": {
@@ -1233,7 +1513,7 @@
               "string",
               "null"
             ],
-            "description": "The kind of pull request the agent said it reviewed."
+            "description": "The pull request type the agent said it reviewed: one of the rubric's types, at `rubricVersion`."
           },
           "attempts": {
             "type": "integer",
@@ -1284,6 +1564,22 @@
                 "type": "string"
               }
             }
+          },
+          "rubricVersion": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "The version of the repository's rubric document the review was checked against, recorded with the agent's submission: 0 when the repository had none; null for a job the agent has not reviewed, or one from before rubrics, whose edits are checked against the current rubric."
+          },
+          "directPosts": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "How many times the platform has posted the review on its own, in a `direct` repository: the post on submission and each post again after a claim was settled as not having reached GitHub. At most 3; a person's posts are not counted."
+          },
+          "postDirect": {
+            "type": "boolean",
+            "description": "Whether the last post was the platform's own, which it posts again (if the pull request is still open at the job's head, and fewer than 3 times) once its claim is settled as not having reached GitHub. A person's post, edit or move clears it."
           }
         }
       },
@@ -1316,7 +1612,7 @@
             "description": "At most 200. A comment's lines must lie in one hunk of the diff's new side."
           }
         },
-        "description": "A `comment` or `request_changes` review must have a non-empty `body`; GitHub refuses either without one."
+        "description": "A `comment` or `request_changes` review must have a non-empty `body`; GitHub refuses either without one. Fields this build does not know, on the review or on a comment, are kept as they are."
       },
       "InlineComment": {
         "type": "object",
@@ -1344,8 +1640,29 @@
           "suggestion": {
             "type": "string",
             "description": "Replacement text for the lines, posted as a GitHub suggestion."
+          },
+          "id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{1,64}$",
+            "description": "Stable within the review, and unique in it. A comment written without one is given one by the platform when the review is submitted or edited; one it has is kept. A review stored before ids existed gets them on its next write, not when it is read."
+          },
+          "category": {
+            "type": "string",
+            "maxLength": 100,
+            "description": "What the comment is about: one of the categories of the job's pull request type, or free text when that type lists none. A job of no type (reviewed by hand) may use any category of the rubric, or free text when it names none. On a person's edit only a category that is new or changed is checked."
+          },
+          "severity": {
+            "type": "string",
+            "enum": [
+              "nit",
+              "minor",
+              "major",
+              "blocker"
+            ],
+            "description": "How much the comment matters. A severity this build does not know makes a stored review unreadable (`reviewError`), as an unknown decision does."
           }
-        }
+        },
+        "description": "Fields this build does not know are kept as they are and written back on every round trip."
       },
       "AgentJob": {
         "type": "object",
@@ -1361,7 +1678,8 @@
           "status",
           "instructions",
           "prTypes",
-          "examples"
+          "examples",
+          "rubricVersion"
         ],
         "properties": {
           "jobId": {
@@ -1402,26 +1720,14 @@
           },
           "instructions": {
             "type": "string",
-            "description": "How to review, in markdown."
+            "description": "How to review and how to write the review, in markdown, followed by the repository's default rubric when it has one."
           },
           "prTypes": {
             "type": "array",
-            "description": "The kinds of pull request the repository's rubrics tell apart; empty for now.",
             "items": {
-              "type": "object",
-              "required": [
-                "name",
-                "description"
-              ],
-              "properties": {
-                "name": {
-                  "type": "string"
-                },
-                "description": {
-                  "type": "string"
-                }
-              }
-            }
+              "$ref": "#/components/schemas/PrType"
+            },
+            "description": "The repository's pull request types, each with its rubric and categories: the agent picks the one that fits, reviews by its rubric and files its comments under its categories. Empty when the rubric names none."
           },
           "examples": {
             "type": "array",
@@ -1441,6 +1747,165 @@
                 }
               }
             }
+          },
+          "rubricVersion": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "The version of the rubric document these come from; 0 when the repository has none."
+          }
+        }
+      },
+      "Category": {
+        "type": "object",
+        "required": [
+          "name",
+          "description"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100
+          },
+          "description": {
+            "type": "string"
+          }
+        },
+        "description": "Fields this build does not know are kept as they are and written back, a `PUT` of the document included."
+      },
+      "PrType": {
+        "type": "object",
+        "required": [
+          "name",
+          "description",
+          "rubric",
+          "categories"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100,
+            "description": "Unique in the document; what a submission's `prType` names."
+          },
+          "description": {
+            "type": "string",
+            "description": "When the type applies: what the agent picks the type by."
+          },
+          "rubric": {
+            "type": "string",
+            "description": "How to review a pull request of this type, in markdown, on top of the default rubric. At most 65536 bytes."
+          },
+          "categories": {
+            "type": "array",
+            "maxItems": 50,
+            "items": {
+              "$ref": "#/components/schemas/Category"
+            },
+            "description": "What a comment of a review of this type is filed under. Names are unique within the type."
+          }
+        },
+        "description": "Fields this build does not know are kept as they are and written back, a `PUT` of the document included."
+      },
+      "RubricDocument": {
+        "type": "object",
+        "required": [
+          "owner",
+          "name",
+          "version",
+          "createdAt",
+          "defaultRubric",
+          "prTypes",
+          "documentError"
+        ],
+        "description": "One version of a repository's rubric document. Fields this build does not know are kept as they are and written back, a `PUT` of the document included.",
+        "properties": {
+          "owner": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "version": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "1 for the first document and one more for each change; 0 for a repository that has none yet."
+          },
+          "createdAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When this version was written; null for version 0."
+          },
+          "defaultRubric": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "How to review any pull request of the repository, in markdown; given to the agent in its `instructions`. At most 65536 bytes. Null only with `documentError`."
+          },
+          "prTypes": {
+            "oneOf": [
+              {
+                "type": "array",
+                "maxItems": 50,
+                "items": {
+                  "$ref": "#/components/schemas/PrType"
+                }
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The kinds of pull request the repository's reviews tell apart. Null only with `documentError`."
+          },
+          "documentError": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why this build cannot read the stored document, when it cannot. The agent API then refuses the repository's reviews (`409`) rather than review without the rubric."
+          }
+        }
+      },
+      "Revision": {
+        "type": "object",
+        "required": [
+          "jobId",
+          "version",
+          "author",
+          "review",
+          "reviewError",
+          "createdAt"
+        ],
+        "description": "One write of a job's review.",
+        "properties": {
+          "jobId": {
+            "type": "string"
+          },
+          "version": {
+            "type": "integer",
+            "description": "The job's version the write made."
+          },
+          "author": {
+            "type": "string",
+            "description": "`agent` (the submission), `person` (an edit) or `github` (what GitHub holds once posted: the job's review with GitHub's body, without the marker, and the event it was posted as when known)."
+          },
+          "review": {
+            "description": "The review as written, as the JSON stored; not reinterpreted by this build."
+          },
+          "reviewError": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why the stored review is not JSON, when it is not."
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
           }
         }
       }

@@ -4,10 +4,13 @@ A platform for agentic reviews of GitHub pull requests (taxis #588), grown out o
 tool. Agents draft reviews; you read and edit them against the diff, approve them, and they are
 posted to the pull request under your name.
 
-It is built in milestones. The first two are here:
+It is built in milestones. The first three are here:
 
 - **A review format** (`DiffReviewer/Types.lean`): a decision (comment, approve, request changes),
-  a summary, and at most 200 inline comments on file line ranges with optional suggestions.
+  a summary, and at most 200 inline comments on file line ranges with optional suggestions. Each
+  comment has a stable `id`, and may have a `category` and a `severity` (see
+  [Rubrics](#rubrics)). Fields the platform does not know, on a review or a comment, are kept as
+  they are.
 - **The platform server** (`diff-reviewer serve`): a REST API over a SQLite database, holding the
   repositories it reviews and one *job* per review of a pull request at one head commit. A job
   moves `pending → queued → running → draft → approved → posted`; `rejected` is a discarded draft,
@@ -20,8 +23,10 @@ It is built in milestones. The first two are here:
   orchestra run if it has one; *queueing* checks a `pending` job's head is still the pull
   request's, fetches its diff (past `--max-diff-bytes` the job `failed`s) and puts it on
   [orchestra](https://github.com/chrisflav/orchestra) as an API client; *following* reads the
-  queue entry and moves the job to `running`, or to `failed` when the run ends without a review.
-  Kept diffs no live job needs, and any older than 30 days, are dropped.
+  queue entry and moves the job to `running`, or to `failed` when the run ends without a review;
+  *settling* settles every claim to post that is past its window, as
+  `POST /api/v1/jobs/{id}/reconcile` would, and logs what it found. Kept diffs no live job needs,
+  and any older than 30 days, are dropped.
 - **The agent API** (`/api/agent/v1/repos/{owner}/{name}/pulls/{pr}…`) and **the agent CLI**
   (`diff-reviewer agent show|diff|submit … --job <id>`): what the reviewing agent reads and how
   it submits. A submission is checked as GitHub would check it — its comments must be on the
@@ -39,13 +44,27 @@ It is built in milestones. The first two are here:
   as GitHub holds it (`postedReview`) rather than posted again. `POST /api/v1/jobs/{id}/reconcile`
   does only that check, without posting: found, the job is `posted`; not found once the claim's
   window has passed, the claim is cleared and the job is free to be edited, rejected or go stale.
+  The workers make the same check on every pass, so a claim is settled even when nobody asks — in
+  a `direct` repository nobody may. There, a review the platform posted that is found not to have
+  reached GitHub is posted again, as a comment — but only if the pull request is still open at the
+  job's head (otherwise the job is `stale`), and at most 3 posts by the platform in all; after that
+  it is left `approved`, with why in its `error`, for a person to post. A post a person starts is
+  never posted again by the platform, and does not count.
+- **Rubrics** (`/api/v1/repos/{owner}/{name}/rubrics`): per repository, a default rubric and the
+  kinds of pull request its reviews tell apart, each with its own rubric and categories, which the
+  agent reviews by. See [Rubrics](#rubrics).
+- **A review's history** (`GET /api/v1/jobs/{id}/revisions`): every write of a job's review — the
+  agent's submission, each edit, and what GitHub holds once it is posted — kept with who wrote it.
+  The agent's draft beside what was posted is what calibration will learn from. It is bounded: the
+  agent's first draft, every revision GitHub holds, and the last 100 are kept. It and the rubric
+  history are paged (`?limit=…&offset=…`, 50 by default).
 - **A web front-end** (`web/`): sign in, register repositories, request a review, read a review,
   edit it, approve or reject it. Every write names the version of the job it was made on, so a
   stale page is refused rather than overwriting.
 - **The command-line tools** it started as: `diff-reviewer github` posts a review JSON to a pull
   request, and `diff-reviewer from-git` turns a commit range into one.
 
-Next: rubrics (M2), calibration from past human reviews, and learned review style.
+Next: calibration from past human reviews, and learned review style.
 
 ## Running it
 
@@ -146,6 +165,67 @@ The platform holds no real credential of GitHub, and agents hold none of the pla
   `diff-reviewer-poster` grant injects the operator's PAT for reading pull requests and posting
   reviews on the repositories it lists, so approved reviews appear under your own name.
 
+## Rubrics
+
+A repository's rubric is one document, `GET`/`PUT /api/v1/repos/{owner}/{name}/rubrics`:
+
+```json
+{
+  "version": 3,
+  "defaultRubric": "Proofs must not use `sorry`. Prefer `simp only` in the middle of a proof.",
+  "prTypes": [
+    {
+      "name": "feature",
+      "description": "Adds new definitions or theorems.",
+      "rubric": "Check the names against the naming convention, and that every new definition has a docstring and the API a user needs.",
+      "categories": [
+        {"name": "correctness", "description": "Wrong, or proves the wrong thing."},
+        {"name": "naming", "description": "Against the naming convention."},
+        {"name": "docs", "description": "Missing or misleading documentation."}
+      ]
+    },
+    {"name": "refactor", "description": "Moves or renames without changing what is proved.",
+     "rubric": "Check that nothing is lost and that deprecations are added.", "categories": []}
+  ]
+}
+```
+
+- **What to write.** The *default rubric* is what every review of the repository should look at:
+  the conventions a maintainer checks first, what the repository cares about and what it does not.
+  A *pull request type* is a kind of change that is reviewed differently: its `description` says
+  how to recognise it — the agent picks the type by it — and its `rubric` says what to look at in
+  such a change, on top of the default. Its *categories* are what its comments are filed under:
+  short names (`correctness`, `naming`, `performance`), with a description of what belongs in each.
+  Rubrics are markdown and go to the agent as they are, so write them as you would brief a careful
+  new maintainer: concrete checks, not adjectives.
+- **How agents use them.** `agent show` gives the agent the default rubric at the end of its
+  `instructions`, and the types in `prTypes`, each with its rubric and categories. The agent picks
+  the type that fits, reviews by its rubric, and gives every comment a `severity` — `nit`,
+  `minor`, `major` or `blocker` — and a `category`. Its submission must name one of the types as
+  `prType` (or `null` when there are none), and each category must be one of that type's — or
+  is free text when that type lists none: the platform refuses anything else, saying what to fix,
+  while the agent can still fix it. A person's edit is checked the same way, for the comments
+  whose category it adds or changes; a job of no type (reviewed by hand) may use any category of
+  the document, or free text if it names none. A job reviewed with no rubric at all records
+  `rubricVersion` 0.
+- **Versions.** Every `PUT` names the version it replaces (`0` for the first) and is refused
+  (`409`) if that is no longer the current one; it becomes the next version, and every version is
+  kept (`GET …/rubrics/history`). A job records the version and the type it was reviewed against
+  (`rubricVersion`, `prType`), so a review is always read next to the rubric it was written to.
+  Fields the platform does not know, on the document, a type or a category, are kept through every
+  write, so a newer front-end's additions survive an older platform; and a `GET`'s answer may be
+  sent back as the next `PUT` as it is, edited. A version this build cannot read is shown with its
+  `documentError` and is not overwritten (`409`). Deleting a repository keeps its rubric versions,
+  as it keeps its jobs, which name them: registering it again picks its rubric up where it was.
+- **Not on GitHub.** Categories and severities are for the platform — reading, filtering, and
+  calibration later — and are not part of what is posted: a posted review stays in the operator's
+  plain style. (To be revisited with learned review style, M4.)
+
+Every inline comment has an `id`, short and random, unique within its review: the platform gives
+one to each comment written without one, when the review is submitted or edited, and keeps the ones
+comments have — so keep them when editing, and a comment can be followed from the agent's draft to
+what was posted. A review stored before ids existed gets them on its next write, never on a read.
+
 ## Tests
 
 ```sh
@@ -156,7 +236,10 @@ The suite covers the review format, the job transitions, that the migrations bui
 schema and bring an old database up to date, the credentials (each reaches only its own routes)
 and the login rate limit per address, a review's whole life over the API, the workers —
 discovery, its cap and cancellations, queueing, following, posting once whatever GitHub answers,
-direct mode — against a fake GitHub and a fake orchestra, the checks of a review against its diff,
+direct mode, settling claims on their own and posting a direct review again at most three times —
+against a fake GitHub and a fake orchestra, rubrics and their versions, the agent's submission
+checked against them, comment ids and unknown fields kept through every round trip (of reviews and
+rubrics), the history of a review from draft to post, the checks of a review against its diff,
 the agent CLI against the server on loopback, and that `docs/openapi.json` documents exactly the
 routes the server answers. Nothing in it reaches the network.
 

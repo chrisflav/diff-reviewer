@@ -66,6 +66,11 @@ queue_entry, review, version, created_at, updated_at) VALUES ('j1', 'acme', 'wid
     ++ check (repos.all (·.mode == .direct)) "the old mode"
     ++ checkEq job.version 3 "the old job's version"
     ++ checkEq job.attempts 0 "no attempts for an old job"
+    ++ checkEq job.rubricVersion none "no rubric version: reviewed before rubrics"
+    ++ checkEq job.directPosts 0 "no posts by the platform"
+    ++ checkEq job.postDirect false "no post of the platform's to make again"
+    ++ checkEq (← Platform.revisions "j1").size 0 "no history"
+    ++ check (← Platform.currentRubric "acme" "widgets").isNone "no rubric"
 
 def all : List (String × Test) :=
   [("reviewRoundTrips", reviewRoundTrips),

@@ -39,6 +39,11 @@ export type JobStatus =
 
 export type Decision = "comment" | "approve" | "request_changes";
 
+/** How much a comment matters, from least to most. */
+export type Severity = "nit" | "minor" | "major" | "blocker";
+
+export const severities: Severity[] = ["nit", "minor", "major", "blocker"];
+
 export interface Repo {
   owner: string;
   name: string;
@@ -59,6 +64,11 @@ export interface InlineComment {
   end_line: number;
   body: string;
   suggestion?: string;
+  /** Stable within the review; the server assigns one on write when absent. Keep it on edits. */
+  id?: string;
+  /** One of the rubric's categories for the job's pull request type, or free text without any. */
+  category?: string;
+  severity?: Severity;
   [field: string]: unknown;
 }
 
@@ -67,6 +77,53 @@ export interface Review {
   body: string;
   comments: InlineComment[];
   [field: string]: unknown;
+}
+
+/**
+ * Rubric documents, like reviews, keep the fields this client does not know: edit what was read
+ * (spread it) rather than rebuild it, and the server keeps the rest.
+ */
+export interface Category {
+  name: string;
+  description: string;
+  [field: string]: unknown;
+}
+
+export interface PrType {
+  name: string;
+  /** When the type applies: what the agent picks it by. */
+  description: string;
+  /** How to review a pull request of this type, in markdown, on top of the default rubric. */
+  rubric: string;
+  categories: Category[];
+  [field: string]: unknown;
+}
+
+/** One version of a repository's rubric document. */
+export interface RubricDocument {
+  owner: string;
+  name: string;
+  /** 0 for a repository with no rubric yet; sent back with the next write. */
+  version: number;
+  createdAt: string | null;
+  /** Null only when `documentError` says why the stored document cannot be read. */
+  defaultRubric: string | null;
+  prTypes: PrType[] | null;
+  documentError: string | null;
+  [field: string]: unknown;
+}
+
+/** One write of a job's review. */
+export interface Revision {
+  jobId: string;
+  /** The job's version the write made. */
+  version: number;
+  /** `agent`, `person` or `github` (what GitHub holds once posted). */
+  author: "agent" | "person" | "github" | string;
+  /** The review as stored, not reinterpreted. */
+  review: unknown;
+  reviewError: string | null;
+  createdAt: string;
 }
 
 export interface Job {
@@ -103,6 +160,12 @@ export interface Job {
   postNote: string | null;
   /** The review as GitHub holds it, once posted. */
   postedReview: { id: number; url: string; body: string } | null;
+  /** The rubric version the review was checked against: 0 for none, null from before rubrics. */
+  rubricVersion: number | null;
+  /** How many times the platform has posted the review on its own (`direct`), at most 3. */
+  directPosts: number;
+  /** Whether the last post was the platform's own, which it may post again. */
+  postDirect: boolean;
 }
 
 export interface JobDiff {
@@ -183,7 +246,40 @@ export const api = {
   /** Post an approved review to GitHub, under the operator's account; the job becomes `posted`. */
   post: (id: string, version: number) =>
     request<Job>("POST", `/api/v1/jobs/${seg(id)}/post`, { version }),
+  /** One page of the writes of the job's review, oldest first. */
+  revisions: (id: string, limit = 50, offset = 0) =>
+    request<Page<Revision>>("GET", `/api/v1/jobs/${seg(id)}/revisions?${pageQuery(limit, offset)}`),
+
+  rubrics: (owner: string, name: string) =>
+    request<RubricDocument>("GET", `/api/v1/repos/${seg(owner)}/${seg(name)}/rubrics`),
+  /** Replace the whole document; `version` is the one last read (0 for none). */
+  putRubrics: (
+    owner: string,
+    name: string,
+    version: number,
+    doc: { defaultRubric: string; prTypes: PrType[]; [field: string]: unknown },
+  ) =>
+    request<RubricDocument>("PUT", `/api/v1/repos/${seg(owner)}/${seg(name)}/rubrics`, {
+      version,
+      ...doc,
+    }),
+  /** One page of the versions of the document, newest first. */
+  rubricHistory: (owner: string, name: string, limit = 50, offset = 0) =>
+    request<Page<RubricDocument>>(
+      "GET",
+      `/api/v1/repos/${seg(owner)}/${seg(name)}/rubrics/history?${pageQuery(limit, offset)}`,
+    ),
 };
+
+/** One page of a history; `nextOffset` is null on the last. */
+export interface Page<T> {
+  items: T[];
+  nextOffset: number | null;
+}
+
+function pageQuery(limit: number, offset: number): string {
+  return `limit=${Math.trunc(limit)}&offset=${Math.trunc(offset)}`;
+}
 
 /** One path segment, encoded, so that a `/`, `?` or `#` in it cannot change the path. */
 function seg(s: string): string {
