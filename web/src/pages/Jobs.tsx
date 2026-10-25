@@ -1,13 +1,11 @@
 import { useCallback, useState, type FormEvent } from "react";
 import { Link } from "react-router-dom";
 import { api, UnauthorizedError, type Job, type Repo } from "../api";
+import { countSeverity } from "../review";
 import { useLoad } from "../useLoad";
 
 export function JobsPage({ onUnauthorized }: { onUnauthorized: () => void }) {
-  const fetchAll = useCallback(
-    () => Promise.all([api.jobs(), api.repos()]),
-    [],
-  );
+  const fetchAll = useCallback(() => Promise.all([api.jobs(), api.repos()]), []);
   const { data, error, reload, setError } = useLoad(fetchAll, onUnauthorized);
   const [repo, setRepo] = useState("");
   const [pr, setPr] = useState("");
@@ -81,33 +79,64 @@ export function JobsPage({ onUnauthorized }: { onUnauthorized: () => void }) {
       ) : jobs.length === 0 ? (
         <p className="mute">No reviews yet.</p>
       ) : (
-        <table>
-          <thead>
-            <tr>
-              <th>Pull request</th>
-              <th>Status</th>
-              <th>Comments</th>
-              <th>Updated</th>
-            </tr>
-          </thead>
-          <tbody>
-            {jobs.map((j) => (
-              <tr key={j.id}>
-                <td>
-                  <Link to={`/jobs/${j.id}`}>
-                    {j.owner}/{j.name}#{j.prNumber}
-                  </Link>
-                </td>
-                <td>
-                  <span className={`status s-${j.status}`}>{j.status}</span>
-                </td>
-                <td className="data">{j.review?.comments.length ?? "—"}</td>
-                <td className="data mute">{j.updatedAt}</td>
+        <div className="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>Pull request</th>
+                <th>Status</th>
+                <th>Type</th>
+                <th>Comments</th>
+                <th>
+                  Blocker<span className="sr-only">s</span> / major
+                </th>
+                <th>Updated</th>
               </tr>
-            ))}
-          </tbody>
-        </table>
+            </thead>
+            <tbody>
+              {jobs.map((j) => (
+                <tr key={j.id}>
+                  <td>
+                    <Link to={`/jobs/${j.id}`}>
+                      {j.owner}/{j.name}#{j.prNumber}
+                    </Link>
+                  </td>
+                  <td>
+                    <span className={`status s-${j.status}`}>{j.status}</span>
+                  </td>
+                  <td>{j.prType ?? <span className="mute">—</span>}</td>
+                  <td className="data">{j.review?.comments.length ?? "—"}</td>
+                  <td className="data">
+                    {j.review === null ? (
+                      "—"
+                    ) : (
+                      <SeverityCounts
+                        blocker={countSeverity(j.review, "blocker")}
+                        major={countSeverity(j.review, "major")}
+                      />
+                    )}
+                  </td>
+                  <td className="data mute">{j.updatedAt}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       )}
     </>
+  );
+}
+
+/** How many blockers and majors a review carries, said in words as well as numbers. */
+function SeverityCounts({ blocker, major }: { blocker: number; major: number }) {
+  return (
+    <span className={blocker > 0 ? "counts-sev has-blocker" : "counts-sev"}>
+      <span aria-hidden="true">
+        {blocker} / {major}
+      </span>
+      <span className="sr-only">
+        {blocker} {blocker === 1 ? "blocker" : "blockers"}, {major} major
+      </span>
+    </span>
   );
 }

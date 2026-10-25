@@ -215,7 +215,8 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
 
 export const api = {
   session: () => request<{ authenticated: boolean }>("GET", "/api/session"),
-  login: (password: string) => request<{ authenticated: boolean }>("POST", "/api/login", { password }),
+  login: (password: string) =>
+    request<{ authenticated: boolean }>("POST", "/api/login", { password }),
   /** Sign in with the API token: never rate-limited, the way in while password attempts are not. */
   loginWithToken: (token: string) =>
     request<{ authenticated: boolean }>("POST", "/api/login", { token }),
@@ -231,9 +232,11 @@ export const api = {
   jobs: () => request<{ items: Job[] }>("GET", "/api/v1/jobs").then((r) => r.items),
   job: (id: string) => request<Job>("GET", `/api/v1/jobs/${seg(id)}`),
   createJob: (owner: string, name: string, prNumber: number, headSha: string | null) =>
-    request<Job>("POST", "/api/v1/jobs", headSha === null
-      ? { owner, name, prNumber }
-      : { owner, name, prNumber, headSha }),
+    request<Job>(
+      "POST",
+      "/api/v1/jobs",
+      headSha === null ? { owner, name, prNumber } : { owner, name, prNumber, headSha },
+    ),
   putReview: (id: string, version: number, review: Review) =>
     request<Job>("PUT", `/api/v1/jobs/${seg(id)}/review`, { version, review }),
   setStatus: (id: string, version: number, status: JobStatus) =>
@@ -269,6 +272,28 @@ export const api = {
       "GET",
       `/api/v1/repos/${seg(owner)}/${seg(name)}/rubrics/history?${pageQuery(limit, offset)}`,
     ),
+
+  /**
+   * Version `version` of the document: the current one, or found in the history, which is newest
+   * first and numbered without gaps, so that `current - version` is where to look first.
+   */
+  rubricAt: async (owner: string, name: string, version: number): Promise<RubricDocument> => {
+    const now = await api.rubrics(owner, name);
+    if (now.version === version) return now;
+    const guess = now.version - version;
+    if (guess > 0) {
+      const page = await api.rubricHistory(owner, name, 1, guess);
+      const hit = page.items.find((v) => v.version === version);
+      if (hit !== undefined) return hit;
+    }
+    for (let offset: number | null = 0; offset !== null;) {
+      const page: Page<RubricDocument> = await api.rubricHistory(owner, name, 200, offset);
+      const hit = page.items.find((v) => v.version === version);
+      if (hit !== undefined) return hit;
+      offset = page.nextOffset;
+    }
+    throw new ApiError(404, `${owner}/${name} has no rubric version ${version}`);
+  },
 };
 
 /** One page of a history; `nextOffset` is null on the last. */

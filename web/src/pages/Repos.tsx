@@ -1,4 +1,5 @@
 import { useEffect, useState, type FormEvent } from "react";
+import { Link } from "react-router-dom";
 import { api, UnauthorizedError, type PostingMode, type Repo } from "../api";
 import { useLoad } from "../useLoad";
 
@@ -67,42 +68,55 @@ export function ReposPage({ onUnauthorized }: { onUnauthorized: () => void }) {
       ) : repos.length === 0 ? (
         <p className="mute">No repositories yet.</p>
       ) : (
-        <table>
-          <thead>
-            <tr>
-              <th>Repository</th>
-              <th>Posting</th>
-              <th>Automatic</th>
-              <th>Registered</th>
-              <th />
-            </tr>
-          </thead>
-          <tbody>
-            {repos.map((r) => (
-              <tr key={`${r.owner}/${r.name}`}>
-                <td className="data">
-                  {r.owner}/{r.name}
-                </td>
-                <td>{r.mode}</td>
-                <td>
-                  <AutoReviewToggle repo={r} onChanged={reload} onError={fail} />
-                </td>
-                <td className="data mute">{r.createdAt}</td>
-                <td className="right">
-                  <button
-                    className="ghost"
-                    onClick={() => {
-                      if (window.confirm(`Unregister ${r.owner}/${r.name}? Its reviews are kept.`))
-                        api.deleteRepo(r.owner, r.name).then(reload).catch(fail);
-                    }}
-                  >
-                    Unregister
-                  </button>
-                </td>
+        <div className="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>Repository</th>
+                <th>Posting</th>
+                <th>Automatic</th>
+                <th>Rubric</th>
+                <th>Registered</th>
+                <th />
               </tr>
-            ))}
-          </tbody>
-        </table>
+            </thead>
+            <tbody>
+              {repos.map((r) => (
+                <tr key={`${r.owner}/${r.name}`}>
+                  <td className="data">
+                    {r.owner}/{r.name}
+                  </td>
+                  <td>{r.mode}</td>
+                  <td>
+                    <AutoReviewToggle repo={r} onChanged={reload} onError={fail} />
+                  </td>
+                  <td>
+                    <Link
+                      to={`/repos/${encodeURIComponent(r.owner)}/${encodeURIComponent(r.name)}/rubric`}
+                      aria-label={`Rubric of ${r.owner}/${r.name}`}
+                    >
+                      Rubric
+                    </Link>
+                  </td>
+                  <td className="data mute">{r.createdAt}</td>
+                  <td className="right">
+                    <button
+                      className="ghost"
+                      onClick={() => {
+                        if (
+                          window.confirm(`Unregister ${r.owner}/${r.name}? Its reviews are kept.`)
+                        )
+                          api.deleteRepo(r.owner, r.name).then(reload).catch(fail);
+                      }}
+                    >
+                      Unregister
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       )}
     </>
   );

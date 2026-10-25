@@ -4,6 +4,7 @@ import { api, ApiError, NetworkError, UnauthorizedError } from "./api";
 import { JobsPage } from "./pages/Jobs";
 import { JobPage } from "./pages/Job";
 import { ReposPage } from "./pages/Repos";
+import { RubricPage } from "./pages/Rubric";
 import { UnsavedContext } from "./unsaved";
 
 type AuthState = "checking" | "unreachable" | "signedOut" | "signedIn";
@@ -23,7 +24,9 @@ export function App() {
 
   if (auth === "checking") return <div className="center mute">…</div>;
   if (auth === "unreachable")
-    return <div className="center error">The server could not be reached. Reload to try again.</div>;
+    return (
+      <div className="center error">The server could not be reached. Reload to try again.</div>
+    );
   if (auth === "signedOut") return <Login onSignedIn={() => setAuth("signedIn")} />;
 
   return <SignedIn onUnauthorized={onUnauthorized} onSignedOut={() => setAuth("signedOut")} />;
@@ -46,6 +49,10 @@ function SignedIn({
           { path: "/", element: <JobsPage onUnauthorized={onUnauthorized} /> },
           { path: "/jobs/:id", element: <JobPage onUnauthorized={onUnauthorized} /> },
           { path: "/repos", element: <ReposPage onUnauthorized={onUnauthorized} /> },
+          {
+            path: "/repos/:owner/:name/rubric",
+            element: <RubricPage onUnauthorized={onUnauthorized} />,
+          },
           { path: "*", element: <p className="mute">Nothing here.</p> },
         ],
       },

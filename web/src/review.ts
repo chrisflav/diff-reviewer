@@ -4,8 +4,9 @@
  * Pure functions only, so that what the page shows can be checked without a browser.
  */
 
-import type { Decision, InlineComment, Review } from "./api";
+import { severities, type Decision, type InlineComment, type Review, type Severity } from "./api";
 import { displayPath, type DiffFile } from "./diff";
+import { blankAscii, charLength } from "./text";
 
 /**
  * The key a comment is known by while the page edits it. A symbol, so that it can never clash
@@ -47,9 +48,14 @@ export function nextKey(r: LocalReview): number {
 
 /**
  * `old` with the fields a form edits replaced by `edited`'s, and the rest kept. A suggestion
- * turned off is removed, not left behind.
+ * turned off is removed, not left behind. With `classified`, the form edited the category and
+ * severity too, and one it left empty is removed; without, they are kept as they were.
  */
-export function mergeComment(old: LocalComment, edited: InlineComment): LocalComment {
+export function mergeComment(
+  old: LocalComment,
+  edited: InlineComment,
+  classified = false,
+): LocalComment {
   const out: LocalComment = {
     ...old,
     file: edited.file,
@@ -57,8 +63,13 @@ export function mergeComment(old: LocalComment, edited: InlineComment): LocalCom
     end_line: edited.end_line,
     body: edited.body,
   };
-  if (edited.suggestion === undefined) delete out.suggestion;
-  else out.suggestion = edited.suggestion;
+  const fields = classified
+    ? (["suggestion", "category", "severity"] as const)
+    : (["suggestion"] as const);
+  for (const f of fields) {
+    if (edited[f] === undefined) delete out[f];
+    else (out as Record<string, unknown>)[f] = edited[f];
+  }
   return out;
 }
 
@@ -453,8 +464,16 @@ export function commentProblem(c: InlineComment): string | null {
   if (!Number.isInteger(c.end_line) || c.end_line < c.start_line)
     return "The last line is before the first.";
   if (c.body.trim() === "" && c.suggestion === undefined) return "The comment says nothing.";
+  if (
+    c.category !== undefined &&
+    (blankAscii(c.category) || charLength(c.category) > MAX_CATEGORY_LENGTH)
+  )
+    return `The category must be 1 to ${MAX_CATEGORY_LENGTH} characters.`;
   return null;
 }
+
+/** The longest category a comment may carry, a rubric's or free text; mirrors Lean's. */
+export const MAX_CATEGORY_LENGTH = 100;
 
 /** The most inline comments a review may carry; mirrors `maxInlineComments` in Lean. */
 export const MAX_COMMENTS = 200;
@@ -500,6 +519,14 @@ export function parseReview(text: string, validate = true): Review | string {
     if (typeof c.body !== "string") return `${at}: "body" must be a string.`;
     if (c.suggestion !== undefined && c.suggestion !== null && typeof c.suggestion !== "string")
       return `${at}: "suggestion" must be a string.`;
+    if (c.category !== undefined && c.category !== null && typeof c.category !== "string")
+      return `${at}: "category" must be a string.`;
+    if (
+      c.severity !== undefined &&
+      c.severity !== null &&
+      !severities.includes(c.severity as Severity)
+    )
+      return `${at}: "severity" must be one of ${severities.join(", ")}.`;
     const out: InlineComment = {
       ...c,
       file: c.file,
@@ -509,6 +536,8 @@ export function parseReview(text: string, validate = true): Review | string {
     };
     // `null` is how some writers say "none"; the server reads it so too.
     if (typeof c.suggestion !== "string") delete out.suggestion;
+    if (typeof c.category !== "string") delete out.category;
+    if (typeof c.severity !== "string") delete out.severity;
     comments.push(out);
   }
   const review: Review = { ...j, decision: j.decision as Decision, body: j.body, comments };
@@ -579,4 +608,57 @@ export function commentsIn(p: Placement, f: DiffFile): number {
 
 export function rangeLabel(c: { start_line: number; end_line: number }): string {
   return c.start_line === c.end_line ? `line ${c.end_line}` : `lines ${c.start_line}–${c.end_line}`;
+}
+
+/** A severity's rank, from 0 (`nit`) to 3 (`blocker`); -1 for a comment without one. */
+export function severityRank(s: unknown): number {
+  return severities.indexOf(s as Severity);
+}
+
+/** How many of `r`'s comments carry severity `s`. */
+export function countSeverity(r: Review | null, s: Severity): number {
+  return r === null ? 0 : r.comments.filter((c) => c.severity === s).length;
+}
+
+export interface CommentFilter {
+  /** The severities shown; empty shows all. "none" stands for a comment without one. */
+  severities: (Severity | "none")[];
+  /** The category shown, "" for all, or `null` for comments without one. */
+  category: string | null;
+}
+
+export type CommentSort = "place" | "severity" | "category";
+
+/** The comments `f` lets through, in the order `by` puts them. Review order breaks ties. */
+export function filterComments<C extends InlineComment>(
+  cs: C[],
+  f: CommentFilter,
+  by: CommentSort,
+): C[] {
+  const kept = cs.filter((c) => {
+    const s = severityRank(c.severity) < 0 ? "none" : (c.severity as Severity);
+    if (f.severities.length > 0 && !f.severities.includes(s)) return false;
+    if (f.category === null) return c.category === undefined;
+    return f.category === "" || c.category === f.category;
+  });
+  const at = new Map(cs.map((c, i) => [c, i]));
+  const order = (a: C, b: C): number => {
+    if (by === "severity") {
+      const d = severityRank(b.severity) - severityRank(a.severity);
+      if (d !== 0) return d;
+    } else if (by === "category") {
+      // Comments without a category last.
+      const [x, y] = [a.category, b.category];
+      if (x !== y) {
+        if (x === undefined) return 1;
+        if (y === undefined) return -1;
+        return x < y ? -1 : 1;
+      }
+    }
+    if (by !== "place") return (at.get(a) ?? 0) - (at.get(b) ?? 0);
+    if (a.file !== b.file) return a.file < b.file ? -1 : 1;
+    if (a.end_line !== b.end_line) return a.end_line - b.end_line;
+    return (at.get(a) ?? 0) - (at.get(b) ?? 0);
+  };
+  return [...kept].sort(order);
 }

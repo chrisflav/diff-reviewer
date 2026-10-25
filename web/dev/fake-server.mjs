@@ -15,9 +15,16 @@
  *     curl -X POST '127.0.0.1:8091/__fake/post?outcome=hang' # next post: ok, refuse or hang
  *
  * A claim (a post that may have reached GitHub) is settled by "Check GitHub" as found, posted.
+ *
+ * Rubrics are versioned per repository as the real server keeps them (`chrisflav/diff-reviewer`
+ * has two versions; `chrisflav/unreadable` has one this build "cannot read"), and every write of
+ * a job's review is kept in its history. To try a 409 on the rubric page, save from another tab:
+ *
+ *     curl -X POST 127.0.0.1:8091/__fake/rubric-bump    # someone else saves a new version
  */
 
 import { createServer } from "node:http";
+import { randomBytes } from "node:crypto";
 
 const port = Number(process.env.PORT ?? 8091);
 let signedIn = true;
@@ -88,15 +95,20 @@ const review = {
       start_line: 9,
       end_line: 9,
       body: '`Decision.ofJson` does not read "dismiss" yet.',
-      // Fields a newer build writes, which this front-end must pass through untouched.
+      id: "c0ffee01",
       category: "correctness",
       severity: "major",
+      // A field a newer build writes, which this front-end must pass through untouched.
+      confidence: 0.8,
     },
     {
       file: "DiffReviewer/Types.lean",
       start_line: 44,
       end_line: 46,
       body: "The trailing comma moved; keep the list aligned.",
+      id: "c0ffee02",
+      category: "style",
+      severity: "nit",
       suggestion:
         '    ("start_line", c.range.startLine),\n    ("end_line",   c.range.endLine),\n    ("body",       c.body)',
     },
@@ -105,17 +117,23 @@ const review = {
       start_line: 2,
       end_line: 43,
       body: "This range starts in the first hunk and ends in the second.",
+      id: "c0ffee03",
+      severity: "blocker",
+      category: "<b>correctness</b>",
     },
     {
       file: "DiffReviewer/Platform.lean",
       start_line: 120,
       end_line: 121,
       body: "This file is not in the diff, so this comment is listed apart.",
+      id: "c0ffee04",
+      severity: "minor",
     },
   ],
 };
 
 const jobs = new Map();
+const revisions = new Map();
 for (const [id, status, prNumber, r] of [
   ["j-draft", "draft", 12, review],
   ["j-failed", "failed", 13, null],
@@ -124,6 +142,28 @@ for (const [id, status, prNumber, r] of [
     "approved",
     14,
     { ...review, decision: "comment", comments: review.comments.slice(0, 2) },
+  ],
+  [
+    "j-posted",
+    "posted",
+    15,
+    {
+      ...review,
+      decision: "comment",
+      body: "Two things before this goes in.\n\nThe new decision is not read yet.",
+      comments: [
+        { ...review.comments[0], severity: "blocker", body: "Not read by `Decision.ofJson`." },
+        {
+          file: "README.md",
+          start_line: 2,
+          end_line: 2,
+          body: "A script tag in the README.",
+          id: "c0ffee05",
+          category: "docs",
+          severity: "minor",
+        },
+      ],
+    },
   ],
 ]) {
   jobs.set(id, {
@@ -144,12 +184,168 @@ for (const [id, status, prNumber, r] of [
     prBody: "Adds `dismiss`.\n\n<script>alert('a PR body is text')</script>",
     error: status === "failed" ? "the run ended without a submission" : null,
     prType: status === "failed" ? null : "feature",
+    rubricVersion: status === "failed" ? null : status === "posted" ? 1 : 2,
+    directPosts: 0,
+    postDirect: false,
     attempts: status === "failed" ? 2 : 1,
     postStartedAt: null,
     postedUrl: null,
     postNote: null,
     postedReview: null,
   });
+  const job = jobs.get(id);
+  // The agent's draft, and for the posted job the edits and what GitHub holds.
+  const revs = [];
+  if (r !== null) revs.push(revision(job, 1, "agent", status === "posted" ? review : r));
+  if (status === "posted") {
+    revs.push(
+      revision(job, 2, "person", {
+        ...r,
+        comments: [r.comments[0], ...review.comments.slice(1, 3)],
+      }),
+    );
+    revs.push(revision(job, 3, "person", r));
+    revs.push(revision(job, 4, "github", { ...r, body: `${r.body}` }));
+    Object.assign(job, {
+      version: 4,
+      postedUrl: `https://github.com/chrisflav/diff-reviewer/pull/${prNumber}#pullrequestreview-2`,
+    });
+  }
+  revisions.set(id, revs);
+}
+
+function revision(job, version, author, r) {
+  return {
+    jobId: job.id,
+    version,
+    author,
+    review: structuredClone(r),
+    reviewError: null,
+    createdAt: new Date(Date.now() - (10 - version) * 60000).toISOString(),
+  };
+}
+
+// The rubric versions of each repository, oldest first.
+const featureType = {
+  name: "feature",
+  description: "Adds new definitions or theorems.",
+  rubric:
+    "Check the names against the naming convention, and that every new definition has a docstring.\n\n<script>alert('a rubric is text')</script>",
+  categories: [
+    { name: "correctness", description: "Wrong, or proves the wrong thing." },
+    { name: "naming", description: "Against the naming convention." },
+    { name: "style", description: "Formatting and layout." },
+  ],
+  // A field a newer front-end wrote: kept through every save.
+  colour: "green",
+};
+const rubrics = new Map([
+  [
+    "chrisflav/diff-reviewer",
+    [
+      {
+        createdAt: now(),
+        doc: { defaultRubric: "Proofs must not use `sorry`.", prTypes: [featureType] },
+      },
+      {
+        createdAt: now(),
+        doc: {
+          defaultRubric:
+            "Proofs must not use `sorry`.\nPrefer `simp only` in the middle of a proof.",
+          prTypes: [
+            {
+              ...featureType,
+              categories: [
+                ...featureType.categories,
+                { name: "docs", description: "Missing documentation." },
+              ],
+            },
+            {
+              name: "refactor",
+              description: "Moves or renames without changing what is proved.",
+              rubric: "Check that nothing is lost and that deprecations are added.",
+              categories: [],
+            },
+          ],
+          reviewers: ["kim"],
+        },
+      },
+    ],
+  ],
+  [
+    "chrisflav/unreadable",
+    [{ createdAt: now(), doc: null, documentError: "unknown field type 'weights'" }],
+  ],
+]);
+
+function rubricVersion(owner, name, i) {
+  const vs = rubrics.get(`${owner}/${name}`) ?? [];
+  const v = vs[i];
+  if (v === undefined)
+    return {
+      owner,
+      name,
+      version: 0,
+      createdAt: null,
+      defaultRubric: "",
+      prTypes: [],
+      documentError: null,
+    };
+  if (v.doc === null)
+    return {
+      owner,
+      name,
+      version: i + 1,
+      createdAt: v.createdAt,
+      defaultRubric: null,
+      prTypes: null,
+      documentError: v.documentError,
+    };
+  return { ...v.doc, owner, name, version: i + 1, createdAt: v.createdAt, documentError: null };
+}
+
+function currentRubric(owner, name) {
+  const vs = rubrics.get(`${owner}/${name}`) ?? [];
+  return rubricVersion(owner, name, vs.length - 1);
+}
+
+/** Why the document is refused, as `Rubric.validate` says it, or null. */
+function rubricProblem(d) {
+  if (typeof d.defaultRubric !== "string" || !Array.isArray(d.prTypes)) return "not a document";
+  if (d.prTypes.length > 50)
+    return `the document names ${d.prTypes.length} pull request types; at most 50`;
+  for (const [i, t] of d.prTypes.entries()) {
+    if (typeof t.name !== "string" || t.name.trim() === "")
+      return `pull request type ${i + 1} has an empty name`;
+    if (d.prTypes.filter((u) => u.name === t.name).length > 1)
+      return `two pull request types are called '${t.name}'`;
+    for (const [j, c] of (t.categories ?? []).entries()) {
+      if (typeof c.name !== "string" || c.name.trim() === "")
+        return `category ${j + 1} of '${t.name}' has an empty name`;
+      if (t.categories.filter((x) => x.name === c.name).length > 1)
+        return `'${t.name}' has two categories called '${c.name}'`;
+    }
+  }
+  return null;
+}
+
+/** `categoriesFor` of the rubric the job was reviewed against: empty is free text. */
+function allowedCategories(job) {
+  if (job.rubricVersion === 0) return [];
+  const vs = rubrics.get(`${job.owner}/${job.name}`) ?? [];
+  const v = job.rubricVersion === null ? vs[vs.length - 1] : vs[job.rubricVersion - 1];
+  const d = v?.doc;
+  if (d === undefined || d === null) return [];
+  const t = d.prTypes.find((x) => x.name === job.prType);
+  if (t !== undefined) return (t.categories ?? []).map((c) => c.name);
+  return [...new Set(d.prTypes.flatMap((x) => (x.categories ?? []).map((c) => c.name)))];
+}
+
+function page(items, url) {
+  const limit = Number(url.searchParams.get("limit") ?? 50);
+  const offset = Number(url.searchParams.get("offset") ?? 0);
+  const slice = items.slice(offset, offset + limit);
+  return { items: slice, nextOffset: offset + limit < items.length ? offset + limit : null };
 }
 
 const repos = new Map([
@@ -162,6 +358,10 @@ const repos = new Map([
       autoReview: false,
       createdAt: now(),
     },
+  ],
+  [
+    "chrisflav/unreadable",
+    { owner: "chrisflav", name: "unreadable", mode: "staged", autoReview: false, createdAt: now() },
   ],
 ]);
 // What the next post does: "ok", "refuse" (GitHub says no: 502 with the job) or "hang" (the post
@@ -183,7 +383,7 @@ function send(res, status, body) {
 
 function posted(job) {
   const url = `https://github.com/${job.owner}/${job.name}/pull/${job.prNumber}#pullrequestreview-1`;
-  return bump(job, {
+  const out = bump(job, {
     status: "posted",
     postStartedAt: null,
     error: null,
@@ -194,10 +394,13 @@ function posted(job) {
         : null,
     postedReview: { id: 1, url, body: job.review?.body ?? "" },
   });
+  revisions.get(job.id)?.push(revision(job, job.version, "github", job.review));
+  return out;
 }
 
-function bump(job, change) {
+function bump(job, change, author = null) {
   Object.assign(job, change, { version: job.version + 1, updatedAt: now() });
+  if (author !== null) revisions.get(job.id)?.push(revision(job, job.version, author, job.review));
   return job;
 }
 
@@ -230,6 +433,15 @@ createServer(async (req, res) => {
     return send(res, 200, {});
   }
   if (url.pathname === "/api/session") return send(res, 200, { authenticated: signedIn });
+  if (url.pathname === "/__fake/rubric-bump") {
+    const vs = rubrics.get("chrisflav/diff-reviewer");
+    const last = structuredClone(vs[vs.length - 1].doc);
+    last.defaultRubric += "\nSomeone else's line.";
+    const feature = last.prTypes.find((t) => t.name === "feature");
+    if (feature !== undefined) feature.description += " (Someone else's words.)";
+    vs.push({ createdAt: now(), doc: last });
+    return send(res, 200, {});
+  }
   if (url.pathname === "/__fake/post") {
     postOutcome = url.searchParams.get("outcome") ?? "ok";
     return send(res, 200, {});
@@ -247,6 +459,40 @@ createServer(async (req, res) => {
   if (!signedIn) return send(res, 401, { error: "unauthorized" });
   if (req.method !== "GET" && delay > 0) await new Promise((r) => setTimeout(r, delay));
   if (url.pathname === "/api/v1/repos") return send(res, 200, { items: [...repos.values()] });
+  if (parts[2] === "repos" && parts[5] === "rubrics") {
+    const [owner, name] = [parts[3].toLowerCase(), parts[4].toLowerCase()];
+    if (!repos.has(`${owner}/${name}`))
+      return send(res, 404, { error: `${owner}/${name} is not registered` });
+    const vs = rubrics.get(`${owner}/${name}`) ?? [];
+    if (parts[6] === "history" && req.method === "GET")
+      return send(res, 200, page(vs.map((_, i) => rubricVersion(owner, name, i)).reverse(), url));
+    if (parts.length === 6 && req.method === "GET")
+      return send(res, 200, currentRubric(owner, name));
+    if (parts.length === 6 && req.method === "PUT") {
+      if (body.version !== vs.length)
+        return send(res, 409, {
+          error: `the rubric of ${owner}/${name} is at version ${vs.length}, not ${body.version}`,
+        });
+      if (vs.length > 0 && vs[vs.length - 1].doc === null)
+        return send(res, 409, {
+          error: "the current version cannot be read by this build; it is left as it is",
+        });
+      const doc = { ...body };
+      for (const f of ["version", "owner", "name", "createdAt", "documentError"]) delete doc[f];
+      doc.defaultRubric ??= "";
+      doc.prTypes = (doc.prTypes ?? []).map((t) => ({
+        description: "",
+        rubric: "",
+        categories: [],
+        ...t,
+      }));
+      const why = rubricProblem(doc);
+      if (why !== null) return send(res, 400, { error: why });
+      vs.push({ createdAt: now(), doc });
+      rubrics.set(`${owner}/${name}`, vs);
+      return send(res, 200, currentRubric(owner, name));
+    }
+  }
   if (parts[2] === "repos" && parts.length === 5 && req.method === "PUT") {
     const key = `${parts[3]}/${parts[4]}`.toLowerCase();
     const repo = {
@@ -268,6 +514,7 @@ createServer(async (req, res) => {
     const action = parts[4];
     if (action === undefined) return send(res, 200, job);
     if (action === "diff") return send(res, 200, { headSha: job.headSha, diff });
+    if (action === "revisions") return send(res, 200, page(revisions.get(job.id) ?? [], url));
     if (body.version !== job.version)
       return send(res, 409, { error: `job ${job.id} is at version ${job.version}` });
     if (job.postStartedAt !== null && (action === "review" || action === "status"))
@@ -279,7 +526,19 @@ createServer(async (req, res) => {
         return send(res, 409, {
           error: `job ${job.id} is ${job.status}; its review is not edited now`,
         });
-      return send(res, 200, bump(job, { review: body.review, status: "draft" }));
+      const stored = job.review?.comments ?? [];
+      const allowed = allowedCategories(job);
+      for (const [i, c] of (body.review?.comments ?? []).entries()) {
+        const was = stored.find((x) => x.id !== undefined && x.id === c.id);
+        if (c.category === undefined || (was !== undefined && was.category === c.category))
+          continue;
+        if (allowed.length > 0 && !allowed.includes(c.category))
+          return send(res, 400, {
+            error: `'review': comment ${i + 1}: '${c.category}' is not a category of the rubric; it is one of ${allowed.join(", ")}`,
+          });
+      }
+      for (const c of body.review?.comments ?? []) c.id ??= randomBytes(4).toString("hex");
+      return send(res, 200, bump(job, { review: body.review, status: "draft" }, "person"));
     }
     if (action === "status" && req.method === "POST") {
       if (!(moves[job.status] ?? []).includes(body.status))

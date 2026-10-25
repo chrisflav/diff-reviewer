@@ -1,6 +1,7 @@
 import {
   memo,
   useCallback,
+  useEffect,
   useRef,
   useState,
   type KeyboardEvent,
@@ -34,6 +35,7 @@ export function DiffView({
   onRangeChange,
   actions,
   suggestionSeed,
+  reveal = null,
 }: {
   files: DiffFile[];
   placement: Placement;
@@ -45,6 +47,8 @@ export function DiffView({
   onRangeChange: (start: number, end: number) => void;
   actions: CommentActions;
   suggestionSeed: (file: string, start: number, end: number) => string | null;
+  /** A file to unfold, to show a comment on it; a new object each time it is asked for. */
+  reveal?: { file: string } | null;
 }) {
   const total = files.reduce((n, f) => n + lineCount(f), 0);
   // By file, not by position, so that a fold stays with its file when the diff is reloaded.
@@ -59,6 +63,12 @@ export function DiffView({
     if (lineCount(f) > FOLD_LINES) return false;
     return total <= FOLD_TOTAL || commentsIn(placement, f) > 0;
   };
+
+  useEffect(() => {
+    if (reveal === null) return;
+    const f = files.find((x) => x.newPath === reveal.file);
+    if (f !== undefined) setOpen((m) => new Map(m).set(fileId(f), true));
+  }, [reveal, files]);
 
   const setAll = (to: boolean) => setOpen(new Map(files.map((f) => [fileId(f), to])));
   const toggle = useCallback(
