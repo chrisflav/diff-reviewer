@@ -767,3 +767,383 @@ details.pr-body .body {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
+
+/* Severity: the word, a meter and a border that grows heavier say it; the hue only repeats it. */
+
+.sev {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  font-family: var(--data);
+  font-size: 0.8em;
+  padding: 0 7px;
+  border-radius: 4px;
+  white-space: nowrap;
+}
+
+.sev .meter {
+  letter-spacing: -0.1em;
+  font-size: 0.85em;
+}
+
+.sev-nit {
+  color: var(--mute);
+  border: 1px dotted currentColor;
+}
+
+.sev-minor {
+  color: var(--info);
+  border: 1px solid currentColor;
+}
+
+.sev-major {
+  color: var(--warn);
+  border: 2px solid currentColor;
+  font-weight: 600;
+}
+
+.sev-blocker {
+  color: var(--danger);
+  border: 3px double currentColor;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.labels {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 6px;
+}
+
+.comment header .labels {
+  margin-right: auto;
+}
+
+.tag.cat {
+  font-family: var(--data);
+  overflow-wrap: anywhere;
+}
+
+.counts-sev.has-blocker {
+  color: var(--danger);
+  font-weight: 700;
+}
+
+/* Positioned, so that what is absolutely placed in it (the screen-reader text) is clipped too. */
+.table-scroll {
+  position: relative;
+  overflow-x: auto;
+}
+
+/* The comments as a list. */
+
+details.comment-list {
+  margin-top: 24px;
+}
+
+.list-tools {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 8px 16px;
+  margin: 8px 0;
+}
+
+fieldset.sev-filter {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  margin: 0;
+  padding: 4px 10px 6px;
+}
+
+fieldset.sev-filter legend {
+  padding: 0 4px;
+  color: var(--mute);
+  font-size: 0.9em;
+}
+
+ol.overview {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+ol.overview li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 8px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--rule);
+}
+
+ol.overview .excerpt {
+  flex: 1 1 100%;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 4.5em;
+  overflow: hidden;
+  color: var(--mute);
+}
+
+ol.overview button.where {
+  color: var(--accent);
+  overflow-wrap: anywhere;
+  text-align: left;
+}
+
+/* The review's history. */
+
+table.revisions tr.picked td,
+tr.picked td {
+  background: var(--pick-bg);
+}
+
+.author {
+  font-family: var(--data);
+  font-size: 0.9em;
+  margin-right: 6px;
+}
+
+.a-github {
+  font-weight: 600;
+}
+
+.notice.calibration,
+section.revdiff.calibration {
+  border-left: 3px solid var(--accent);
+}
+
+form.compare {
+  align-items: end;
+  margin-top: 12px;
+}
+
+form.compare label {
+  display: grid;
+  gap: 2px;
+  max-width: 100%;
+}
+
+form.compare select {
+  max-width: 100%;
+}
+
+section.revdiff {
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  background: var(--raised);
+  padding: 8px 12px;
+  margin: 12px 0;
+}
+
+section.revdiff h3 {
+  margin: 4px 0;
+}
+
+section.revdiff h4 {
+  margin: 16px 0 4px;
+}
+
+ul.revdiff-counts,
+ul.changes {
+  margin: 6px 0;
+  padding-left: 20px;
+}
+
+.textdiff {
+  border: 1px solid var(--rule);
+  border-radius: 4px;
+  margin: 4px 0;
+  font-size: 0.92em;
+  overflow-x: auto;
+}
+
+.textdiff .tl {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  padding: 0 8px 0 4px;
+}
+
+.textdiff .tl .sign {
+  display: inline-block;
+  width: 1.5ch;
+  color: var(--mute);
+  user-select: none;
+  font-family: var(--data);
+}
+
+.textdiff .tl.add {
+  background: var(--add-bg);
+}
+
+.textdiff .tl.del {
+  background: var(--del-bg);
+  text-decoration: line-through;
+  text-decoration-color: var(--mute);
+}
+
+.comment.shown-add {
+  border-left: 3px solid var(--accent);
+}
+
+.comment.shown-del {
+  border-left: 3px dashed var(--danger);
+}
+
+/* The rubric editor. */
+
+.rubric-text {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 12px;
+  margin: 8px 0;
+}
+
+.rubric-text .pane {
+  display: grid;
+  align-content: start;
+  gap: 4px;
+  min-width: 0;
+}
+
+.rubric-text textarea {
+  margin: 0;
+}
+
+.rubric-text .pane-label {
+  color: var(--mute);
+}
+
+.preview {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  border-left: 3px solid var(--rule);
+  background: var(--raised);
+  padding: 6px 10px;
+  max-height: 28em;
+  overflow-y: auto;
+  min-height: 3em;
+}
+
+ol.types,
+ol.cats {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+fieldset.type {
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  background: var(--raised);
+  margin: 0 0 16px;
+  padding: 8px 12px 12px;
+  min-width: 0;
+}
+
+fieldset.type legend {
+  font-weight: 600;
+  padding: 0 4px;
+  overflow-wrap: anywhere;
+}
+
+fieldset.type .preview {
+  background: var(--page);
+}
+
+.type-tools {
+  justify-content: flex-end;
+}
+
+label.field {
+  display: grid;
+  gap: 2px;
+  margin: 6px 0;
+}
+
+label.field textarea {
+  margin: 0;
+}
+
+h3.cats-h {
+  font-size: 1rem;
+  margin: 16px 0 2px;
+}
+
+li.cat {
+  border-top: 1px solid var(--rule);
+  padding: 6px 0;
+}
+
+.cat-fields {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0 12px;
+}
+
+.cat-fields label.field {
+  flex: 0 1 20ch;
+}
+
+.cat-fields label.field.grow {
+  flex: 1 1 28ch;
+}
+
+[aria-invalid="true"] {
+  border-color: var(--danger);
+  border-width: 2px;
+}
+
+section.viewed h3 {
+  margin: 4px 0;
+}
+
+.shown-type {
+  border-top: 1px solid var(--rule);
+  padding: 6px 0;
+}
+
+.shown-type h5 {
+  font-size: 1rem;
+  margin: 4px 0;
+}
+
+.shown-type .body,
+section.viewed .body {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+dl.cats-shown {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 2px 12px;
+  margin: 6px 0;
+}
+
+dl.cats-shown div {
+  display: contents;
+}
+
+dl.cats-shown dd {
+  margin: 0;
+}
+
+@media (max-width: 720px) {
+  .rubric-text {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  dl.cats-shown {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  dl.cats-shown dd {
+    margin-bottom: 6px;
+  }
+}

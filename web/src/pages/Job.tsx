@@ -14,9 +14,18 @@ import {
   type JobDiff,
   type JobStatus,
   type Review,
+  type RubricDocument,
 } from "../api";
-import { CommentCard, FormsContext, type CommentActions } from "../components/Comments";
+import { CommentList } from "../components/CommentList";
+import {
+  CategoryContext,
+  CommentCard,
+  FormsContext,
+  type CategoryRules,
+  type CommentActions,
+} from "../components/Comments";
 import { DiffView, type Selection } from "../components/DiffView";
+import { History } from "../components/History";
 import { parseDiff, type DiffFile } from "../diff";
 import {
   canKeepBoth,
@@ -40,6 +49,7 @@ import {
   type Pick,
   type Placement,
 } from "../review";
+import { categoriesFor, documentOf, rubricVersionOfJob } from "../rubric";
 import { dropStash, stash, unstash, type Edits, type Stashed } from "../stash";
 import { UnsavedContext } from "../unsaved";
 import { useLoad } from "../useLoad";
@@ -156,7 +166,7 @@ function JobView({ id, onUnauthorized }: { id: string; onUnauthorized: () => voi
       update: (key: number, c: InlineComment) =>
         modify((r) => ({
           ...r,
-          comments: r.comments.map((old) => (old[KEY] === key ? mergeComment(old, c) : old)),
+          comments: r.comments.map((old) => (old[KEY] === key ? mergeComment(old, c, true) : old)),
         })),
       remove: (key: number) =>
         modify((r) => ({ ...r, comments: r.comments.filter((c) => c[KEY] !== key) })),
@@ -217,6 +227,62 @@ function JobView({ id, onUnauthorized }: { id: string; onUnauthorized: () => voi
   }, [blocker]);
 
   const placement = useMemo(() => placeComments(files ?? [], current.comments), [files, current]);
+
+  // The rubric the review was written to, for the categories its comments may carry.
+  const owner = job?.owner;
+  const repoName = job?.name;
+  const rubricWanted = job === null ? null : rubricVersionOfJob(job.rubricVersion);
+  const fetchRubric = useCallback((): Promise<RubricDocument | null> => {
+    if (owner === undefined || repoName === undefined || rubricWanted === null)
+      return Promise.resolve(null);
+    if (rubricWanted === "none") return Promise.resolve(null);
+    if (rubricWanted === "current") return api.rubrics(owner, repoName);
+    return api.rubricAt(owner, repoName, rubricWanted);
+  }, [owner, repoName, rubricWanted]);
+  const { data: rubric, error: rubricError } = useLoad(fetchRubric, onUnauthorized);
+  const rules = useMemo<CategoryRules>(() => {
+    const none = { allowed: [], descriptions: new Map<string, string>() };
+    if (rubricWanted === "none")
+      return {
+        ...none,
+        note: "The review was written with no rubric, so a category is free text.",
+      };
+    if (rubricError !== null)
+      return {
+        ...none,
+        note: `The rubric could not be loaded (${rubricError}), so a category is free text here; the server checks it on save.`,
+      };
+    if (rubric === null) return { ...none, note: "Loading the rubric's categories…" };
+    const doc = documentOf(rubric);
+    if (doc === null)
+      return {
+        ...none,
+        note: `The rubric (version ${rubric.version}) cannot be read by this version, so a category is free text here; the server checks it on save.`,
+      };
+    const prType = job?.prType ?? null;
+    const allowed = categoriesFor(doc, prType);
+    const descriptions = new Map<string, string>();
+    const t = doc.prTypes.find((x) => x.name === prType);
+    for (const x of t === undefined ? doc.prTypes : [t])
+      for (const c of x.categories)
+        if (!descriptions.has(c.name)) descriptions.set(c.name, c.description);
+    return { allowed, descriptions, note: null };
+  }, [rubricWanted, rubric, rubricError, job?.prType]);
+
+  // A comment picked in the list: its file is unfolded, and focus goes to it once it is drawn.
+  const [reveal, setReveal] = useState<{ file: string } | null>(null);
+  const showComment = useCallback((c: LocalComment) => {
+    setReveal({ file: c.file });
+    let tries = 0;
+    const go = () => {
+      const el = document.getElementById(`comment-${c[KEY]}`);
+      if (el !== null) {
+        el.scrollIntoView({ block: "center" });
+        el.focus({ preventScroll: true });
+      } else if (tries++ < 10) requestAnimationFrame(go);
+    };
+    requestAnimationFrame(go);
+  }, []);
 
   if (job === null)
     return error !== null ? <p className="error">{error}</p> : <p className="mute">Loading…</p>;
@@ -384,12 +450,30 @@ function JobView({ id, onUnauthorized }: { id: string; onUnauthorized: () => voi
         <dd className="data">{job.headSha ?? "—"}</dd>
         <dt>Base</dt>
         <dd className="data">{job.baseSha ?? "—"}</dd>
-        {job.prType !== null && (
-          <>
-            <dt>Kind</dt>
-            <dd>{job.prType}</dd>
-          </>
-        )}
+        <dt>Type</dt>
+        <dd>{job.prType ?? <span className="mute">—</span>}</dd>
+        <dt>Rubric</dt>
+        <dd>
+          {job.rubricVersion === null ? (
+            <>
+              <span className="mute">none recorded; categories are checked against the </span>
+              <Link
+                to={`/repos/${encodeURIComponent(job.owner)}/${encodeURIComponent(job.name)}/rubric`}
+              >
+                current rubric
+              </Link>
+            </>
+          ) : job.rubricVersion === 0 ? (
+            <span className="mute">none (reviewed with no rubric)</span>
+          ) : (
+            <Link
+              to={`/repos/${encodeURIComponent(job.owner)}/${encodeURIComponent(job.name)}/rubric?version=${job.rubricVersion}`}
+            >
+              version {job.rubricVersion}
+              {job.prType !== null && `, type ${job.prType}`}
+            </Link>
+          )}
+        </dd>
         <dt>Attempts</dt>
         <dd className="data">{job.attempts}</dd>
         <dt>Queue entry</dt>
@@ -565,25 +649,32 @@ function JobView({ id, onUnauthorized }: { id: string; onUnauthorized: () => voi
         <Summary review={current} editable={editable} modify={modify} />
       )}
 
+      {job.reviewError === null && <CommentList comments={current.comments} onShow={showComment} />}
+
       {job.reviewError === null && (
-        <DiffSection
-          job={job}
-          diff={diff}
-          diffError={diffError}
-          files={files}
-          placement={placement}
-          comments={current.comments}
-          editable={editable}
-          canAdd={editable && !atCap}
-          selection={selection}
-          setSelection={setSelection}
-          actions={actions}
-        />
+        <CategoryContext.Provider value={rules}>
+          <DiffSection
+            job={job}
+            diff={diff}
+            diffError={diffError}
+            files={files}
+            placement={placement}
+            comments={current.comments}
+            editable={editable}
+            canAdd={editable && !atCap}
+            selection={selection}
+            setSelection={setSelection}
+            actions={actions}
+            reveal={reveal}
+          />
+        </CategoryContext.Provider>
       )}
 
       {(editable || edits !== null) && (
         <RawEditor review={current} base={edits?.base ?? saved} modify={modify} />
       )}
+
+      <History jobId={job.id} jobVersion={job.version} onUnauthorized={onUnauthorized} />
 
       {dirty && (
         <div className="savebar" role="region" aria-label="Unsaved changes">
@@ -867,6 +958,7 @@ function DiffSection({
   selection,
   setSelection,
   actions,
+  reveal,
 }: {
   job: Job;
   diff: JobDiff | null;
@@ -880,6 +972,7 @@ function DiffSection({
   selection: Selection | null;
   setSelection: (f: (s: Selection | null) => Selection | null) => void;
   actions: CommentActions;
+  reveal: { file: string } | null;
 }) {
   const onSelect = useCallback(
     (file: string, line: number, extend: boolean) =>
@@ -963,6 +1056,7 @@ function DiffSection({
             onRangeChange={onRangeChange}
             actions={actions}
             suggestionSeed={suggestionSeed}
+            reveal={reveal}
           />
         </>
       )}

@@ -7,14 +7,34 @@ import {
   useState,
   type FormEvent,
 } from "react";
-import type { InlineComment } from "../api";
+import { severities, type InlineComment, type Severity } from "../api";
 import { commentProblem, KEY, rangeLabel, type LocalComment } from "../review";
+import { categoryProblem } from "../rubric";
+import { CategoryTag, SeverityBadge, severityHelp } from "./Severity";
 
 /**
  * Where an open comment form says whether it holds text not yet in the review: typed text is
  * an unsaved edit too, and the page counts it as one.
  */
 export const FormsContext = createContext<(id: string, dirty: boolean) => void>(() => {});
+
+/**
+ * The categories a comment of the job's review may be filed under, from the rubric version the
+ * job was reviewed against (`categoriesFor`): empty is free text.
+ */
+export interface CategoryRules {
+  allowed: string[];
+  /** What each allowed category is for, as the rubric says. */
+  descriptions: Map<string, string>;
+  /** Why the rules are not known, when they are not: the form takes free text, the server checks. */
+  note: string | null;
+}
+
+export const CategoryContext = createContext<CategoryRules>({
+  allowed: [],
+  descriptions: new Map(),
+  note: null,
+});
 
 /**
  * Where focus goes when `el`, a comment, leaves: the comment next to it, else the line it was
@@ -97,6 +117,8 @@ export function CommentCard({
   return (
     <article
       ref={card}
+      id={`comment-${comment[KEY]}`}
+      tabIndex={-1}
       className="comment"
       aria-label={`Comment on ${comment.file} ${rangeLabel(comment)}`}
     >
@@ -104,6 +126,10 @@ export function CommentCard({
         <span className="where data">
           {showFile && `${comment.file}, `}
           {rangeLabel(comment)}
+        </span>
+        <span className="labels">
+          <SeverityBadge severity={comment.severity} />
+          <CategoryTag category={comment.category} />
         </span>
         {editable && (
           <span className="tools">
@@ -173,7 +199,11 @@ export function CommentForm({
   const [body, setBody] = useState(initial.body);
   const [suggesting, setSuggesting] = useState(initial.suggestion !== undefined);
   const [suggestion, setSuggestion] = useState(initial.suggestion ?? "");
+  const [category, setCategory] = useState(initial.category ?? "");
+  const [severity, setSeverity] = useState<Severity | "">(initial.severity ?? "");
   const [problem, setProblem] = useState<string | null>(null);
+  const rules = useContext(CategoryContext);
+  const picked = rules.allowed.length > 0;
 
   const report = useContext(FormsContext);
   const dirty =
@@ -182,7 +212,9 @@ export function CommentForm({
     end !== String(initial.end_line) ||
     body !== initial.body ||
     suggesting !== (initial.suggestion !== undefined) ||
-    (suggesting && suggestion !== (initial.suggestion ?? ""));
+    (suggesting && suggestion !== (initial.suggestion ?? "")) ||
+    category !== (initial.category ?? "") ||
+    severity !== (initial.severity ?? "");
   useEffect(() => report(id, dirty), [report, id, dirty]);
   useEffect(() => () => report(id, false), [report, id]);
 
@@ -202,13 +234,17 @@ export function CommentForm({
       body,
     };
     if (suggesting) c.suggestion = suggestion;
+    // Free text is trimmed; a rubric's category is taken as the rubric spells it.
+    const cat = picked ? category : category.trim();
+    if (cat !== "") c.category = cat;
+    if (severity !== "") c.severity = severity;
     return c;
   };
 
   const submit = (e: FormEvent) => {
     e.preventDefault();
     const c = build();
-    const p = commentProblem(c);
+    const p = commentProblem(c) ?? categoryProblem(c.category, rules.allowed, initial.category);
     if (p !== null) {
       setProblem(p);
       return;
@@ -274,6 +310,57 @@ export function CommentForm({
           />
         </label>
       </div>
+      <div className="range-fields">
+        <label>
+          Severity
+          <select value={severity} onChange={(e) => setSeverity(e.target.value as Severity | "")}>
+            <option value="">(none)</option>
+            {severities.map((s) => (
+              <option key={s} value={s}>
+                {s} — {severityHelp[s]}
+              </option>
+            ))}
+          </select>
+        </label>
+        {picked ? (
+          <label className="grow">
+            Category
+            <select
+              value={category}
+              onChange={(e) => setCategory(e.target.value)}
+              aria-describedby={`${id}-cat`}
+            >
+              <option value="">(none)</option>
+              {rules.allowed.map((c) => (
+                <option key={c} value={c}>
+                  {c}
+                </option>
+              ))}
+              {initial.category !== undefined && !rules.allowed.includes(initial.category) && (
+                <option value={initial.category}>{initial.category} (not in the rubric)</option>
+              )}
+            </select>
+          </label>
+        ) : (
+          <label className="grow">
+            Category
+            <input
+              value={category}
+              placeholder="free text"
+              aria-describedby={`${id}-cat`}
+              onChange={(e) => setCategory(e.target.value)}
+            />
+          </label>
+        )}
+      </div>
+      <p id={`${id}-cat`} className="mute small-text">
+        {rules.note !== null
+          ? rules.note
+          : picked
+            ? rules.descriptions.get(category) ||
+              "The categories of the rubric the review was written to."
+            : "The rubric names no categories for this review, so any category is free text."}
+      </p>
       <label htmlFor={`${id}-body`} className="sr-only">
         Comment
       </label>

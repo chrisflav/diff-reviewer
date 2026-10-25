@@ -7,6 +7,7 @@
  */
 
 import { freeze, thaw, type LocalReview } from "./review";
+import { freezeRubric, thawRubric, type LocalRubric } from "./rubric";
 
 /** Edits as the job page holds them: made to `base`, the review at `version` of job `jobId`. */
 export interface Edits {
@@ -64,6 +65,66 @@ export function unstash(jobId: string): Stashed | null {
 export function dropStash(jobId: string) {
   try {
     sessionStorage.removeItem(prefix + jobId);
+  } catch {
+    /* nothing to drop */
+  }
+}
+
+/** Unsaved rubric edits of repository `repo` (`owner/name`): made to `base`, at `version`. */
+export interface RubricEdits {
+  repo: string;
+  version: number;
+  base: LocalRubric;
+  doc: LocalRubric;
+}
+
+export interface StashedRubric extends RubricEdits {
+  savedAt: string;
+}
+
+const rubricPrefix = "diff-reviewer:rubric:";
+
+export function stashRubric(e: RubricEdits) {
+  try {
+    sessionStorage.setItem(
+      rubricPrefix + e.repo,
+      JSON.stringify({
+        repo: e.repo,
+        version: e.version,
+        base: freezeRubric(e.base),
+        doc: freezeRubric(e.doc),
+        savedAt: new Date().toISOString(),
+      }),
+    );
+  } catch {
+    /* kept in memory only */
+  }
+}
+
+export function unstashRubric(repo: string): StashedRubric | null {
+  try {
+    const text = sessionStorage.getItem(rubricPrefix + repo);
+    if (text === null) return null;
+    const j = JSON.parse(text) as Record<string, unknown>;
+    const base = thawRubric(j.base);
+    const doc = thawRubric(j.doc);
+    if (
+      j.repo !== repo ||
+      typeof j.version !== "number" ||
+      typeof j.savedAt !== "string" ||
+      base === null ||
+      doc === null
+    )
+      return null;
+    return { repo, version: j.version, base, doc, savedAt: j.savedAt };
+  } catch {
+    return null;
+  }
+}
+
+export function dropRubricStash(repo: string) {
+  try {
+    sessionStorage.removeItem(rubricPrefix + repo);
   } catch {
     /* nothing to drop */
   }
