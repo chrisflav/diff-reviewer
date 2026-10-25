@@ -95,6 +95,12 @@ export interface Job {
   postedReview: { id: number; url: string; body: string } | null;
 }
 
+export interface JobDiff {
+  headSha: string;
+  /** Unified diff text, as `git diff` writes it. */
+  diff: string;
+}
+
 /** Thrown when the server could not be reached at all. */
 export class NetworkError extends Error {
   constructor() {
@@ -158,6 +164,11 @@ export const api = {
   /** Settle a post whose outcome is unknown, without posting (`POST /api/v1/jobs/{id}/reconcile`). */
   reconcileJob: (id: string, version: number) =>
     request<Job>("POST", `/api/v1/jobs/${seg(id)}/reconcile`, { version }),
+  /** The pull request's diff at the job's head. */
+  diff: (id: string) => request<JobDiff>("GET", `/api/v1/jobs/${seg(id)}/diff`),
+  /** Post an approved review to GitHub, under the operator's account; the job becomes `posted`. */
+  post: (id: string, version: number) =>
+    request<Job>("POST", `/api/v1/jobs/${seg(id)}/post`, { version }),
 };
 
 /** One path segment, encoded, so that a `/`, `?` or `#` in it cannot change the path. */
@@ -178,6 +189,11 @@ export function nextStatuses(s: string): JobStatus[] {
     default:
       return [];
   }
+}
+
+/** Whether a job may be posted now; posting is its own action, not a status move. */
+export function canPost(s: string): boolean {
+  return s === "approved";
 }
 
 /** Whether a person may edit the review now; mirrors `JobStatus.personCanEdit` in Lean. */
