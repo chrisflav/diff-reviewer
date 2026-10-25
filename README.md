@@ -88,8 +88,10 @@ request comes from that proxy, when it is the last address of `X-Forwarded-For`.
 jobs discovery makes per repository, and `--max-diff-bytes` (default 5242880) the diff reviewed.
 
 Releases (`v*` tags) attach a Linux x86_64 binary and its sha256 to the GitHub release; it runs on
-Debian bookworm and newer. The workflow builds with read-only permissions and only its publishing
-job may write; its actions are pinned by commit.
+Debian bookworm and newer. They also publish the image review tasks run in on orchestra,
+`ghcr.io/chrisflav/diff-reviewer-agent` (see [The agent image](#the-agent-image)). The workflow
+builds with read-only permissions and only its publishing jobs may write — the release's job
+`contents`, the image's job `packages`; its actions are pinned by commit.
 
 ### Configuration
 
@@ -132,8 +134,10 @@ The platform queues reviews as an orchestra API client. Create
   "backend": "claude",
   "read_only": true,
   "kleis_spec": "reviewer",
+  "execution_image": "ghcr.io/chrisflav/diff-reviewer-agent:0.1.0@sha256:…",
   "queue_policy": {
     "repos": ["acme/widgets"],
+    "images": ["ghcr.io/chrisflav/diff-reviewer-agent:0.1.0@sha256:…"],
     "max_budget": 3.0
   },
   "max_active": 10
@@ -148,7 +152,57 @@ the pull request (`issue_number`) and the job id as `external_id` — `<id>.2`, 
 retry, since orchestra answers an `external_id` it has seen with the entry it already made. When a
 pull request moves on, the platform cancels the runs of its older heads
 (`POST /api/v1/queue/{id}/cancel`). The
-agent image needs `curl` and the `diff-reviewer` binary from a release on its `PATH`.
+agent needs `curl` and the `diff-reviewer` binary from a release on its `PATH`: see the next
+section.
+
+### The agent image
+
+On orchestra's `kubernetes` backend a review runs in its own pod, and the image that pod runs must
+carry the `diff-reviewer` CLI. Orchestra's default agent image does not, and should not: each
+release publishes `ghcr.io/chrisflav/diff-reviewer-agent:<version>` (the release's tag without
+its `v`, and `:latest` for the latest release), which is orchestra's agent image
+(`ghcr.io/chrisflav/orchestra-agent`) with the release's binary in `/usr/local/bin` and nothing
+else changed — the same non-root `agent` user, the same home, `curl` already there. It is built
+by `docker/agent.Dockerfile`, from the binary attached to the release, on a base pinned by tag
+and digest in that file; its labels name the commit it was built from
+(`org.opencontainers.image.revision`) and the base it was built on
+(`org.opencontainers.image.base.name`, `org.opencontainers.image.base.digest`).
+
+A review task asks for it by name (orchestra's `execution_image`), which beats both the operator's
+per-repository pin and a repository's own `execution.image`: a review needs this CLI whatever the
+repository it reviews. In the client file above:
+
+- **`execution_image`** is the image every task the platform queues runs in. The platform's
+  requests do not name one, so this default is what applies.
+- **`queue_policy.images`** lists the images a request may name instead. List this image there
+  too (orchestra refuses, `400`, a request naming an image the list does not have), so that a
+  request may name it; leave every other image out.
+
+**Pin it by digest.** A tag can be pushed again — `:latest` moves with every release, and a
+version's tag moves when its image is rebuilt on a newer base — so write
+`ghcr.io/chrisflav/diff-reviewer-agent:<version>@<digest>`, in both places: the release
+workflow's run prints the digest it pushed in its summary, and `docker buildx imagetools inspect
+ghcr.io/chrisflav/diff-reviewer-agent:<version>` shows it later.
+`images` is an exact list, so a new digest has to be written there as well as in
+`execution_image`.
+
+**A newer base.** To pick up a newer claude-code without a new release, run the release workflow
+by hand (*Actions → Release → Run workflow*) with the release's tag (`v0.1.0`) and the
+`orchestra-agent` tag to build on (`claude-<version>`): it rebuilds that release's image from its
+binary and Dockerfile against that tag, pins the digest the tag has at that moment in the labels,
+pushes `:<version>` again (and `:latest`, if it is the latest release), and prints the new digest.
+
+**On landrun or local hosts** there is no image: orchestra notes the requested image in its log
+and runs the task on the host. Install the release's binary somewhere on the agent's `PATH` there
+(under landrun, a path the sandbox can execute, e.g. through `additional_sandbox_paths`).
+
+To build it from a local binary:
+
+```sh
+lake build
+DOCKER_BUILDKIT=1 docker build -f docker/agent.Dockerfile --build-arg BINARY=diff-reviewer \
+  -t diff-reviewer-agent:dev .lake/build/bin
+```
 
 ### Behind kleis
 

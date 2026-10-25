@@ -7,16 +7,34 @@ name: Release
 # Two jobs, so that the one running the build — and every dependency it fetches — never holds a
 # token that can write to the repository: `build` reads, and hands the binary on as an artifact;
 # `publish` only creates the release. Actions are pinned by commit, not by a tag that can move.
+#
+# Then `image` builds docker/agent.Dockerfile — orchestra's agent image with this binary added, the
+# image review tasks run in — and pushes it as ghcr.io/<owner>/diff-reviewer-agent:<version> (the
+# tag without its `v`), and as `:latest` when that version is the latest release. It is the only
+# job that may write packages, and it builds nothing but that image.
+#
+# Run by hand (`workflow_dispatch`), it rebuilds the image of an existing release against another
+# base tag — a newer claude-code — from that release's binary and Dockerfile; `build` and `publish`
+# do not run.
 
 on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "The release to rebuild the image of, as its tag (v0.1.0)"
+        required: true
+      base_tag:
+        description: "The ghcr.io/chrisflav/orchestra-agent tag to build on (claude-2.1.303)"
+        required: true
 
 permissions: {}
 
 jobs:
   build:
+    if: github.event_name == 'push'
     runs-on: ubuntu-22.04
     permissions:
       contents: read
@@ -53,6 +71,7 @@ jobs:
           if-no-files-found: error
 
   publish:
+    if: github.event_name == 'push'
     needs: build
     runs-on: ubuntu-22.04
     permissions:
@@ -68,3 +87,131 @@ jobs:
         run: |
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag \
             --generate-notes dist/*
+
+  image:
+    needs: [build, publish]
+    # On a tag, once the release it installs from exists; by hand, with the other two skipped.
+    if: >-
+      !cancelled() && (github.event_name == 'workflow_dispatch'
+      || needs.publish.result == 'success')
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      packages: write
+    env:
+      VERSION: ${{ inputs.version || github.ref_name }}
+      BASE_TAG_INPUT: ${{ inputs.base_tag }}
+      IMAGE: ghcr.io/${{ github.repository_owner }}/diff-reviewer-agent
+    steps:
+      # Only the release's tag ever reaches a shell or a ref, so it is checked first.
+      - name: Check the version
+        run: |
+          [[ "$VERSION" =~ ^v[0-9][0-9A-Za-z.+-]*$ ]] \
+            || { echo "not a release tag: $VERSION"; exit 1; }
+          [[ -z "$BASE_TAG_INPUT" || "$BASE_TAG_INPUT" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]] \
+            || { echo "not an image tag: $BASE_TAG_INPUT"; exit 1; }
+      # The release's own Dockerfile, so that the image is of that release whichever ref ran this.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: refs/tags/${{ env.VERSION }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        if: github.event_name == 'push'
+        with:
+          name: release
+          path: dist
+      - name: Download the release's binary
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "$VERSION" --repo "$GITHUB_REPOSITORY" --dir dist \
+            --pattern "diff-reviewer-$VERSION-linux-x86_64*"
+      - name: Check the binary and resolve the base
+        id: inputs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          asset="diff-reviewer-$VERSION-linux-x86_64"
+          (cd dist && sha256sum --check "$asset.sha256")
+          # The Dockerfile's pin, unless this run names another tag: then that tag's digest now.
+          base_image=$(sed -n 's/^ARG BASE_IMAGE=//p' docker/agent.Dockerfile)
+          if [ -n "$BASE_TAG_INPUT" ]; then
+            base_tag="$BASE_TAG_INPUT"
+            base_digest=$(docker buildx imagetools inspect "$base_image:$base_tag" \
+              --format '{{json .Manifest}}' | jq -r .digest)
+          else
+            base_tag=$(sed -n 's/^ARG BASE_TAG=//p' docker/agent.Dockerfile)
+            base_digest=$(sed -n 's/^ARG BASE_DIGEST=//p' docker/agent.Dockerfile)
+          fi
+          [[ "$base_digest" =~ ^sha256:[0-9a-f]{64}$ ]] \
+            || { echo "no digest for $base_image:$base_tag"; exit 1; }
+          tags="$IMAGE:${VERSION#v}"
+          latest=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)
+          if [ "$latest" = "$VERSION" ]; then
+            tags="$tags,$IMAGE:latest"
+          fi
+          {
+            echo "asset=$asset"
+            echo "base_image=$base_image"
+            echo "base_tag=$base_tag"
+            echo "base_digest=$base_digest"
+            echo "revision=$(git rev-parse HEAD)"
+            echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "tags=$tags"
+          } >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          # The directory holding the binary, and nothing else of the repository.
+          context: dist
+          file: docker/agent.Dockerfile
+          build-args: |
+            BINARY=${{ steps.inputs.outputs.asset }}
+            BASE_IMAGE=${{ steps.inputs.outputs.base_image }}
+            BASE_TAG=${{ steps.inputs.outputs.base_tag }}
+            BASE_DIGEST=${{ steps.inputs.outputs.base_digest }}
+          push: true
+          tags: ${{ steps.inputs.outputs.tags }}
+          # All of the base's labels that would otherwise be inherited and describe orchestra.
+          labels: |
+            org.opencontainers.image.title=diff-reviewer-agent
+            org.opencontainers.image.description=orchestra's agent image with the diff-reviewer CLI
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.url=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.created=${{ steps.inputs.outputs.created }}
+            org.opencontainers.image.version=${{ env.VERSION }}
+            org.opencontainers.image.revision=${{ steps.inputs.outputs.revision }}
+            org.opencontainers.image.licenses=Apache-2.0
+            org.opencontainers.image.base.name=${{ steps.inputs.outputs.base_image }}:${{ steps.inputs.outputs.base_tag }}
+            org.opencontainers.image.base.digest=${{ steps.inputs.outputs.base_digest }}
+      - name: Summarise
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+          TAGS: ${{ steps.inputs.outputs.tags }}
+          BASE: ${{ steps.inputs.outputs.base_image }}:${{ steps.inputs.outputs.base_tag }}@${{ steps.inputs.outputs.base_digest }}
+          REVISION: ${{ steps.inputs.outputs.revision }}
+        run: |
+          {
+            echo "### Published"
+            echo
+            echo '```'
+            echo "tags:     $TAGS"
+            echo "digest:   $DIGEST"
+            echo "base:     $BASE"
+            echo "revision: $REVISION"
+            echo '```'
+            echo
+            echo "Pin it in orchestra's client file (\`execution_image\`, \`queue_policy.images\`):"
+            echo
+            echo '```'
+            echo "$IMAGE:${VERSION#v}@$DIGEST"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
