@@ -378,9 +378,9 @@ def aDirectPostIsRetried : Test := withTempDb do
   let posted ← gh.posted.get
   return checkEq (field submitted "status") (some "approved") "the first post failed"
     ++ check first.postStartedAt.isSome "its claim stands"
-    ++ checkEq first.postAttempts 1 "one attempt"
+    ++ checkEq first.directPosts 1 "one post by the platform"
     ++ checkEq after.statusRaw "posted" "posted again by the loop"
-    ++ checkEq after.postAttempts 2 "the second attempt"
+    ++ checkEq after.directPosts 2 "the second"
     ++ checkEq (posted.map (·.2.2.2)) #[some .comment] "as a comment"
     ++ check ((← logs.get).any (·.startsWith s!"posted job {id} again")) "and logged"
 
@@ -402,11 +402,140 @@ def aDirectPostIsRetriedAtMostThrice : Test := withTempDb do
   let gaveUp := (← logs.get).filter fun m => (m.splitOn "the most the platform tries").length > 1
   return checkEq after.statusRaw "approved" "left approved"
     ++ checkEq after.postStartedAt none "without a claim"
-    ++ checkEq after.postAttempts 3 "after three attempts"
+    ++ checkEq after.directPosts 3 "after three posts"
     ++ check (after.error.any fun e => (e.splitOn "3 times").length > 1)
       s!"saying why: {after.error}"
     ++ checkEq gaveUp.size 1 "logged once"
     ++ checkEq (← gh.posted.get).size 0 "nothing reached GitHub"
+
+/-- Before posting a `direct` review again the pull request is read: moved on from the job's
+    head, or closed, the job is `stale` and nothing is posted. -/
+def aDirectRepostChecksThePull : Test := withTempDb do
+  let gh ← FakeGitHub.new #[pull7]
+  let orch ← FakeOrchestra.new
+  let logs ← IO.mkRef #[]
+  let svc ← services gh orch logs
+  let st ← State.new cfg svc
+  let id ← directJob st svc
+  gh.outcome.set .failedUnposted
+  let _ ← route st (agentReq .post "/review" (submission headA))
+  gh.outcome.set .ok
+  gh.pulls.set #[pull7 headB]
+  ageClaim id
+  Workers.settleClaims svc
+  let movedOn ← job! id
+  -- A closed pull request, at the job's head.
+  let some j ← Platform.findJob id | return #["gone"]
+  let _ ← Platform.updateJob id fun _ =>
+    return { j with statusRaw := "approved", postDirect := true, error := none }
+  gh.pulls.set #[{ pull7 with state := "closed" }]
+  Workers.settleClaims svc
+  let closed ← job! id
+  return checkEq movedOn.statusRaw "stale" "moved on: stale"
+    ++ check (movedOn.error.any fun e => (e.splitOn "moved on").length > 1) "saying why"
+    ++ checkEq closed.statusRaw "stale" "closed: stale"
+    ++ checkEq (← gh.posted.get).size 0 "nothing posted"
+
+/-- What a person starts is theirs: a person's post of a `direct` job is not retried by the
+    platform, nor counted among its posts. -/
+def aPersonsPostIsNotRetried : Test := withTempDb do
+  let gh ← FakeGitHub.new #[pull7]
+  let orch ← FakeOrchestra.new
+  let logs ← IO.mkRef #[]
+  let svc ← services gh orch logs
+  let st ← State.new cfg svc
+  let id ← directJob st svc
+  gh.outcome.set .failedUnposted
+  let _ ← route st (agentReq .post "/review" (submission headA))
+  ageClaim id
+  -- The person posts: the earlier claim is settled, and the person's own post fails too.
+  let _ ← route st (req .post s!"/api/v1/jobs/{id}/post" s!"\{\"version\": {(← job! id).version}}")
+  let afterPerson ← job! id
+  gh.outcome.set .ok
+  ageClaim id
+  Workers.settleClaims svc
+  Workers.settleClaims svc
+  let after ← job! id
+  return checkEq afterPerson.directPosts 1 "the person's post is not counted"
+    ++ checkEq afterPerson.postDirect false "and is not the platform's"
+    ++ checkEq after.statusRaw "approved" "settled, and not posted again"
+    ++ checkEq after.postStartedAt none "free"
+    ++ checkEq (← gh.posted.get).size 0 "nothing posted by the platform"
+
+/-- A job reviewed against no rubric records version 0; categories are checked only where the
+    edit adds or changes one; a picked type with no categories takes free text; the history
+    keeps the first draft and the last `maxRevisions`; pages; and a rubric this build cannot read
+    is not overwritten, nor a `null` stored. -/
+def rubricEdgesAreHeld : Test := withTempDb do
+  let gh ← FakeGitHub.new #[pull7]
+  let orch ← FakeOrchestra.new
+  let logs ← IO.mkRef #[]
+  let svc ← services gh orch logs
+  let st ← State.new cfg svc
+  putRepo st "{}"
+  let created ← route st (req .post "/api/v1/jobs"
+    s!"\{\"owner\": \"acme\", \"name\": \"widgets\", \"prNumber\": 7, \"headSha\": \"{headA}\"}")
+  let id := (field created "id").getD ""
+  Workers.queuePending svc
+  let _ ← route st (agentReq .get "")
+  let _ ← route st (agentReq .post "/review"
+    (submission headA (withComment ", \"category\": \"legacy\"")))
+  let noRubric ← job! id
+  -- A rubric with categories now: the job was reviewed against none, so free text still holds.
+  let _ ← putRubric st 0 twoTypes
+  let freeStill ← route st (req .put s!"/api/v1/jobs/{id}/review"
+    (reviewBody noRubric.version (withComment ", \"category\": \"invented\"")))
+  -- A job from before rubrics, against the current one: an unchanged category stands.
+  let some j ← Platform.findJob id | return #["gone"]
+  let old := "{\"decision\":\"comment\",\"body\":\"Old.\",\"comments\":[{\"file\":\"A.lean\",\
+\"start_line\":3,\"end_line\":3,\"body\":\"x\",\"id\":\"c1\",\"category\":\"legacy\"}]}"
+  let _ ← Platform.updateJob id fun _ =>
+    return { j with rubricVersion := none, reviewRaw := some old, statusRaw := "draft" }
+  let v := (← job! id).version
+  let kept ← route st (req .put s!"/api/v1/jobs/{id}/review" (reviewBody v
+    (withComment ", \"id\": \"c1\", \"category\": \"legacy\"")))
+  let changed ← route st (req .put s!"/api/v1/jobs/{id}/review" (reviewBody (versionOf kept)
+    (withComment ", \"id\": \"c1\", \"category\": \"bogus\"")))
+  let added ← route st (req .put s!"/api/v1/jobs/{id}/review" (reviewBody (versionOf kept)
+    (withComment ", \"category\": \"legacy\"")))
+  -- The history, bounded and paged.
+  for _ in [0:Platform.maxRevisions + 5] do
+    let _ ← Platform.updateJob id (revision := Job.revisionBy .person) fun j => return j
+  let revs ← Platform.revisions id
+  let page1 ← route st { req .get s!"/api/v1/jobs/{id}/revisions" with query := "limit=2" }
+  let badLimit ← route st { req .get s!"/api/v1/jobs/{id}/revisions" with query := "limit=0" }
+  -- A rubric this build cannot read, and nulls.
+  let nullTypes ← putRubric st 1 "\"prTypes\": null"
+  let nullDefault ← putRubric st 1 "\"defaultRubric\": null"
+  Store.run <| HasModel.save
+    ({ owner := "acme", name := "widgets", version := 2, document := "{\"prTypes\": 7}"
+     , created_at := "2026-01-01T00:00:00Z" } : Store.RubricRow)
+  let unreadable ← route st (req .get "/api/v1/repos/acme/widgets/rubrics")
+  let overwrite ← putRubric st 2 "\"defaultRubric\": \"x\""
+  let doc : Rubric := match Rubric.ofJson ((Json.parse s!"\{{twoTypes}}").toOption.getD .null) with
+    | .ok d => d
+    | .error _ => {}
+  let r : GitHub.PostedReview := { id := 1, body := "b", url := "u", state := "COMMENTED" }
+  let posted := (Json.parse (Workers.postedRevision noRubric r (some .approve))).toOption.getD .null
+  return checkEq noRubric.rubricVersion (some 0) "reviewed against no rubric: version 0"
+    ++ checkStatus freeStill 200 "free text for a job reviewed against no rubric"
+    ++ checkStatus kept 200 "an unchanged category the rubric does not name"
+    ++ checkStatus changed 400 "a changed one"
+    ++ checkStatus added 400 "a new one"
+    ++ checkEq (doc.categoriesFor (some "docs")) [] "a type without categories: free text"
+    ++ checkEq (doc.categoriesFor (some "feature")) ["correctness", "style"] "a type's own"
+    ++ checkEq (doc.categoriesFor none) ["correctness", "style"] "no type: the document's"
+    ++ checkEq revs.size (Platform.maxRevisions + 1) "the history, bounded"
+    ++ checkEq (revs[0]?.map (·.author)) (some "agent") "the first draft kept"
+    ++ checkEq (revs.back?.map (·.version)) (some (← job! id).version) "and the latest"
+    ++ checkEq (itemsOf page1).length 2 "a page"
+    ++ checkEq ((bodyJson page1).getObjValAs? Nat "nextOffset").toOption (some 2) "the next one"
+    ++ checkStatus badLimit 400 "a limit of 0"
+    ++ checkStatus nullTypes 400 "null types"
+    ++ checkStatus nullDefault 400 "a null default rubric"
+    ++ check (field unreadable "documentError" |>.isSome) "an unreadable rubric, shown so"
+    ++ checkStatus overwrite 409 "and not overwritten"
+    ++ checkEq (strOf posted "decision") (some "comment") "the decision GitHub's state says"
 
 def all : List (String × Test) :=
   [("commentsKeepTheirIdsAndUnknownFields", commentsKeepTheirIdsAndUnknownFields),
@@ -418,6 +547,9 @@ def all : List (String × Test) :=
    ("claimsSettleThemselves", claimsSettleThemselves),
    ("rubricsKeepUnknownFields", rubricsKeepUnknownFields),
    ("aDirectPostIsRetried", aDirectPostIsRetried),
-   ("aDirectPostIsRetriedAtMostThrice", aDirectPostIsRetriedAtMostThrice)]
+   ("aDirectPostIsRetriedAtMostThrice", aDirectPostIsRetriedAtMostThrice),
+   ("aDirectRepostChecksThePull", aDirectRepostChecksThePull),
+   ("aPersonsPostIsNotRetried", aPersonsPostIsNotRetried),
+   ("rubricEdgesAreHeld", rubricEdgesAreHeld)]
 
 end DiffReviewerTest.Rubrics

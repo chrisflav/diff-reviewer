@@ -52,6 +52,13 @@ def FakeGitHub.new (pulls : Array GitHub.Pull := #[]) : IO FakeGitHub := do
          , diffText := ← IO.mkRef sampleDiff, reviewer := ← IO.mkRef "chrisflav"
          , foreign := ← IO.mkRef #[] }
 
+/-- The `state` GitHub gives a review submitted as `event`. -/
+def stateOf : Option Decision → String
+  | some .approve => "APPROVED"
+  | some .requestChanges => "CHANGES_REQUESTED"
+  | some .comment => "COMMENTED"
+  | none => "PENDING"
+
 def FakeGitHub.client (f : FakeGitHub) : GitHub.Client where
   listOpenPulls _ _ := return .ok (← f.pulls.get)
   getPull _ _ n := do
@@ -64,8 +71,9 @@ def FakeGitHub.client (f : FakeGitHub) : GitHub.Client where
   listReviews _ _ n := do
     if ← f.listFails.get then return .error (.indefinite "GitHub answered 503")
     let author ← f.reviewer.get
-    let own := ((← f.posted.get).filter (·.1 == n)).mapIdx fun i (_, r, _, _) =>
-      { id := i, body := r.body, url := s!"https://github.example/review/{i}", author }
+    let own := ((← f.posted.get).filter (·.1 == n)).mapIdx fun i (_, r, _, ev) =>
+      { id := i, body := r.body, url := s!"https://github.example/review/{i}", author
+      , state := stateOf ev }
     return .ok (own ++ (← f.foreign.get))
   postReview _ _ n review commit event := do
     let record := do
@@ -79,7 +87,8 @@ def FakeGitHub.client (f : FakeGitHub) : GitHub.Client where
       return .error (.indefinite "curl: (28) Operation timed out")
     | .ok =>
       let i ← record
-      return .ok { id := i, body := review.body, url := s!"https://github.example/review/{i}" }
+      return .ok { id := i, body := review.body, url := s!"https://github.example/review/{i}"
+                 , state := stateOf event }
 
 structure FakeOrchestra where
   queued    : IO.Ref (Array Orchestra.QueueRequest)

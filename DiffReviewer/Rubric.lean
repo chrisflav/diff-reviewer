@@ -69,17 +69,18 @@ def Rubric.toJson (r : Rubric) : Json :=
     [("defaultRubric", r.defaultRubric), ("prTypes", .arr (r.prTypes.map PrType.toJson).toArray)]
   .mkObj (r.extra ++ known)
 
-/-- Field `k` of `j`, a string; absent or `null` is `""`. -/
+/-- Field `k` of `j`, a string; absent is `""`. `null` is refused rather than read as empty: a
+    document that says `null` where a rubric goes is a mistake, not an empty rubric. -/
 private def strField (j : Json) (k : String) (what : String) : Except String String :=
   match j.getObjVal? k with
-  | .error _ | .ok .null => .ok ""
+  | .error _ => .ok ""
   | .ok (.str s) => .ok s
   | .ok _ => .error s!"{what}: '{k}' must be a string"
 
-/-- Field `k` of `j`, an array; absent or `null` is empty. -/
+/-- Field `k` of `j`, an array; absent is empty, and `null` refused, as by `strField`. -/
 private def arrField (j : Json) (k : String) (what : String) : Except String (List Json) :=
   match j.getObjVal? k with
-  | .error _ | .ok .null => .ok []
+  | .error _ => .ok []
   | .ok (.arr xs) => .ok xs.toList
   | .ok _ => .error s!"{what}: '{k}' must be an array"
 
@@ -148,13 +149,14 @@ def Rubric.validate (r : Rubric) : Except String Unit := do
 def Rubric.findType? (r : Rubric) (name : String) : Option PrType :=
   r.prTypes.find? (·.name == name)
 
-/-- The categories a comment of a review of type `prType` may be filed under: the type's, when it
-    names any, and otherwise every category of the document. Empty when the document names none,
-    and then a category is free text. -/
+/-- The categories a comment of a review of type `prType` may be filed under: the type's — none,
+    for a type that lists none, and then a category is free text, as the agent is told. A review
+    of no type the document names (a job reviewed by hand) may use any category of the document,
+    or free text if it names none. Empty means free text. -/
 def Rubric.categoriesFor (r : Rubric) (prType : Option String) : List String :=
-  let own := ((prType.bind r.findType?).map (·.categories.map (·.name))).getD []
-  if !own.isEmpty then own else
-    (r.prTypes.flatMap (·.categories.map (·.name))).eraseDups
+  match prType.bind r.findType? with
+  | some t => t.categories.map (·.name)
+  | none => (r.prTypes.flatMap (·.categories.map (·.name))).eraseDups
 
 /-- Why `prType` is not a type a submission under `r` may name, if it is not: one of the
     document's types, or `null` when it names none. -/

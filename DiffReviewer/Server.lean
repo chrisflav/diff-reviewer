@@ -63,6 +63,8 @@ structure Req where
   body    : String := ""
   /-- The address of the socket's other end, when known. -/
   peer    : Option String := none
+  /-- The query string, without the `?`, still percent-encoded. -/
+  query   : String := ""
 
 /-- What `route` answers. -/
 structure Reply where
@@ -342,6 +344,35 @@ def openApiSpec : String := include_str "../docs/openapi.json"
 
 private def items (xs : Array Json) : Json := .mkObj [("items", .arr xs)]
 
+/-- The most items one page of a history holds, and what a page holds unless `limit` says. -/
+def maxPageSize : Nat := 200
+
+def defaultPageSize : Nat := 50
+
+/-- Value `k` of a query string, undecoded. -/
+def queryParam (query k : String) : Option String :=
+  (query.splitOn "&").findSome? fun kv => match kv.splitOn "=" with
+    | [a, b] => if a == k then some b else none
+    | _ => none
+
+/-- One page of `xs`, as `?limit=n&offset=m` names it (`defaultPageSize` and 0 unless they say):
+    `{"items": [...], "nextOffset": …}`, `nextOffset` null on the last page. -/
+private def page (query : String) (xs : Array Json) : IO Reply := do
+  let num (k : String) (dflt : Nat) : Except String Nat :=
+    match queryParam query k with
+    | none => .ok dflt
+    | some v => match v.toNat? with
+      | some n => .ok n
+      | none => .error s!"'{k}' must be a whole number"
+  let (limit, offset) ← match num "limit" defaultPageSize, num "offset" 0 with
+    | .ok l, .ok o => pure (l, o)
+    | .error e, _ | _, .error e => return .error e .badRequest
+  unless 1 ≤ limit && limit ≤ maxPageSize do
+    return .error s!"'limit' must be between 1 and {maxPageSize}" .badRequest
+  let next : Json := if offset + limit < xs.size then (offset + limit : Nat) else .null
+  return .json (.mkObj [("items", .arr (xs.extract offset (offset + limit))),
+                        ("nextOffset", next)])
+
 private def parseBody (body : String) : Except String Json :=
   (Json.parse body).mapError (s!"the body is not valid JSON: " ++ ·)
 
@@ -415,11 +446,13 @@ it is left as it is")
 {job.version}); reload it")
   return st
 
-/-- The rubric a job's review is checked against: the version it was reviewed against, if it was,
-    and otherwise the repository's current one; `none` when there is none. An error when that
+/-- The rubric a job's review is checked against: the version it was reviewed against — 0 is no
+    rubric — and for a job that names none (made before rubrics, or not reviewed by the agent)
+    the repository's current one; `none` when there is none. An error when that
     version cannot be read by this build. -/
 private def rubricOfJob (job : Job) : IO (Except String (Option Rubric)) := do
   let version? ← match job.rubricVersion with
+    | some 0 => pure none
     | some v => Platform.rubricAt job.owner job.name v
     | none => Platform.currentRubric job.owner job.name
   match version? with
@@ -443,15 +476,7 @@ private def putReview (id body : String) : IO Reply := do
     | .ok r => pure r
     | .error e => return .error s!"'review' is not a review: {e}" .badRequest
   if let .error e := review.validate then return .error s!"'review': {e}" .badRequest
-  let some job ← Platform.findJob id | return .error "not found" .notFound
-  match ← rubricOfJob job with
-  | .error e => return .error e .conflict
-  | .ok doc =>
-    let allowed := (doc.map (·.categoriesFor job.prType)).getD []
-    if let .error e := review.checkCategories allowed then
-      return .error s!"'review': {e}" .badRequest
-  let review ← review.assignIds
-  updateReply <$> Platform.updateJob id (revision := Job.revisionBy .person) fun job => do
+  let editable (job : Job) : Except Platform.UpdateError Unit := do
     let st ← current job version
     if let some why := job.claimBlocks then throw (.conflict why)
     unless st.personCanEdit do
@@ -459,7 +484,28 @@ private def putReview (id body : String) : IO Reply := do
     if let some (.error e) := job.review? then
       throw (.conflict s!"job {id}'s stored review cannot be read by this build ({e}); it is \
 left as it is")
-    return { job.setReview review with statusRaw := JobStatus.draft.toString }
+  let some job ← Platform.findJob id | return .error "not found" .notFound
+  -- The checks of the job first: a stale page is told to reload before anything else.
+  if let .error e := editable job then return updateReply (.error e)
+  -- Only a category the edit adds or changes is checked: one the agent gave under the rubric it
+  -- reviewed by is the agent's, and stays as it was.
+  let stored := match job.review? with
+    | some (.ok r) => r.comments
+    | _ => []
+  let changed (c : InlineComment) : Bool := match c.id with
+    | none => true
+    | some i => (stored.find? (·.id == some i)).map (·.category) != some c.category
+  match ← rubricOfJob job with
+  | .error e => return .error e .conflict
+  | .ok doc =>
+    let allowed := (doc.map (·.categoriesFor job.prType)).getD []
+    if let .error e := review.checkCategories allowed changed then
+      return .error s!"'review': {e}" .badRequest
+  let review ← review.assignIds
+  updateReply <$> Platform.updateJob id (revision := Job.revisionBy .person) fun job => do
+    editable job
+    -- A person's edit ends the platform's own attempts to post.
+    return { job.setReview review with statusRaw := JobStatus.draft.toString, postDirect := false }
 
 /-- Make a person's decision on a job. The body is `{"status": …, "version": n}`. -/
 private def setStatus (id body : String) : IO Reply := do
@@ -483,8 +529,10 @@ private def setStatus (id body : String) : IO Reply := do
       | none => throw (.conflict s!"job {id} has no review to approve")
     -- Another run: the entry of the last one is history, and so is why it failed.
     if to == .pending then
-      return { job with statusRaw := to.toString, queueEntry := none, error := none }
-    return { job with statusRaw := to.toString }
+      return { job with statusRaw := to.toString, queueEntry := none, error := none
+                        postDirect := false }
+    -- A person's move ends the platform's own attempts to post.
+    return { job with statusRaw := to.toString, postDirect := false }
 
 /-- Post an approved review to GitHub. The body is `{"version": n}`. `502` when GitHub refuses,
     with the job — still `approved`, the reason in its `error` — beside the message. -/
@@ -596,7 +644,7 @@ private def apiRoute (st : State) (r : Req) (segs : List String) : IO Reply := d
     | none   => return .error "not found" .notFound
   | ["jobs", id, "revisions"], .get =>
     if (← Platform.findJob id).isNone then return .error "not found" .notFound
-    return .json (items ((← Platform.revisions id).map (·.toJson)))
+    page r.query ((← Platform.revisions id).map (·.toJson))
   | ["repos", owner, name, "rubrics"], .get =>
     let (owner, name) := (owner.toLower, name.toLower)
     if (← Platform.findRepo owner name).isNone then return .error "not found" .notFound
@@ -607,7 +655,7 @@ private def apiRoute (st : State) (r : Req) (segs : List String) : IO Reply := d
   | ["repos", owner, name, "rubrics", "history"], .get =>
     let (owner, name) := (owner.toLower, name.toLower)
     if (← Platform.findRepo owner name).isNone then return .error "not found" .notFound
-    return .json (items ((← Platform.rubricHistory owner name).map (·.toJson)))
+    page r.query ((← Platform.rubricHistory owner name).map (·.toJson))
   | ["repos"], _ | ["repos", _, _], _ | ["jobs"], _ | ["jobs", _], _
   | ["jobs", _, "review"], _ | ["jobs", _, "status"], _ | ["jobs", _, "post"], _
   | ["jobs", _, "reconcile"], _ | ["jobs", _, "revisions"], _
@@ -672,7 +720,7 @@ private def agentJobJson (job : Job) (rubric : Option (Nat × Rubric)) : Json :=
           ("title", job.title.getD ""), ("body", job.prBody.getD ""),
           ("status", job.statusRaw), ("instructions", Workers.instructionsFor doc),
           ("prTypes", .arr (((doc.map (·.prTypes)).getD []).map PrType.toJson).toArray),
-          ("rubricVersion", (rubric.map fun (v, _) => (v : Json)).getD .null),
+          ("rubricVersion", (rubric.map (·.1)).getD 0),
           ("examples", .arr #[])]
 
 /-- The first read of a queued job is the run starting: it moves to `running`. -/
@@ -729,7 +777,7 @@ show` first")
       throw (.conflict s!"the review is of {headSha}, but job {j.id} is of \
 {j.headSha.getD "no commit"}")
     return { j.setReview review with statusRaw := JobStatus.draft.toString, prType, error := none
-                                     rubricVersion := rubric.map (·.1) }
+                                     rubricVersion := some ((rubric.map (·.1)).getD 0) }
   let job ← match drafted with
     | .ok j => pure j
     | .error e => return updateReply (.error e)
@@ -905,6 +953,7 @@ private instance : Handler Server where
       | .v6 v => toString v.addr
     let r : Req :=
       { method := req.line.method, path := toString req.line.uri.path, body, peer
+      , query := req.line.uri.query.toRawString
       , header := fun n => (req.line.headers.get? (Header.Name.ofString! n)).map toString }
     toResponse (← route s.st r)
   onFailure _ _ := pure ()

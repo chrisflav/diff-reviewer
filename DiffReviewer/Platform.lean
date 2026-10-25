@@ -186,10 +186,13 @@ structure Job where
   postNote   : Option String := none
   /-- The review as GitHub holds it, `{"id", "url", "body"}`, once posted. -/
   postedReview : Option String := none
-  /-- The version of the repository's rubric the review was checked against. -/
+  /-- The version of the repository's rubric the review was checked against: 0 when the repository
+      had none, `none` for a job reviewed before rubrics existed. -/
   rubricVersion : Option Nat := none
-  /-- How many times posting the review has been attempted: claimed, and GitHub asked. -/
-  postAttempts : Nat := 0
+  /-- How many times the platform has posted the review on its own (`direct`). -/
+  directPosts : Nat := 0
+  /-- Whether the last claim to post was the platform's own, which it may make again. -/
+  postDirect : Bool := false
 
 def Job.status? (j : Job) : Option JobStatus := JobStatus.ofString? j.statusRaw
 
@@ -228,7 +231,7 @@ def Job.toJson (j : Job) : Json :=
     ("postNote", optStr j.postNote),
     ("postedReview", (j.postedReview.bind (Json.parse · |>.toOption)).getD .null),
     ("rubricVersion", (j.rubricVersion.map fun v => (v : Json)).getD .null),
-    ("postAttempts", j.postAttempts)]
+    ("directPosts", j.directPosts), ("postDirect", j.postDirect)]
 
 private def Job.ofRow (row : Store.JobRow) : Job :=
   { id := row.id, owner := row.owner, name := row.name, prNumber := row.pr_number.toNat
@@ -239,7 +242,7 @@ private def Job.ofRow (row : Store.JobRow) : Job :=
   , prType := row.pr_type, attempts := (row.attempts.getD 0).toNat
   , postStartedAt := row.post_started_at, postedUrl := row.posted_url, postNote := row.post_note
   , postedReview := row.posted_review, rubricVersion := row.rubric_version.map (·.toNat)
-  , postAttempts := (row.post_attempts.getD 0).toNat }
+  , directPosts := (row.direct_posts.getD 0).toNat, postDirect := row.post_direct.getD false }
 
 private def Job.toRow (j : Job) : Store.JobRow :=
   { id := j.id, owner := j.owner, name := j.name, pr_number := j.prNumber
@@ -250,7 +253,7 @@ private def Job.toRow (j : Job) : Store.JobRow :=
   , pr_type := j.prType, attempts := some j.attempts
   , post_started_at := j.postStartedAt, posted_url := j.postedUrl, post_note := j.postNote
   , posted_review := j.postedReview, rubric_version := j.rubricVersion.map Int.ofNat
-  , post_attempts := some j.postAttempts }
+  , direct_posts := some j.directPosts, post_direct := some j.postDirect }
 
 /-- The largest pull request number accepted: what fits a 32-bit column with room to spare. -/
 def maxPrNumber : Nat := 2147483647
@@ -377,7 +380,9 @@ def putRepo (owner name : String) (mode : PostingMode) (autoReview : Bool := fal
      , auto_review := some autoReview } : Store.RepoRow)
   return existing.isSome
 
-/-- Delete a repository. Its jobs are kept: they are the record of reviews that happened. -/
+/-- Delete a repository. Its jobs are kept: they are the record of reviews that happened. So are
+    its rubric versions, which those jobs name (`rubricVersion`): registering the repository again
+    picks up its rubric where it was. -/
 def deleteRepo (owner name : String) : IO Bool := do
   let n ← Store.run <| HasModel.delete (α := Store.RepoRow)
     (.and (.eq (.var Store.RepoRowIndex.owner .text) (.text owner.toLower))
@@ -498,6 +503,30 @@ inductive UpdateError where
   | conflict (why : String)
   | invalid (why : String)
 
+/-- The most recent revisions of a job's review kept, beside its first draft and what was posted. -/
+def maxRevisions : Nat := 100
+
+/-- Bound job `id`'s history: keep the agent's first draft, every revision by GitHub — what was
+    posted — and the last `maxRevisions`; drop the rest. What calibration needs is the draft and
+    the posted review; the edits between are kept as far back as is useful, and a job edited
+    without end does not grow without bound. -/
+private def pruneRevisions (id : String) : Sqlite.M Unit := do
+  let rows ← HasModel.fetch <| query% do
+    let r ← from Store.RevisionRow
+    guard r.job_id = id
+    select r
+    order_by r.version
+  if rows.size ≤ maxRevisions + 1 then return
+  let firstDraft := (rows.find? (·.author == Author.agent.toString)).map (·.version)
+  let recent := (rows.extract (rows.size - maxRevisions) rows.size).map (·.version)
+  let drop := rows.filter fun r =>
+    some r.version != firstDraft && !recent.contains r.version &&
+      r.author != Author.github.toString
+  if drop.isEmpty then return
+  let _ ← HasModel.delete (α := Store.RevisionRow)
+    (.and (.eq (.var Store.RevisionRowIndex.job_id .text) (.text id))
+          (.inList (.var Store.RevisionRowIndex.version .int) (drop.map (·.version)).toList))
+
 /-- Change job `id` with `f`, reading and writing it under one hold of the store's lock and in one
     transaction, so no other write — from this process or another — can land between the check `f`
     makes and the write that follows it. Bumps the version and the time on every write.
@@ -519,6 +548,7 @@ def updateJob (id : String) (f : Job → Except UpdateError Job)
       if let some (author, review) := revision next then
         HasModel.save ({ job_id := id, version := next.version, author := author.toString
                        , review, created_at := now } : Store.RevisionRow)
+        pruneRevisions id
       return .ok next
 
 /-- The revisions of job `id`'s review, oldest first. -/
@@ -545,22 +575,45 @@ private def fetchRubrics (owner name : String) : Sqlite.M (Array RubricVersion) 
 def rubricHistory (owner name : String) : IO (Array RubricVersion) :=
   Store.run (fetchRubrics owner name)
 
+private def fetchCurrentRubric (owner name : String) : Sqlite.M (Option RubricVersion) := do
+  let rows ← HasModel.fetch <| query% do
+    let r ← from Store.RubricRow
+    guard r.owner = owner
+    guard r.name = name
+    select r
+    order_by_desc r.version
+    limit 1
+  return rows[0]?.map RubricVersion.ofRow
+
 /-- The current version of `owner/name`'s rubric document, if it has one. -/
-def currentRubric (owner name : String) : IO (Option RubricVersion) := do
-  return (← rubricHistory owner name)[0]?
+def currentRubric (owner name : String) : IO (Option RubricVersion) :=
+  Store.run (fetchCurrentRubric owner name)
 
 /-- Version `version` of `owner/name`'s rubric document. -/
 def rubricAt (owner name : String) (version : Nat) : IO (Option RubricVersion) := do
-  return (← rubricHistory owner name).find? (·.version == version)
+  let rows ← Store.run <| HasModel.fetch <| query% do
+    let r ← from Store.RubricRow
+    guard r.owner = owner
+    guard r.name = name
+    guard r.version = (version : Int)
+    select r
+  return rows[0]?.map RubricVersion.ofRow
 
 /-- Write `doc` as the next version of `owner/name`'s rubric, if `expected` is the current
     version (0 for none yet): a versioned write, like a job's, so that two people editing the
-    rubric cannot overwrite each other unseen. The check and the write are one transaction. -/
+    rubric cannot overwrite each other unseen. The check and the write are one transaction. A
+    current version this build cannot read is not replaced (`conflict`): the person writing never
+    saw what it says, and the build that can read it should be the one to change it. -/
 def putRubric (owner name : String) (expected : Nat) (doc : Rubric) :
     IO (Except UpdateError RubricVersion) := do
   let now ← nowIso
   Store.transact do
-    let current := ((← fetchRubrics owner name)[0]?.map (·.version)).getD 0
+    let cur ← fetchCurrentRubric owner name
+    if let some c := cur then
+      if let .error e := c.rubric? then
+        return .error (.conflict s!"the rubric of {owner}/{name} (version {c.version}) cannot be \
+read by this build ({e}); it is left as it is")
+    let current := (cur.map (·.version)).getD 0
     unless current == expected do
       return .error (.conflict s!"the rubric of {owner}/{name} has changed since it was read \
 (version {expected}, now {current}); reload it")

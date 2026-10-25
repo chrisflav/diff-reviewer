@@ -222,10 +222,13 @@ def Review.validate (r : Review) : Except String Unit := do
         throw s!"{at_}: 'category' must be 1 to {maxCategoryLength} characters"
 
 /-- Why a comment of `r` names a category outside `allowed`, if one does. An empty `allowed` is a
-    repository whose rubric names no categories, where any category is free text. -/
-def Review.checkCategories (r : Review) (allowed : List String) : Except String Unit := do
+    rubric that names no categories for the review, where any category is free text. Only the
+    comments `checked` says are looked at. -/
+def Review.checkCategories (r : Review) (allowed : List String)
+    (checked : InlineComment → Bool := fun _ => true) : Except String Unit := do
   if allowed.isEmpty then return
   for (c, i) in r.comments.zipIdx do
+    if !checked c then continue
     if let some cat := c.category then
       unless allowed.contains cat do
         throw s!"comment {i + 1}: '{cat}' is not a category of the rubric; it is one of \

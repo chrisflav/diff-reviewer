@@ -45,15 +45,19 @@ It is built in milestones. The first three are here:
   does only that check, without posting: found, the job is `posted`; not found once the claim's
   window has passed, the claim is cleared and the job is free to be edited, rejected or go stale.
   The workers make the same check on every pass, so a claim is settled even when nobody asks — in
-  a `direct` repository nobody may. There, a review found not to have reached GitHub is posted
-  again, as a comment, up to 3 posts of the job in all; after that it is left `approved`, with why
-  in its `error`, for a person to post.
+  a `direct` repository nobody may. There, a review the platform posted that is found not to have
+  reached GitHub is posted again, as a comment — but only if the pull request is still open at the
+  job's head (otherwise the job is `stale`), and at most 3 posts by the platform in all; after that
+  it is left `approved`, with why in its `error`, for a person to post. A post a person starts is
+  never posted again by the platform, and does not count.
 - **Rubrics** (`/api/v1/repos/{owner}/{name}/rubrics`): per repository, a default rubric and the
   kinds of pull request its reviews tell apart, each with its own rubric and categories, which the
   agent reviews by. See [Rubrics](#rubrics).
 - **A review's history** (`GET /api/v1/jobs/{id}/revisions`): every write of a job's review — the
   agent's submission, each edit, and what GitHub holds once it is posted — kept with who wrote it.
-  The agent's draft beside what was posted is what calibration will learn from.
+  The agent's draft beside what was posted is what calibration will learn from. It is bounded: the
+  agent's first draft, every revision GitHub holds, and the last 100 are kept. It and the rubric
+  history are paged (`?limit=…&offset=…`, 50 by default).
 - **A web front-end** (`web/`): sign in, register repositories, request a review, read a review,
   edit it, approve or reject it. Every write names the version of the job it was made on, so a
   stale page is refused rather than overwriting.
@@ -198,17 +202,21 @@ A repository's rubric is one document, `GET`/`PUT /api/v1/repos/{owner}/{name}/r
   `instructions`, and the types in `prTypes`, each with its rubric and categories. The agent picks
   the type that fits, reviews by its rubric, and gives every comment a `severity` — `nit`,
   `minor`, `major` or `blocker` — and a `category`. Its submission must name one of the types as
-  `prType` (or `null` when there are none), and each category must be one of that type's (or of
-  any type, if that type lists none; free text when the rubric names no categories at all): the
-  platform refuses anything else, saying what to fix, while the agent can still fix it. A
-  person's edit is checked the same way.
+  `prType` (or `null` when there are none), and each category must be one of that type's — or
+  is free text when that type lists none: the platform refuses anything else, saying what to fix,
+  while the agent can still fix it. A person's edit is checked the same way, for the comments
+  whose category it adds or changes; a job of no type (reviewed by hand) may use any category of
+  the document, or free text if it names none. A job reviewed with no rubric at all records
+  `rubricVersion` 0.
 - **Versions.** Every `PUT` names the version it replaces (`0` for the first) and is refused
   (`409`) if that is no longer the current one; it becomes the next version, and every version is
   kept (`GET …/rubrics/history`). A job records the version and the type it was reviewed against
   (`rubricVersion`, `prType`), so a review is always read next to the rubric it was written to.
   Fields the platform does not know, on the document, a type or a category, are kept through every
   write, so a newer front-end's additions survive an older platform; and a `GET`'s answer may be
-  sent back as the next `PUT` as it is, edited.
+  sent back as the next `PUT` as it is, edited. A version this build cannot read is shown with its
+  `documentError` and is not overwritten (`409`). Deleting a repository keeps its rubric versions,
+  as it keeps its jobs, which name them: registering it again picks its rubric up where it was.
 - **Not on GitHub.** Categories and severities are for the platform — reading, filtering, and
   calibration later — and are not part of what is posted: a posted review stays in the operator's
   plain style. (To be revisited with learned review style, M4.)

@@ -73,11 +73,16 @@ structure JobRow where
   /-- The review as GitHub holds it, `{"id", "url", "body"}`: what was posted, which after a
       reconciliation may not be the job's own review (`0002`). -/
   posted_review : Option String
-  /-- The version of the repository's rubric the review was checked against (`0003`). -/
+  /-- The version of the repository's rubric the review was checked against, 0 for none (`0003`).
+      Null for a job reviewed before rubrics existed. -/
   rubric_version : Option Int
-  /-- How many times posting the review has been claimed: each a request to GitHub (`0003`); none
-      is 0. -/
-  post_attempts : Option Int
+  /-- How many times the platform has posted the review on its own, in a `direct` repository: each
+      a claim, and a request to GitHub (`0003`); none is 0. A person's posts are not counted. -/
+  direct_posts : Option Int
+  /-- Whether the last claim to post was the platform's own, in a `direct` repository, and so a
+      post the platform may make again once the claim is settled as not having reached GitHub
+      (`0003`); none is `false`. -/
+  post_direct : Option Bool
   deriving Repr
 
 /-- The diff of a pull request at one head commit, as GitHub gave it. A commit's diff never
@@ -174,14 +179,15 @@ def migration0002 : Db.Migration.Migration where
         primaryKey := ["owner", "name", "base_sha", "head_sha"] }]
 
 /-- `0003_m2`: rubrics, and the history of each job's review — the rubric versions of a repository,
-    a job's revisions, the rubric version a job was reviewed against, and how many times posting
-    it was attempted. The new columns are nullable: a job reviewed before rubrics existed was
-    reviewed against none, and its attempts are not known. -/
+    a job's revisions, the rubric version a job was reviewed against, and the platform's own posts
+    of it. The new columns are nullable: `rubric_version` is null for a job written before rubrics
+    existed (a job reviewed against no rubric has 0), and the posting columns read as none yet. -/
 def migration0003 : Db.Migration.Migration where
   name := "0003_m2"
   steps := [
     .addColumn "review_job" "rubric_version" { type := .int, nullable := true },
-    .addColumn "review_job" "post_attempts" { type := .int, nullable := true },
+    .addColumn "review_job" "direct_posts" { type := .int, nullable := true },
+    .addColumn "review_job" "post_direct" { type := .bool, nullable := true },
     .createTable "repo_rubric"
       { columns := .ofList
           [("owner", { type := .text, nullable := false }),

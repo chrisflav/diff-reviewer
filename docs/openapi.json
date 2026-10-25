@@ -229,7 +229,7 @@
       },
       "delete": {
         "summary": "Unregister a repository",
-        "description": "Its jobs are kept: they are the record of reviews that happened.",
+        "description": "Its jobs are kept: they are the record of reviews that happened. So are its rubric versions, which those jobs name: registering the repository again picks its rubric up where it was.",
         "operationId": "deleteRepo",
         "responses": {
           "204": {
@@ -849,7 +849,7 @@
       ],
       "post": {
         "summary": "Submit the review",
-        "description": "The job must be `running` and `headSha` must be its head (`409` otherwise). The review must be one GitHub would take (`400`, saying what to fix): at most 200 inline comments, a summary unless it approves, and every comment's lines in one hunk of the diff's new side. `prType` must be one of the rubric's pull request types, or null when it names none, and each comment's `category` one of that type's categories (see `InlineComment`) (`400`). Comments without an `id` are given one. The job becomes a `draft`, recording `prType` and the rubric's version, and the review is the first of its revisions. For a repository in `direct` mode the platform then posts it — always as a comment, whatever its decision, which the job keeps; if posting fails the job is left `approved` with the reason in `error`, and the submission still stands; when the post's outcome was unknown and it is found not to have reached GitHub, the workers post it again, up to 3 posts in all.",
+        "description": "The job must be `running` and `headSha` must be its head (`409` otherwise). The review must be one GitHub would take (`400`, saying what to fix): at most 200 inline comments, a summary unless it approves, and every comment's lines in one hunk of the diff's new side. `prType` must be one of the rubric's pull request types, or null when it names none, and each comment's `category` one of that type's categories (see `InlineComment`) (`400`). Comments without an `id` are given one. The job becomes a `draft`, recording `prType` and the rubric's version (0 for none), and the review is the first of its revisions. For a repository in `direct` mode the platform then posts it — always as a comment, whatever its decision, which the job keeps; if posting fails the job is left `approved` with the reason in `error`, and the submission still stands; when the post's outcome was unknown and it is found not to have reached GitHub, the workers post it again, if the pull request is still open at the job's head, up to 3 posts in all.",
         "operationId": "agentSubmit",
         "security": [
           {
@@ -947,7 +947,7 @@
       ],
       "post": {
         "summary": "Settle a post whose outcome is unknown, without posting",
-        "description": "For a job whose `postStartedAt` is set — a post that may have reached GitHub. The pull request's reviews by the operator are searched for the job's marker. Found, the job is `posted`, with GitHub's record in `postedReview`. Not found and the claim older than its window (three times the post's timeout), the claim is cleared and the job left `approved`, free to be moved back to `draft`, rejected, posted again or made `stale`. Not found within the window, a `409`: the post may still be under way. Reviews that cannot be read leave the claim as it is: a `502` that carries the job. `409` too for a job that is not `approved`, not at `version`, or has no claim. The workers do the same on every pass for every claim past its window, so a claim is settled without this too. In a `direct` repository the workers then post a review that did not reach GitHub again, as a comment, up to 3 posts of the job in all; past that it is left `approved` with the reason in `error`.",
+        "description": "For a job whose `postStartedAt` is set — a post that may have reached GitHub. The pull request's reviews by the operator are searched for the job's marker. Found, the job is `posted`, with GitHub's record in `postedReview`. Not found and the claim older than its window (three times the post's timeout), the claim is cleared and the job left `approved`, free to be moved back to `draft`, rejected, posted again or made `stale`. Not found within the window, a `409`: the post may still be under way. Reviews that cannot be read leave the claim as it is: a `502` that carries the job. `409` too for a job that is not `approved`, not at `version`, or has no claim. The workers do the same on every pass for every claim past its window, so a claim is settled without this too. In a `direct` repository the workers then post a review of their own that did not reach GitHub again, as a comment, if its pull request is still open at the job's head (otherwise the job is made `stale`), up to 3 posts by the platform; past that it is left `approved` with the reason in `error`. A post a person started is never posted again by the workers.",
         "operationId": "reconcileJob",
         "requestBody": {
           "required": true,
@@ -1034,7 +1034,7 @@
       ],
       "get": {
         "summary": "The history of a job's review",
-        "description": "Every write of the job's review, oldest first: the agent's submission, each person's edit, and what GitHub holds once it is posted. What the agent drafted beside what was posted.",
+        "description": "Every write of the job's review, oldest first: the agent's submission, each person's edit, and what GitHub holds once it is posted. What the agent drafted beside what was posted. Paged: `limit` (default 50, at most 200) and `offset`; `400` for a `limit` or `offset` that is not one. The history is bounded: the agent's first draft, every `github` revision (what was posted) and the last 100 revisions are kept, and older edits between them are dropped.",
         "operationId": "listRevisions",
         "responses": {
           "200": {
@@ -1044,7 +1044,8 @@
                 "schema": {
                   "type": "object",
                   "required": [
-                    "items"
+                    "items",
+                    "nextOffset"
                   ],
                   "properties": {
                     "items": {
@@ -1052,6 +1053,13 @@
                       "items": {
                         "$ref": "#/components/schemas/Revision"
                       }
+                    },
+                    "nextOffset": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ],
+                      "description": "The `offset` of the next page; null on the last."
                     }
                   }
                 }
@@ -1063,8 +1071,36 @@
           },
           "404": {
             "$ref": "#/components/responses/Error"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
           }
-        }
+        },
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 200,
+              "default": 50
+            },
+            "description": "The most items in the page."
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0
+            },
+            "description": "How many items to skip."
+          }
+        ]
       }
     },
     "/api/v1/repos/{owner}/{name}/rubrics": {
@@ -1111,7 +1147,7 @@
       },
       "put": {
         "summary": "Replace a repository's rubric document",
-        "description": "The body is the whole document with the version it replaces, as last read (`409` if that is no longer the current one). It becomes the next version, and the one it replaces stays in the history. A type's `description`, `rubric` and `categories` default to empty. `400` for a type or category without a name or with the name of another, past 50 types or 50 categories a type, or a rubric past 65536 bytes. The answer of a `GET` may be sent back as it is, edited: its `owner`, `name`, `createdAt` and `documentError` are not kept as the document's, and fields this build does not know, on the document, a type or a category, are kept.",
+        "description": "The body is the whole document with the version it replaces, as last read (`409` if that is no longer the current one). It becomes the next version, and the one it replaces stays in the history. A type's `description`, `rubric` and `categories` default to empty. `400` for a type or category without a name or with the name of another, past 50 types or 50 categories a type, or a rubric past 65536 bytes. The answer of a `GET` may be sent back as it is, edited: its `owner`, `name`, `createdAt` and `documentError` are not kept as the document's, and fields this build does not know, on the document, a type or a category, are kept. A field may be left out (it is then empty) but not `null` (`400`). `409` too while the current version cannot be read by this build (`documentError`): it is left for a build that can.",
         "operationId": "putRubrics",
         "requestBody": {
           "required": true,
@@ -1192,7 +1228,7 @@
       ],
       "get": {
         "summary": "Every version of a repository's rubric document",
-        "description": "Newest first. A job's `rubricVersion` names one of them.",
+        "description": "Newest first. A job's `rubricVersion` names one of them. Paged: `limit` (default 50, at most 200) and `offset`; `400` for a `limit` or `offset` that is not one.",
         "operationId": "getRubricHistory",
         "responses": {
           "200": {
@@ -1202,7 +1238,8 @@
                 "schema": {
                   "type": "object",
                   "required": [
-                    "items"
+                    "items",
+                    "nextOffset"
                   ],
                   "properties": {
                     "items": {
@@ -1210,6 +1247,13 @@
                       "items": {
                         "$ref": "#/components/schemas/RubricDocument"
                       }
+                    },
+                    "nextOffset": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ],
+                      "description": "The `offset` of the next page; null on the last."
                     }
                   }
                 }
@@ -1221,8 +1265,36 @@
           },
           "404": {
             "$ref": "#/components/responses/Error"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
           }
-        }
+        },
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 200,
+              "default": 50
+            },
+            "description": "The most items in the page."
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0
+            },
+            "description": "How many items to skip."
+          }
+        ]
       }
     }
   },
@@ -1342,7 +1414,8 @@
           "postNote",
           "postedReview",
           "rubricVersion",
-          "postAttempts"
+          "directPosts",
+          "postDirect"
         ],
         "properties": {
           "id": {
@@ -1497,12 +1570,16 @@
               "integer",
               "null"
             ],
-            "description": "The version of the repository's rubric document the review was checked against: recorded with the agent's submission; null for a job the agent has not reviewed."
+            "description": "The version of the repository's rubric document the review was checked against, recorded with the agent's submission: 0 when the repository had none; null for a job the agent has not reviewed, or one from before rubrics, whose edits are checked against the current rubric."
           },
-          "postAttempts": {
+          "directPosts": {
             "type": "integer",
             "minimum": 0,
-            "description": "How many times posting the review has been attempted (claimed, and GitHub asked). In a `direct` repository the platform posts on its own at most 3 times in all."
+            "description": "How many times the platform has posted the review on its own, in a `direct` repository: the post on submission and each post again after a claim was settled as not having reached GitHub. At most 3; a person's posts are not counted."
+          },
+          "postDirect": {
+            "type": "boolean",
+            "description": "Whether the last post was the platform's own, which it posts again (if the pull request is still open at the job's head, and fewer than 3 times) once its claim is settled as not having reached GitHub. A person's post, edit or move clears it."
           }
         }
       },
@@ -1572,7 +1649,7 @@
           "category": {
             "type": "string",
             "maxLength": 100,
-            "description": "What the comment is about: when the repository's rubric names categories, one of those of the job's pull request type (or, if that type names none, of any type); otherwise free text."
+            "description": "What the comment is about: one of the categories of the job's pull request type, or free text when that type lists none. A job of no type (reviewed by hand) may use any category of the rubric, or free text when it names none. On a person's edit only a category that is new or changed is checked."
           },
           "severity": {
             "type": "string",
@@ -1672,11 +1749,9 @@
             }
           },
           "rubricVersion": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "description": "The version of the rubric document these come from; null when the repository has none."
+            "type": "integer",
+            "minimum": 0,
+            "description": "The version of the rubric document these come from; 0 when the repository has none."
           }
         }
       },
