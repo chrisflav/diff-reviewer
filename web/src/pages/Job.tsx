@@ -525,7 +525,7 @@ function JobView({ id, onUnauthorized }: { id: string; onUnauthorized: () => voi
             <dt>Style notes</dt>
             <dd>
               {job.notesVersion === null ? (
-                <span className="mute">not recorded (the agent has not read the job)</span>
+                <span className="mute">not recorded</span>
               ) : job.notesVersion === 0 ? (
                 <span className="mute">none (the agent was given no style notes)</span>
               ) : (
