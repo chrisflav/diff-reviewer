@@ -180,7 +180,7 @@ private def putRepo (owner name body : String) : IO Reply := do
       | none => return .error s!"'mode' must be 'staged' or 'direct', not '{s}'" .badRequest
     | .ok _ => return .error "'mode' must be a string" .badRequest
   let existed ← Platform.putRepo owner name mode
-  let some repo ← Platform.findRepo owner name
+  let some repo ← Platform.findRepo owner.toLower name.toLower
     | return .error "the repository was written and could not be read back" .internalServerError
   return .json repo.toJson (if existed then .ok else .created)
 
@@ -194,41 +194,83 @@ private def createJob (body : String) : IO Reply := do
     | return .error "the body must name the repository's 'name'" .badRequest
   let some prNumber := (j.getObjValAs? Nat "prNumber").toOption
     | return .error "the body must name the pull request as a whole number 'prNumber'" .badRequest
-  let headSha := (j.getObjValAs? String "headSha").toOption
-  let some repo ← Platform.findRepo owner name
+  unless 1 ≤ prNumber && prNumber ≤ maxPrNumber do
+    return .error s!"'prNumber' must be between 1 and {maxPrNumber}" .badRequest
+  let headSha ← match j.getObjVal? "headSha" with
+    | .error _ | .ok .null => pure none
+    | .ok (.str sha) =>
+      let sha := sha.toLower
+      unless validSha sha do
+        return .error s!"'headSha' must be a commit id (7 to 64 hex digits), not '{sha}'" .badRequest
+      pure (some sha)
+    | .ok _ => return .error "'headSha' must be a string" .badRequest
+  let some repo ← Platform.findRepo owner.toLower name.toLower
     | return .error s!"{owner}/{name} is not a registered repository" .notFound
   let job ← Platform.createJob repo prNumber headSha
   return .json job.toJson .created
 
-/-- Replace a job's review. The body is a review in `Review`'s JSON form. Editing a review makes
-    the job a draft again — an approval was of the review as it was — except that a posted review
-    is history and is not edited. -/
-private def putReview (id body : String) : IO Reply := do
-  let some job ← Platform.findJob id | return .error "not found" .notFound
-  if job.status == .posted then
-    return .error s!"job {id} is posted; a posted review is not edited" .conflict
-  let review ← match Review.ofJsonString body with
-    | .ok r => pure r
-    | .error e => return .error s!"the body is not a review: {e}" .badRequest
-  let job := { job with review := some review, status := .draft, updatedAt := ← nowIso }
-  Platform.saveJob job
-  return .json job.toJson
+/-- The `version` a write names: the version of the job the client last read. -/
+private def versionOf (j : Json) : Except String Nat :=
+  match j.getObjValAs? Nat "version" with
+  | .ok v => .ok v
+  | .error _ => .error "the body must carry the job's 'version', as last read"
 
-private def setStatus (id body : String) : IO Reply := do
-  let some job ← Platform.findJob id | return .error "not found" .notFound
+private def updateReply : Except Platform.UpdateError Job → Reply
+  | .ok job => .json job.toJson
+  | .error .notFound => .error "not found" .notFound
+  | .error (.conflict why) => .error why .conflict
+  | .error (.invalid why) => .error why .badRequest
+
+/-- The checks every person's write makes on the job it is about: this build understands its
+    status, and it is the version the client read. -/
+private def current (job : Job) (version : Nat) : Except Platform.UpdateError JobStatus := do
+  let some st := job.status?
+    | throw (.conflict s!"job {job.id} is '{job.statusRaw}', a status this build does not know; \
+it is left as it is")
+  unless job.version == version do
+    throw (.conflict s!"job {job.id} has changed since it was read (version {version}, now \
+{job.version}); reload it")
+  return st
+
+/-- Replace a job's review. The body is `{"version": n, "review": {...}}`. Editing makes the job a
+    draft again — an approval was of the review as it was. -/
+private def putReview (id body : String) : IO Reply := do
   let j ← match parseBody body with
     | .ok j => pure j
     | .error e => return .error e .badRequest
+  let version ← match versionOf j with
+    | .ok v => pure v
+    | .error e => return .error e .badRequest
+  let review ← match j.getObjVal? "review" >>= Review.ofJson with
+    | .ok r => pure r
+    | .error e => return .error s!"'review' is not a review: {e}" .badRequest
+  if let .error e := review.validate then return .error s!"'review': {e}" .badRequest
+  updateReply <$> Platform.updateJob id fun job => do
+    let st ← current job version
+    unless st.personCanEdit do
+      throw (.conflict s!"job {id} is {st.toString}; its review is not edited now")
+    return { job.setReview review with statusRaw := JobStatus.draft.toString }
+
+/-- Make a person's decision on a job. The body is `{"status": …, "version": n}`. -/
+private def setStatus (id body : String) : IO Reply := do
+  let j ← match parseBody body with
+    | .ok j => pure j
+    | .error e => return .error e .badRequest
+  let version ← match versionOf j with
+    | .ok v => pure v
+    | .error e => return .error e .badRequest
   let some to := (j.getObjValAs? String "status").toOption.bind JobStatus.ofString?
-    | return .error s!"'status' must be one of \
-{", ".intercalate (JobStatus.all.map (·.toString))}" .badRequest
-  unless job.status.canMove to do
-    return .error s!"job {id} is {job.status.toString} and cannot become {to.toString}" .conflict
-  if to == .approved && job.review.isNone then
-    return .error s!"job {id} has no review to approve" .conflict
-  let job := { job with status := to, updatedAt := ← nowIso }
-  Platform.saveJob job
-  return .json job.toJson
+    | return .error "'status' must be approved, rejected, stale or draft" .badRequest
+  updateReply <$> Platform.updateJob id fun job => do
+    let st ← current job version
+    unless st.personCanMove to do
+      throw (.conflict s!"job {id} is {st.toString} and cannot be made {to.toString} from here")
+    if to == .approved then
+      match job.review? with
+      | some (.ok _) => pure ()
+      | some (.error e) => throw (.conflict s!"job {id}'s review does not parse ({e})")
+      | none => throw (.conflict s!"job {id} has no review to approve")
+    return { job with statusRaw := to.toString }
 
 /-- Every route under `/api/v1/`, with the methods it answers. `DiffReviewerTest.Server` checks
     this against `docs/openapi.json`, so a route without a spec entry fails the suite. -/
@@ -307,7 +349,11 @@ private def serveStatic (root : System.FilePath) (path : String) : IO Reply := d
 /-! ## Routing -/
 
 /-- Answer one request. The credential is required first, before any route runs, except for the
-    public paths and the site — checking once is what keeps a route from being open by omission. -/
+    public paths and the site — checking once is what keeps a route from being open by omission.
+
+    Two things keep a write from being forged by another site: the cookie is `SameSite=Strict`,
+    and a write has to be JSON (or a `DELETE`), which from another origin needs a CORS preflight
+    this server never grants. So: no CORS headers, and no `GET` that changes anything. -/
 def route (st : State) (r : Req) : IO Reply := do
   let isSite := r.method == .get && !r.path.startsWith "/api/"
   unless publicPaths.contains r.path || isSite || (← authenticated st r) do
@@ -341,8 +387,11 @@ def route (st : State) (r : Req) : IO Reply := do
   if r.method == .post || r.method == .put then
     unless isJsonContentType (r.header "content-type") do
       return .error "writes must be sent as application/json" .unsupportedMediaType
+  -- The reason goes to the log, not the response: it can quote SQL and stored values.
   try apiRoute r segs
-  catch e => return .error (toString e) .internalServerError
+  catch e =>
+    IO.eprintln s!"diff-reviewer: {r.path}: {e}"
+    return .error "internal error; see the server log" .internalServerError
 
 /-! ## Serving -/
 
@@ -357,6 +406,10 @@ private def toResponse (rep : Reply) : Async (Response Body.Any) := do
     |>.header! "X-Content-Type-Options" "nosniff"
     |>.header! "X-Frame-Options" "DENY"
     |>.header! "Referrer-Policy" "no-referrer"
+    -- Review text is written by agents reading pull requests, so it is untrusted: the app renders
+    -- it as text, and this keeps anything that slipped through from loading or running.
+    |>.header! "Content-Security-Policy"
+      "default-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'"
   let b := if rep.contentType.isEmpty then b else b.header! "Content-Type" rep.contentType
   let b := rep.headers.foldl (fun b (k, v) => b.header! k v) b
   b.fromBytes rep.body

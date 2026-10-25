@@ -3,7 +3,7 @@
   "info": {
     "title": "diff-reviewer platform API",
     "version": "0.1.0",
-    "description": "The review platform: the repositories whose pull requests it reviews, and one review job per review. A job moves `pending → queued → running → draft → approved → posted`; `rejected` is a discarded draft and `stale` a draft whose pull request has moved on.\n\nEvery route under `/api/v1/` needs the platform's secret, as `Authorization: Bearer <secret>` or the session cookie `POST /api/login` sets. Every write must be `application/json` (`415` otherwise). Collections answer `{\"items\": [...]}`. Instants are RFC 3339 in UTC; an absent value is `null`."
+    "description": "The review platform: the repositories whose pull requests it reviews, and one review job per review. A job moves `pending → queued → running → draft → approved → posted`; `rejected` is a discarded draft and `stale` a draft whose pull request has moved on.\n\nEvery route under `/api/v1/` needs the platform's secret, as `Authorization: Bearer <secret>` or the session cookie `POST /api/login` sets. Every write under `/api/v1/` must be `application/json` (`415` otherwise). Every write to a job names the job's `version` as last read, and is a `409` if the job has changed since. A request the server fails on is a `500` whose reason goes to the server log; a method a route does not answer is a `405`. Collections answer `{\"items\": [...]}`. Instants are RFC 3339 in UTC; an absent value is `null`."
   },
   "security": [
     {
@@ -201,7 +201,8 @@
           "415": {
             "$ref": "#/components/responses/Error"
           }
-        }
+        },
+        "description": "Names are stored in lower case, as GitHub compares them."
       },
       "delete": {
         "summary": "Unregister a repository",
@@ -274,11 +275,13 @@
                   },
                   "prNumber": {
                     "type": "integer",
-                    "minimum": 0
+                    "minimum": 1,
+                    "maximum": 2147483647
                   },
                   "headSha": {
                     "type": "string",
-                    "description": "The head commit the review is for."
+                    "pattern": "^[0-9a-fA-F]{7,64}$",
+                    "description": "The head commit the review is for; stored in lower case."
                   }
                 }
               }
@@ -365,14 +368,26 @@
       ],
       "put": {
         "summary": "Replace a job's review",
-        "description": "Makes the job a `draft` again: an approval was of the review as it was. A `posted` review is history and is not edited (`409`).",
+        "description": "The body is `{\"version\": n, \"review\": {...}}`. Allowed while the job is `pending`, `draft`, `approved` or `rejected` (`409` otherwise: the agent may still be writing it, or it is history), and makes it a `draft`: an approval was of the review as it was. Each comment must name a file and lines `1 ≤ start_line ≤ end_line`, and say something.",
         "operationId": "putReview",
         "requestBody": {
           "required": true,
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/Review"
+                "type": "object",
+                "required": [
+                  "version",
+                  "review"
+                ],
+                "properties": {
+                  "version": {
+                    "type": "integer"
+                  },
+                  "review": {
+                    "$ref": "#/components/schemas/Review"
+                  }
+                }
               }
             }
           }
@@ -418,8 +433,8 @@
         }
       ],
       "post": {
-        "summary": "Move a job on",
-        "description": "The moves a person makes: `draft → approved | rejected | stale`, `approved → draft | posted`, `rejected → draft`, and the run's own `pending → queued → running → draft`. Any other move is a `409`, and so is approving a job with no review.",
+        "summary": "Make a person's decision on a job",
+        "description": "A person's moves only: `draft → approved | rejected | stale`, `approved → draft`, `rejected → draft`. Queueing, running, the agent's draft and posting are the platform's own, and no request makes them. Any other move is a `409`, and so is approving a job without a readable review.",
         "operationId": "setJobStatus",
         "requestBody": {
           "required": true,
@@ -428,11 +443,21 @@
               "schema": {
                 "type": "object",
                 "required": [
-                  "status"
+                  "status",
+                  "version"
                 ],
                 "properties": {
                   "status": {
-                    "$ref": "#/components/schemas/JobStatus"
+                    "type": "string",
+                    "enum": [
+                      "approved",
+                      "rejected",
+                      "stale",
+                      "draft"
+                    ]
+                  },
+                  "version": {
+                    "type": "integer"
                   }
                 }
               }
@@ -560,7 +585,9 @@
           "queueEntry",
           "review",
           "createdAt",
-          "updatedAt"
+          "updatedAt",
+          "reviewError",
+          "version"
         ],
         "properties": {
           "id": {
@@ -573,16 +600,20 @@
             "type": "string"
           },
           "prNumber": {
-            "type": "integer"
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 2147483647
           },
           "headSha": {
             "type": [
               "string",
               "null"
-            ]
+            ],
+            "pattern": "^[0-9a-f]{7,64}$"
           },
           "status": {
-            "$ref": "#/components/schemas/JobStatus"
+            "type": "string",
+            "description": "A `JobStatus`; a status a newer build wrote is shown as it is, and the job is read-only to this one."
           },
           "queueEntry": {
             "type": [
@@ -608,6 +639,18 @@
           "updatedAt": {
             "type": "string",
             "format": "date-time"
+          },
+          "reviewError": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why the stored review cannot be read by this build, when it cannot; `review` is then null and the job is read-only."
+          },
+          "version": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Incremented by every write; sent back with the next one."
           }
         }
       },

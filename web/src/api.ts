@@ -62,11 +62,24 @@ export interface Job {
   name: string;
   prNumber: number;
   headSha: string | null;
-  status: JobStatus;
+  /** A `JobStatus`, or one a newer build wrote, which this one shows and does not change. */
+  status: JobStatus | string;
   queueEntry: string | null;
   review: Review | null;
+  /** Why the stored review could not be read, when it could not. */
+  reviewError: string | null;
+  /** Sent back with every write, so that a stale page gets a 409 instead of overwriting. */
+  version: number;
   createdAt: string;
   updatedAt: string;
+}
+
+/** Thrown when the server could not be reached at all. */
+export class NetworkError extends Error {
+  constructor() {
+    super("the server could not be reached");
+    this.name = "NetworkError";
+  }
 }
 
 async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
@@ -75,7 +88,12 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
     init.headers = { "Content-Type": "application/json" };
     init.body = JSON.stringify(body);
   }
-  const res = await fetch(path, init);
+  let res: Response;
+  try {
+    res = await fetch(path, init);
+  } catch {
+    throw new NetworkError();
+  }
   if (res.status === 401) throw new UnauthorizedError();
   if (res.status === 204) return undefined as T;
   const text = await res.text();
@@ -102,31 +120,41 @@ export const api = {
 
   repos: () => request<{ items: Repo[] }>("GET", "/api/v1/repos").then((r) => r.items),
   putRepo: (owner: string, name: string, mode: PostingMode) =>
-    request<Repo>("PUT", `/api/v1/repos/${owner}/${name}`, { mode }),
+    request<Repo>("PUT", `/api/v1/repos/${seg(owner)}/${seg(name)}`, { mode }),
   deleteRepo: (owner: string, name: string) =>
-    request<void>("DELETE", `/api/v1/repos/${owner}/${name}`),
+    request<void>("DELETE", `/api/v1/repos/${seg(owner)}/${seg(name)}`),
 
   jobs: () => request<{ items: Job[] }>("GET", "/api/v1/jobs").then((r) => r.items),
-  job: (id: string) => request<Job>("GET", `/api/v1/jobs/${id}`),
+  job: (id: string) => request<Job>("GET", `/api/v1/jobs/${seg(id)}`),
   createJob: (owner: string, name: string, prNumber: number, headSha: string | null) =>
     request<Job>("POST", "/api/v1/jobs", headSha === null
       ? { owner, name, prNumber }
       : { owner, name, prNumber, headSha }),
-  putReview: (id: string, review: Review) => request<Job>("PUT", `/api/v1/jobs/${id}/review`, review),
-  setStatus: (id: string, status: JobStatus) =>
-    request<Job>("POST", `/api/v1/jobs/${id}/status`, { status }),
+  putReview: (id: string, version: number, review: Review) =>
+    request<Job>("PUT", `/api/v1/jobs/${seg(id)}/review`, { version, review }),
+  setStatus: (id: string, version: number, status: JobStatus) =>
+    request<Job>("POST", `/api/v1/jobs/${seg(id)}/status`, { status, version }),
 };
 
-/** The moves a person makes from a job's page; mirrors `JobStatus.canMove` in Lean. */
-export function nextStatuses(s: JobStatus): JobStatus[] {
+/** One path segment, encoded, so that a `/`, `?` or `#` in it cannot change the path. */
+function seg(s: string): string {
+  return encodeURIComponent(s);
+}
+
+/** The moves a person makes from a job's page; mirrors `JobStatus.personCanMove` in Lean. */
+export function nextStatuses(s: string): JobStatus[] {
   switch (s) {
     case "draft":
       return ["approved", "rejected", "stale"];
     case "approved":
-      return ["posted", "draft"];
     case "rejected":
       return ["draft"];
     default:
       return [];
   }
+}
+
+/** Whether a person may edit the review now; mirrors `JobStatus.personCanEdit` in Lean. */
+export function canEdit(s: string): boolean {
+  return s === "pending" || s === "draft" || s === "approved" || s === "rejected";
 }

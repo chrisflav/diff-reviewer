@@ -90,4 +90,16 @@ def Review.toJsonString (r : Review) : String :=
 def Review.ofJsonString (s : String) : Except String Review :=
   (Lean.Json.parse s).bind Review.ofJson
 
+/-- Why `r` could not be posted as a GitHub review, or `ok`: every comment names a file and a
+    line range starting at 1 with its end at or after its start, and says something. Checked when
+    a review is written, so a review that GitHub would refuse is refused before it is stored. -/
+def Review.validate (r : Review) : Except String Unit := do
+  for (c, i) in r.comments.zipIdx do
+    let at_ := s!"comment {i + 1}"
+    if c.file.trimAscii.isEmpty then throw s!"{at_} names no file"
+    if c.range.startLine == 0 then throw s!"{at_}: lines start at 1"
+    if c.range.endLine < c.range.startLine then
+      throw s!"{at_}: end_line {c.range.endLine} is before start_line {c.range.startLine}"
+    if c.body.trimAscii.isEmpty && c.suggestion.isNone then throw s!"{at_} says nothing"
+
 end DiffReviewer

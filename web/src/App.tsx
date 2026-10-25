@@ -1,11 +1,11 @@
 import { useCallback, useEffect, useState, type FormEvent } from "react";
 import { BrowserRouter, NavLink, Route, Routes } from "react-router-dom";
-import { api, ApiError, UnauthorizedError } from "./api";
+import { api, ApiError, NetworkError, UnauthorizedError } from "./api";
 import { JobsPage } from "./pages/Jobs";
 import { JobPage } from "./pages/Job";
 import { ReposPage } from "./pages/Repos";
 
-type AuthState = "checking" | "signedOut" | "signedIn";
+type AuthState = "checking" | "unreachable" | "signedOut" | "signedIn";
 
 export function App() {
   const [auth, setAuth] = useState<AuthState>("checking");
@@ -14,13 +14,15 @@ export function App() {
     api
       .session()
       .then((s) => setAuth(s.authenticated ? "signedIn" : "signedOut"))
-      .catch(() => setAuth("signedOut"));
+      .catch((err: unknown) => setAuth(err instanceof NetworkError ? "unreachable" : "signedOut"));
   }, []);
 
   // Any page that meets a 401 sends the person back to the login screen.
   const onUnauthorized = useCallback(() => setAuth("signedOut"), []);
 
   if (auth === "checking") return <div className="center mute">…</div>;
+  if (auth === "unreachable")
+    return <div className="center error">The server could not be reached. Reload to try again.</div>;
   if (auth === "signedOut") return <Login onSignedIn={() => setAuth("signedIn")} />;
 
   return (

@@ -1,13 +1,20 @@
 import { useCallback, useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
-import { api, nextStatuses, UnauthorizedError, type Job, type JobStatus, type Review } from "../api";
+import {
+  api,
+  canEdit,
+  nextStatuses,
+  UnauthorizedError,
+  type Job,
+  type JobStatus,
+  type Review,
+} from "../api";
 import { useLoad } from "../useLoad";
 
 const actionLabel: Partial<Record<JobStatus, string>> = {
   approved: "Approve",
   rejected: "Reject",
   stale: "Mark stale",
-  posted: "Mark posted",
   draft: "Back to draft",
 };
 
@@ -40,7 +47,7 @@ export function JobPage({ onUnauthorized }: { onUnauthorized: () => void }) {
       return;
     }
     api
-      .putReview(job.id, review)
+      .putReview(job.id, job.version, review)
       .then(() => {
         setEditing(false);
         reload();
@@ -49,7 +56,7 @@ export function JobPage({ onUnauthorized }: { onUnauthorized: () => void }) {
   };
 
   const move = (to: JobStatus) => {
-    api.setStatus(job.id, to).then(reload).catch(fail);
+    api.setStatus(job.id, job.version, to).then(reload).catch(fail);
   };
 
   return (
@@ -82,13 +89,15 @@ export function JobPage({ onUnauthorized }: { onUnauthorized: () => void }) {
       </div>
 
       <h2>Review</h2>
-      {job.review === null ? (
+      {job.reviewError !== null ? (
+        <p className="error">The stored review cannot be read by this version: {job.reviewError}</p>
+      ) : job.review === null ? (
         <p className="mute">No review yet.</p>
       ) : (
         <ReviewView review={job.review} />
       )}
 
-      {job.status !== "posted" && (
+      {canEdit(job.status) && job.reviewError === null && (
         <details open={editing} onToggle={(e) => setEditing(e.currentTarget.open)}>
           <summary>Edit the review</summary>
           <p className="mute">

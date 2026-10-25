@@ -20,7 +20,11 @@ export function JobsPage({ onUnauthorized }: { onUnauthorized: () => void }) {
     e.preventDefault();
     const [owner, name] = repo.split("/");
     const prNumber = Number(pr);
-    if (owner === undefined || name === undefined || !Number.isInteger(prNumber)) return;
+    if (owner === undefined || name === undefined) return;
+    if (!Number.isInteger(prNumber) || prNumber < 1 || prNumber > 2147483647) {
+      setError("That is not a pull request number.");
+      return;
+    }
     api
       .createJob(owner, name, prNumber, sha.trim() === "" ? null : sha.trim())
       .then(() => {

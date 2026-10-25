@@ -14,7 +14,9 @@ It is built in milestones. This is the first, the skeleton:
   `stale` a draft whose pull request has moved on. `docs/openapi.json` describes the API and is
   served at `/api/openapi.json`.
 - **A web front-end** (`web/`): sign in, register repositories, request a review, read a review,
-  edit it, approve or reject it.
+  edit it, approve or reject it. Every write names the version of the job it was made on, so a
+  stale page is refused rather than overwriting; queueing, running and posting are the platform's
+  own moves, which no request makes.
 - **The command-line tools** it started as: `diff-reviewer github` posts a review JSON to a pull
   request with `gh`, and `diff-reviewer from-git` turns a commit range into one.
 
@@ -32,6 +34,9 @@ DIFF_REVIEWER_PASSWORD='…' .lake/build/bin/diff-reviewer serve --db reviews.db
 It listens on `127.0.0.1:8090` (`--host`, `--port`). The password is the one you sign in with,
 and what scripts send as `Authorization: Bearer <password>`. The server is plain HTTP: put TLS in
 front of anything wider than loopback, and pass `--secure-cookie`.
+
+Known limits of this milestone: `/api/login` is not rate-limited, and the password is also the
+bearer token for scripts. Both change before the platform posts anything under your name.
 
 During front-end work, `cd web && npm run dev` serves the app with hot reload and proxies `/api`
 to the server on 8090 (`DIFF_REVIEWER_URL` to point it elsewhere).

@@ -29,10 +29,11 @@ def slugPartsAreChecked : Test := do
     ++ check (!validSlugPart "a/b") "a separator"
 
 def transitionsAreTheOnesAPersonMakes : Test := do
-  return check (JobStatus.draft.canMove .approved) "a draft is approved"
-    ++ check (JobStatus.approved.canMove .posted) "an approved review is posted"
-    ++ check (!JobStatus.pending.canMove .approved) "nothing to approve before a draft"
-    ++ check (!JobStatus.posted.canMove .draft) "a posted review is history"
+  return check (JobStatus.draft.personCanMove .approved) "a draft is approved"
+    ++ check (!JobStatus.approved.personCanMove .posted) "posting is the platform's"
+    ++ check (!JobStatus.pending.personCanMove .approved) "nothing to approve before a draft"
+    ++ check (!JobStatus.running.personCanEdit) "not while the agent writes"
+    ++ check (!JobStatus.posted.personCanEdit) "a posted review is history"
 
 /-- A model change without a migration fails here rather than on a deployment. -/
 def theMigrationsBuildTheDeclaredSchema : Test := do

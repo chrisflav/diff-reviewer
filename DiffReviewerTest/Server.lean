@@ -56,41 +56,111 @@ def pathsNameOnlyThemselves : Test := do
     ++ checkEq (staticCandidate "site" "/assets/a.js") (some ("site" / "assets" / "a.js"))
       "a static file"
 
-def aReviewMovesFromDraftToPosted : Test := do
+private def field (r : Reply) (k : String) : Option String :=
+  ((bodyJson r).getObjValAs? String k).toOption
+
+private def versionOf (r : Reply) : Nat :=
+  ((bodyJson r).getObjValAs? Nat "version").toOption.getD 0
+
+private def reviewBody (version : Nat) (review : String) : String :=
+  s!"\{\"version\": {version}, \"review\": {review}}"
+
+private def fine : String := "{\"decision\": \"comment\", \"body\": \"Fine.\", \"comments\": []}"
+
+private def statusBody (status : String) (version : Nat) : String :=
+  s!"\{\"status\": \"{status}\", \"version\": {version}}"
+
+/-- A registered repository and a new job on it; answers the job reply. -/
+private def newJob (st : State) : IO Reply := do
+  let _ ← route st (req .put "/api/v1/repos/Acme/Widgets" "{\"mode\": \"staged\"}")
+  route st (req .post "/api/v1/jobs"
+    "{\"owner\": \"acme\", \"name\": \"widgets\", \"prNumber\": 7, \"headSha\": \"ABCDEF1\"}")
+
+def aReviewIsDraftedAndApproved : Test := do
   let st ← State.new { password }
   withTempDb do
-    let created ← route st (req .put "/api/v1/repos/acme/widgets" "{\"mode\": \"staged\"}")
+    let job ← newJob st
     let again ← route st (req .put "/api/v1/repos/acme/widgets" "{}")
     let missing ← route st (req .post "/api/v1/jobs"
       "{\"owner\": \"acme\", \"name\": \"other\", \"prNumber\": 1}")
-    let job ← route st (req .post "/api/v1/jobs"
-      "{\"owner\": \"acme\", \"name\": \"widgets\", \"prNumber\": 7, \"headSha\": \"abc\"}")
-    let id := ((bodyJson job).getObjValAs? String "id").toOption.getD ""
-    let early ← route st (req .post s!"/api/v1/jobs/{id}/status" "{\"status\": \"approved\"}")
-    let review ← route st (req .put s!"/api/v1/jobs/{id}/review"
-      "{\"decision\": \"comment\", \"body\": \"Fine.\", \"comments\": []}")
-    let notReview ← route st (req .put s!"/api/v1/jobs/{id}/review" "{\"decision\": \"maybe\"}")
-    let approved ← route st (req .post s!"/api/v1/jobs/{id}/status" "{\"status\": \"approved\"}")
-    let posted ← route st (req .post s!"/api/v1/jobs/{id}/status" "{\"status\": \"posted\"}")
-    let edit ← route st (req .put s!"/api/v1/jobs/{id}/review"
-      "{\"decision\": \"approve\", \"body\": \"\", \"comments\": []}")
+    let id := (field job "id").getD ""
+    let early ← route st (req .post s!"/api/v1/jobs/{id}/status" (statusBody "approved" 1))
+    let review ← route st (req .put s!"/api/v1/jobs/{id}/review" (reviewBody 1 fine))
+    let stale ← route st (req .put s!"/api/v1/jobs/{id}/review" (reviewBody 1 fine))
+    let approved ← route st (req .post s!"/api/v1/jobs/{id}/status"
+      (statusBody "approved" (versionOf review)))
+    let posted ← route st (req .post s!"/api/v1/jobs/{id}/status"
+      (statusBody "posted" (versionOf approved)))
     let form ← route st (req .post s!"/api/v1/jobs/{id}/status" "status=draft" (json := false))
-    let listed ← route st (req .get "/api/v1/jobs")
-    let count := ((bodyJson listed).getObjValAs? (Array Json) "items").toOption.map (·.size)
-    return checkStatus created 201 "a new repository"
-      ++ checkStatus again 200 "the same repository again"
+    return checkStatus again 200 "the same repository, in other case"
       ++ checkStatus missing 404 "a job for a repository nobody registered"
       ++ checkStatus job 201 "a new job"
+      ++ checkEq (field job "headSha") (some "abcdef1") "the commit, in lower case"
       ++ checkStatus early 409 "approving before there is a draft"
       ++ checkStatus review 200 "the draft"
-      ++ checkEq ((bodyJson review).getObjValAs? String "status").toOption (some "draft")
-        "the job after its review"
-      ++ checkStatus notReview 400 "a body that is not a review"
+      ++ checkEq (field review "status") (some "draft") "the job after its review"
+      ++ checkStatus stale 409 "a write naming a version that is no longer current"
       ++ checkStatus approved 200 "the approval"
-      ++ checkStatus posted 200 "the posting"
-      ++ checkStatus edit 409 "editing a posted review"
+      ++ checkStatus posted 409 "posting is the platform's, not a request's"
       ++ checkStatus form 415 "a form post"
-      ++ checkEq count (some 1) "the job list"
+
+def inputsAreChecked : Test := do
+  let st ← State.new { password }
+  withTempDb do
+    let job ← newJob st
+    let id := (field job "id").getD ""
+    let huge ← route st (req .post "/api/v1/jobs"
+      "{\"owner\": \"acme\", \"name\": \"widgets\", \"prNumber\": 99999999999999999999}")
+    let zero ← route st (req .post "/api/v1/jobs"
+      "{\"owner\": \"acme\", \"name\": \"widgets\", \"prNumber\": 0}")
+    let sha ← route st (req .post "/api/v1/jobs"
+      "{\"owner\": \"acme\", \"name\": \"widgets\", \"prNumber\": 1, \"headSha\": \"main\"}")
+    let line0 ← route st (req .put s!"/api/v1/jobs/{id}/review" (reviewBody 1
+      "{\"decision\": \"comment\", \"body\": \"\", \"comments\": [{\"file\": \"A.lean\", \"start_line\": 0, \"end_line\": 0, \"body\": \"x\"}]}"))
+    let backwards ← route st (req .put s!"/api/v1/jobs/{id}/review" (reviewBody 1
+      "{\"decision\": \"comment\", \"body\": \"\", \"comments\": [{\"file\": \"A.lean\", \"start_line\": 5, \"end_line\": 2, \"body\": \"x\"}]}"))
+    let listed ← route st (req .get "/api/v1/jobs")
+    return checkStatus huge 400 "a pull request number past 2^31"
+      ++ checkStatus zero 400 "pull request 0"
+      ++ checkStatus sha 400 "a head that is not a commit id"
+      ++ checkStatus line0 400 "a comment on line 0"
+      ++ checkStatus backwards 400 "a comment ending before it starts"
+      ++ checkStatus listed 200 "the job list after all that"
+
+/-- A stored status or review this build does not understand is left exactly as it is: shown,
+    refused for writes, never replaced by a default. -/
+def whatThisBuildCannotReadIsKept : Test := do
+  let st ← State.new { password }
+  withTempDb do
+    let job ← newJob st
+    let id := (field job "id").getD ""
+    let some j ← Platform.findJob id | return #["the job was not stored"]
+    let odd := "{\"decision\":\"block\",\"body\":\"\",\"comments\":[]}"
+    Store.run <| HasModel.save
+      ({ id, owner := j.owner, name := j.name, pr_number := j.prNumber, head_sha := j.headSha
+       , status := "escalated", queue_entry := none, review := some odd, version := 1
+       , created_at := j.createdAt, updated_at := j.updatedAt } : Store.JobRow)
+    let read ← route st (req .get s!"/api/v1/jobs/{id}")
+    let write ← route st (req .post s!"/api/v1/jobs/{id}/status" (statusBody "rejected" 1))
+    let some after ← Platform.findJob id | return #["the job disappeared"]
+    return checkStatus read 200 "reading it"
+      ++ checkEq (field read "status") (some "escalated") "the unknown status, as stored"
+      ++ check (field read "reviewError" |>.isSome) "the review is reported as unreadable"
+      ++ checkStatus write 409 "a write to it"
+      ++ checkEq after.reviewRaw (some odd) "the stored review, untouched"
+      ++ checkEq after.statusRaw "escalated" "the stored status, untouched"
+
+def editsFollowTheState : Test := do
+  let st ← State.new { password }
+  withTempDb do
+    let job ← newJob st
+    let id := (field job "id").getD ""
+    let drafted ← route st (req .put s!"/api/v1/jobs/{id}/review" (reviewBody 1 fine))
+    let stale ← route st (req .post s!"/api/v1/jobs/{id}/status"
+      (statusBody "stale" (versionOf drafted)))
+    let edit ← route st (req .put s!"/api/v1/jobs/{id}/review" (reviewBody (versionOf stale) fine))
+    return checkStatus stale 200 "marking the draft stale"
+      ++ checkStatus edit 409 "editing a stale review"
 
 /-- Every route `apiRoutes` names is in `docs/openapi.json` with exactly its methods, and the spec
     documents no route that is not served. -/
@@ -120,7 +190,10 @@ def theSpecDescribesTheRoutes : Test := do
 def all : List (String × Test) :=
   [("theApiNeedsTheSecret", theApiNeedsTheSecret),
    ("pathsNameOnlyThemselves", pathsNameOnlyThemselves),
-   ("aReviewMovesFromDraftToPosted", aReviewMovesFromDraftToPosted),
+   ("aReviewIsDraftedAndApproved", aReviewIsDraftedAndApproved),
+   ("inputsAreChecked", inputsAreChecked),
+   ("whatThisBuildCannotReadIsKept", whatThisBuildCannotReadIsKept),
+   ("editsFollowTheState", editsFollowTheState),
    ("theSpecDescribesTheRoutes", theSpecDescribesTheRoutes)]
 
 end DiffReviewerTest.Server

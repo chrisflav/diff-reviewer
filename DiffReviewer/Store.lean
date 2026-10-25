@@ -11,7 +11,7 @@ structured, a review above all, is a `text` column holding the JSON its own `toJ
 conversions live in `DiffReviewer.Platform`, beside the records they convert.
 
 `Store.target` is the schema the code declares and `migrations` is how a database gets there;
-`DiffReviewerTest.Store` asserts that the two agree, so a model change without a migration fails
+`DiffReviewerTest.Platform` asserts that the two agree, so a model change without a migration fails
 the suite rather than a deployment.
 -/
 
@@ -43,6 +43,8 @@ structure JobRow where
   queue_entry : Option String
   /-- The current review, as `Review.toJson`: the agent's draft, then each edit over it. -/
   review : Option String
+  /-- Incremented by every write; what a client sends back to say which job it acted on. -/
+  version : Int
   created_at : String
   updated_at : String
   deriving Repr
@@ -71,6 +73,7 @@ def migration0001 : Db.Migration.Migration where
            ("status", { type := .text, nullable := false }),
            ("queue_entry", { type := .text, nullable := true }),
            ("review", { type := .text, nullable := true }),
+           ("version", { type := .int, nullable := false }),
            ("created_at", { type := .text, nullable := false }),
            ("updated_at", { type := .text, nullable := false })],
         primaryKey := ["id"] }]
@@ -90,11 +93,17 @@ private initialize storeMutex : Std.BaseMutex ← Std.BaseMutex.new
 
 def setPath (p : System.FilePath) : IO Unit := pathRef.set p
 
+private def configure : Sqlite.M Unit := do
+  let db ← read
+  SQLite.exec db "PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL"
+
 /-- Run a database computation against the configured database, migrating it first if this
     process has not yet.
 
     Serialised: SQLite has one writer, and a connection per call under one lock is simpler than a
-    pool for a platform whose traffic is one person and a handful of agents. -/
+    pool for a platform whose traffic is one person and a handful of agents. Each connection uses
+    WAL and waits for a lock rather than failing, so another process — a backup, a later worker —
+    reading the file does not turn requests into `SQLITE_BUSY` errors. -/
 def run {α : Type} (x : Sqlite.M α) : IO α := do
   storeMutex.lock
   try
@@ -102,9 +111,12 @@ def run {α : Type} (x : Sqlite.M α) : IO α := do
     unless (← migratedRef.get).contains p do
       let now := (← Std.Time.Timestamp.now).toSecondsSinceUnixEpoch.val
       Sqlite.runDB p do
+        configure
         let _ ← Db.Migration.migrate migrations now
       migratedRef.modify (p :: ·)
-    Sqlite.runDB p x
+    Sqlite.runDB p do
+      configure
+      x
   finally
     storeMutex.unlock
 
