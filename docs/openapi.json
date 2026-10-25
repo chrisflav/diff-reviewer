@@ -234,6 +234,10 @@
                     "type": "integer",
                     "minimum": 0,
                     "description": "The version of the settings last read, 0 for a repository not registered (now). Given, the write is a `409` if the settings have changed since; left out, it is not checked. A repository registered again after being deleted goes on from the version it had, so no version is given twice to one name."
+                  },
+                  "fromProposal": {
+                    "type": "string",
+                    "description": "The rubric proposal the style notes written were taken from: the new notes version records its provenance, and the proposal is marked accepted. `409` for a rejected proposal or one that is not the repository's."
                   }
                 }
               }
@@ -1044,10 +1048,10 @@
       "get": {
         "summary": "What a rubric proposal is written from",
         "operationId": "agentProposalShow",
-        "description": "The proposal job must be `queued` or `running` (`404` otherwise); reading a `queued` one moves it to `running`. Of the repository and the job, with no pull request: kleis's `reviewer` spec does not allow it, a `rubric-proposer` spec does. The first read records the style notes it gives (which accepting the proposal's notes checks are still the repository's) and every read the samples its context drew on.",
+        "description": "The proposal job must be `queued` or `running` (`404` otherwise); reading a `queued` one moves it to `running`. Of the repository and the job, with no pull request: kleis's `reviewer` spec does not allow it, a `rubric-proposer` spec does. The first read records the style notes it gives (which applying the proposal's notes checks are still the repository's), and every read the samples and pull requests its context drew on: the provenance every rubric and notes version taken from the proposal records. Only the proposals' agent token reaches it.",
         "security": [
           {
-            "agentBearer": []
+            "proposerAgentBearer": []
           }
         ],
         "responses": {
@@ -1075,7 +1079,7 @@
         "description": "The job must be `running` (`409` otherwise: a proposal is submitted once). `rubric` is checked as `PUT …/rubrics` checks a document, and may carry no field a rubric does not have, on the document, a type or a category (`400`, naming them) — only a person's document keeps unknown fields; `baseVersion` must be a version the rubric has had (`400`) — one older than the current is stored, and accepting it asks for a rebase. Stored as a `pending` proposal; the job becomes a `draft`.",
         "security": [
           {
-            "agentBearer": []
+            "proposerAgentBearer": []
           }
         ],
         "requestBody": {
@@ -1389,7 +1393,7 @@
       },
       "put": {
         "summary": "Replace a repository's rubric document",
-        "description": "The body is the whole document with the version it replaces, as last read (`409` if that is no longer the current one). It becomes the next version, and the one it replaces stays in the history. A type's `description`, `rubric` and `categories` default to empty. `400` for a type or category without a name or with the name of another, past 50 types or 50 categories a type, or a rubric past 65536 bytes. The answer of a `GET` may be sent back as it is, edited: its `owner`, `name`, `createdAt` and `documentError` are not kept as the document's, and fields this build does not know, on the document, a type or a category, are kept. A field may be left out (it is then empty) but not `null` (`400`). `409` too while the current version cannot be read by this build (`documentError`): it is left for a build that can.",
+        "description": "The body is the whole document with the version it replaces, as last read (`409` if that is no longer the current one). It becomes the next version, and the one it replaces stays in the history. A type's `description`, `rubric` and `categories` default to empty. `400` for a type or category without a name or with the name of another, past 50 types or 50 categories a type, or a rubric past 65536 bytes. The answer of a `GET` may be sent back as it is, edited: its `owner`, `name`, `createdAt` and `documentError` are not kept as the document's, and fields this build does not know, on the document, a type or a category, are kept. A field may be left out (it is then empty) but not `null` (`400`). `409` too while the current version cannot be read by this build (`documentError`): it is left for a build that can. With `fromProposal`, it records that proposal's provenance and accepts it, in the same transaction.",
         "operationId": "putRubrics",
         "requestBody": {
           "required": true,
@@ -1414,6 +1418,10 @@
                     "items": {
                       "$ref": "#/components/schemas/PrType"
                     }
+                  },
+                  "fromProposal": {
+                    "type": "string",
+                    "description": "The rubric proposal this document was made from — a proposal rebased in the editor after the rubric moved on from its base. The version records the proposal's provenance (`derivedFrom`, `derivedFromPulls`), and the proposal is marked accepted with it, freeing the repository's one live proposal. A rejected proposal, or one that is not the repository's, is refused."
                   }
                 }
               }
@@ -1894,7 +1902,7 @@
       "post": {
         "summary": "Accept a rubric proposal",
         "operationId": "acceptProposal",
-        "description": "A versioned write of the rubric: `version` is the rubric version the person read. The proposal's document becomes the next rubric version, recording the calibration samples the proposal's context drew on (`derivedFrom`); with `applyStyleNotes`, its style notes become the repository's, recording them too. One transaction, the rubric written first: a refusal after it rolls everything back. `409` when the proposal is decided already, when applying notes it has none or the repository's notes are no longer the ones its agent first read, and — with `baseVersion` and `currentVersion` beside `error` — when the rubric has moved since the proposal's base or since `version`: rebase it in the editor and save that as a rubric `PUT` instead.",
+        "description": "A versioned write of the rubric: `version` is the rubric version the person read. The proposal's document becomes the next rubric version, recording the calibration samples the proposal's context drew on (`derivedFrom`); with `applyStyleNotes`, its style notes become the repository's, recording them too. One transaction, the rubric written first: a refusal after it rolls everything back. `409` when the proposal is decided already, when applying notes it has none or the repository's notes are no longer the ones its agent was given at its first read of its context, and — with `baseVersion` and `currentVersion` beside `error` — when the rubric has moved since the proposal's base or since `version`: rebase it in the editor and save that as a rubric `PUT` with `fromProposal`, which keeps its provenance and accepts it.",
         "requestBody": {
           "required": true,
           "content": {
@@ -2693,7 +2701,12 @@
       "agentBearer": {
         "type": "http",
         "scheme": "bearer",
-        "description": "The agent token ($DIFF_REVIEWER_AGENT_TOKEN_FILE), which kleis injects into an agent's requests. Reaches `/api/agent/v1/` only."
+        "description": "The agent token ($DIFF_REVIEWER_AGENT_TOKEN_FILE), which kleis injects into an agent's requests. Reaches `/api/agent/v1/` only, and not a rubric proposal's routes."
+      },
+      "proposerAgentBearer": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "The proposals' agent token ($DIFF_REVIEWER_PROPOSER_AGENT_TOKEN_FILE), which kleis injects, from an account of its own, into a rubric proposal agent's requests. Reaches a rubric proposal's agent routes only."
       }
     },
     "responses": {
@@ -2730,7 +2743,7 @@
           "trustedReviewers",
           "styleNotes",
           "evalShare",
-          "styleNotesDerivedFrom",
+          "styleNotesVersion",
           "version",
           "createdAt"
         ],
@@ -2768,14 +2781,12 @@
             "type": "integer",
             "minimum": 0,
             "maximum": 100,
-            "description": "The share of new calibration samples, in percent, held out as `eval` (what runs measure by); the rest are the `pool` examples and proposals learn from. 50 by default. A sample's split is fixed once made."
+            "description": "The share of pull requests, in percent, whose calibration samples are held out as `eval` (what runs measure by); the rest are the `pool` examples and proposals learn from. 50 by default. A pull request's split is fixed once made, and a later sample of it takes it."
           },
-          "styleNotesDerivedFrom": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            },
-            "description": "The calibration samples the style notes were derived from, by accepted rubric proposals."
+          "styleNotesVersion": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "The version of the style notes, 0 before any. Each version records what it was derived from, kept by name across a delete and a registration again; a job records the version its agent was given (`notesVersion`)."
           },
           "version": {
             "type": "integer",
@@ -2832,7 +2843,8 @@
           "postDirect",
           "kind",
           "sampleId",
-          "runId"
+          "runId",
+          "notesVersion"
         ],
         "properties": {
           "id": {
@@ -3015,6 +3027,14 @@
               "null"
             ],
             "description": "The calibration run that asked for a `calibration` job."
+          },
+          "notesVersion": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0,
+            "description": "The version of the style notes the agent was given when it read the job, as `rubricVersion` records the rubric: a score is `derived` when either was derived from its sample's pull request."
           }
         }
       },
@@ -3297,7 +3317,14 @@
             "items": {
               "type": "string"
             },
-            "description": "The calibration samples the version was derived from: those of the rubric proposal it was accepted from, and every earlier version's. Ignored when sent back with a `PUT`."
+            "description": "The calibration samples the version was derived from: those of the rubric proposal it came from (by accepting it, or a `PUT` with `fromProposal`), and every earlier version's. Ignored when sent back with a `PUT`."
+          },
+          "derivedFromPulls": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The pull requests (`owner/name#pr`) it was derived from: those its proposal's context drew on — misses, unmatched comments, people's edits — and every earlier version's. A score of any sample of them, under this version, is `derived`. Ignored when sent back."
           }
         }
       },
@@ -3509,7 +3536,7 @@
               "pool",
               null
             ],
-            "description": "`eval` (held out: what runs measure by) or `pool` (what examples and proposals learn from), by a stable hash of the group against `evalShare`, fixed once made; null until assigned."
+            "description": "`eval` (held out: what runs measure by) or `pool` (what examples and proposals learn from), by a stable hash of its pull request against `evalShare`, or the split its pull request has already; fixed once made, null until assigned. A `pool` sample of a pull request with an `eval` sample is never learned from."
           }
         }
       },
@@ -4087,7 +4114,7 @@
           },
           "derivedScores": {
             "type": "integer",
-            "description": "Scores of samples the rubric version they were reviewed against, or the style notes, were derived from; left out unless `?derived=include`."
+            "description": "Scores whose sample's pull request the rubric version or the style notes version they were made under was derived from; left out unless `?derived=include`."
           },
           "derivedIncluded": {
             "type": "boolean"
@@ -4617,12 +4644,12 @@
           },
           "calibration": {
             "$ref": "#/components/schemas/CalibrationSummary",
-            "description": "Calibration's aggregates of the `pool` samples — overall, by category, by severity and by rubric version — never of the `eval` samples calibration measures by."
+            "description": "Calibration's aggregates of the `pool` samples of pull requests with no `eval` sample — overall, by category, by severity and by rubric version — never of what calibration measures by."
           },
           "missedHuman": {
             "type": "array",
             "maxItems": 30,
-            "description": "Trusted reviewers' comments the agent did not match, from the most recent scores of `pool` samples (`full`, not stale, not deleted, of a reviewer still trusted). A body over 2 KiB is cut and marked `bodyTruncated`.",
+            "description": "Trusted reviewers' comments the agent did not match, from each sample's newest score that is not stale, of `pool` samples (`full`, not deleted, of a reviewer still trusted, of a pull request with no `eval` sample). A body over 2 KiB is cut and marked `bodyTruncated`.",
             "items": {
               "type": "object",
               "required": [
@@ -4706,7 +4733,7 @@
           "personEdits": {
             "type": "array",
             "maxItems": 30,
-            "description": "What people changed in the agent's drafts before posting them: of the posted review jobs, most recent first, each comment of the agent's first draft against the same comment (by id) as posted. A body or suggestion over 2 KiB is cut and marked `bodyTruncated` or `suggestionTruncated`.",
+            "description": "What people changed in the agent's drafts before posting them: of the posted review jobs of pull requests with no `eval` sample, most recent first, each comment of the agent's first draft against the same comment (by id) as posted. A body or suggestion over 2 KiB is cut and marked `bodyTruncated` or `suggestionTruncated`.",
             "items": {
               "type": "object",
               "required": [

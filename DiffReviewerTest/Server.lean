@@ -13,7 +13,11 @@ def apiToken : String := "api-0123456789abcdef0123456789abcdef"
 
 def agentToken : String := "agent-0123456789abcdef0123456789abcdef"
 
-def cfg : Config := { password, apiToken := some apiToken, agentToken := some agentToken }
+def proposerAgentToken : String := "proposer-0123456789abcdef0123456789abcdef"
+
+def cfg : Config :=
+  { password, apiToken := some apiToken, agentToken := some agentToken
+  , proposerAgentToken := some proposerAgentToken }
 
 /-- A request with `token` as its bearer, the API token unless said otherwise. -/
 def req (method : Std.Http.Method) (path : String) (body : String := "")
@@ -216,7 +220,8 @@ def whatThisBuildCannotReadIsKept : Test := do
        , pr_body := none, error := none, pr_type := none, attempts := none
        , post_started_at := none, posted_url := none, post_note := none, posted_review := none
        , rubric_version := none, direct_posts := none
-       , post_direct := none, kind := none, sample_id := none, run_id := none }
+       , post_direct := none, kind := none, sample_id := none, run_id := none
+       , notes_version := none }
        : Store.JobRow)
     let read ← route st (req .get s!"/api/v1/jobs/{id}")
     let write ← route st (req .post s!"/api/v1/jobs/{id}/status" (statusBody "rejected" 1))

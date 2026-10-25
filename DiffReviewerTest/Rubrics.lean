@@ -324,7 +324,8 @@ def rubricsKeepUnknownFields : Test := withTempDb do
 \"feature\", \"weight\": 2, \"categories\": [{\"name\": \"style\", \"color\": \"red\"}]}]}"
   Store.run <| HasModel.save
     ({ owner := "acme", name := "widgets", version := 1, document := newer
-     , created_at := "2026-01-01T00:00:00Z", derived_samples := none } : Store.RubricRow)
+     , created_at := "2026-01-01T00:00:00Z", derived_samples := none
+     , derived_prs := none } : Store.RubricRow)
   let read ← route st (req .get "/api/v1/repos/acme/widgets/rubrics")
   -- An older client: changes the default rubric, sends back the rest as it read it.
   let back := (bodyJson read).setObjVal! "defaultRubric" "d, revised"
@@ -509,7 +510,8 @@ def rubricEdgesAreHeld : Test := withTempDb do
   let nullDefault ← putRubric st 1 "\"defaultRubric\": null"
   Store.run <| HasModel.save
     ({ owner := "acme", name := "widgets", version := 2, document := "{\"prTypes\": 7}"
-     , created_at := "2026-01-01T00:00:00Z", derived_samples := none } : Store.RubricRow)
+     , created_at := "2026-01-01T00:00:00Z", derived_samples := none
+     , derived_prs := none } : Store.RubricRow)
   let unreadable ← route st (req .get "/api/v1/repos/acme/widgets/rubrics")
   let overwrite ← putRubric st 2 "\"defaultRubric\": \"x\""
   let doc : Rubric := match Rubric.ofJson ((Json.parse s!"\{{twoTypes}}").toOption.getD .null) with

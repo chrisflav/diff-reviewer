@@ -157,8 +157,9 @@ private def cmdServe (flags : List String) : IO Unit := do
       IO.Process.exit 1
   let apiToken ← tokenFromEnv "DIFF_REVIEWER_API_TOKEN_FILE"
   let agentToken ← tokenFromEnv "DIFF_REVIEWER_AGENT_TOKEN_FILE"
+  let proposerAgentToken ← tokenFromEnv "DIFF_REVIEWER_PROPOSER_AGENT_TOKEN_FILE"
   let cfg ← match serveFlags flags with
-    | .ok f => pure (f { password, apiToken, agentToken })
+    | .ok f => pure (f { password, apiToken, agentToken, proposerAgentToken })
     | .error e =>
       IO.eprintln s!"error: {e}"
       IO.Process.exit 1
@@ -170,6 +171,9 @@ private def cmdServe (flags : List String) : IO Unit := do
     log "no DIFF_REVIEWER_API_TOKEN_FILE: only a signed-in browser reaches /api/v1"
   if agentToken.isNone then
     log "no DIFF_REVIEWER_AGENT_TOKEN_FILE: the agent API refuses every request"
+  if proposerAgentToken.isNone then
+    log "no DIFF_REVIEWER_PROPOSER_AGENT_TOKEN_FILE: a rubric proposal's agent routes refuse \
+every request"
   let login := (← IO.getEnv "DIFF_REVIEWER_GITHUB_LOGIN").filter (!·.isEmpty)
   let cfg := { cfg with limits.githubLogin := login }
   let github ← GitHub.Client.fromEnv cfg.limits.maxDiffBytes

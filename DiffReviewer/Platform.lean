@@ -98,9 +98,9 @@ structure Repo where
   /-- The share of new calibration samples, in percent, held out for measuring (`eval`); the rest
       are the `pool` examples and proposals learn from. A sample's split is fixed once made. -/
   evalShare  : Nat := 50
-  /-- The calibration samples the style notes were derived from, by accepted rubric proposals:
-      a score of one of them measures nothing the notes did not learn from. -/
-  styleNotesDerived : List String := []
+  /-- The version of the style notes (`notesAt`), which records what they were derived from; 0
+      before any. -/
+  styleNotesVersion : Nat := 0
   /-- Incremented by every write of the settings, so that a stale page is refused (`409`) rather
       than overwriting what it never saw. -/
   version    : Nat := 1
@@ -114,7 +114,7 @@ def Repo.toJson (r : Repo) : Json :=
           ("autoReview", r.autoReview),
           ("trustedReviewers", .arr (r.trustedReviewers.map Json.str).toArray),
           ("styleNotes", r.styleNotes), ("evalShare", r.evalShare),
-          ("styleNotesDerivedFrom", .arr (r.styleNotesDerived.map Json.str).toArray),
+          ("styleNotesVersion", r.styleNotesVersion),
           ("version", r.version), ("createdAt", r.createdAt)]
 
 /-- The strings a column holding a JSON array of strings holds; anything else is none. -/
@@ -135,7 +135,7 @@ private def Repo.ofRow (row : Store.RepoRow) : Repo :=
   , trustedReviewers := trustedOfRaw row.trusted_reviewers
   , styleNotes := row.style_notes.getD ""
   , evalShare := (row.eval_share.getD 50).toNat
-  , styleNotesDerived := stringsOfRaw row.style_notes_derived
+  , styleNotesVersion := (row.style_notes_version.getD 0).toNat
   , version := (row.version.getD 1).toNat }
 
 /-- The repository as its row, for a write. -/
@@ -144,7 +144,26 @@ private def Repo.toRow (r : Repo) : Store.RepoRow :=
   , auto_review := some r.autoReview
   , trusted_reviewers := some (Json.arr (r.trustedReviewers.map Json.str).toArray).compress
   , style_notes := some r.styleNotes, eval_share := some r.evalShare
-  , style_notes_derived := some (rawOfStrings r.styleNotesDerived), version := some r.version }
+  , style_notes_version := some r.styleNotesVersion, version := some r.version }
+
+/-! ## Provenance -/
+
+/-- What a rubric version or a version of the style notes was derived from: the calibration
+    samples (by id) and the pull requests (`owner/name#pr`) the context of the rubric proposal it
+    came from drew on — its misses, its unmatched comments, its people's edits — and every earlier
+    version's, since what a version learned is never forgotten by the next. A score of any sample
+    of those pull requests, made under such a version, is `derived`
+    (`Calibration.derivedOf`). -/
+structure Provenance where
+  samples : List String := []
+  prs     : List String := []
+  deriving Repr, BEq, Inhabited
+
+def Provenance.union (a b : Provenance) : Provenance :=
+  { samples := (a.samples ++ b.samples).eraseDups, prs := (a.prs ++ b.prs).eraseDups }
+
+/-- The key of pull request `pr` of `owner/name`, as provenance records it. -/
+def prKey (owner name : String) (pr : Nat) : String := s!"{owner}/{name}#{pr}"
 
 /-- Whether `s` can be a GitHub login: 1 to 39 letters, digits and single hyphens, not starting or
     ending with one. -/
@@ -283,6 +302,9 @@ structure Job where
   /-- The calibration sample a `calibration` job reviews, and the run that asked for it. -/
   sampleId   : Option String := none
   runId      : Option String := none
+  /-- The version of the style notes the agent was given when it read the job, as
+      `rubricVersion` records the rubric: what `Calibration.derivedOf` judges its score by. -/
+  notesVersion : Option Nat := none
 
 def Job.status? (j : Job) : Option JobStatus := JobStatus.ofString? j.statusRaw
 
@@ -338,7 +360,8 @@ def Job.toJson (j : Job) : Json :=
     ("rubricVersion", (j.rubricVersion.map fun v => (v : Json)).getD .null),
     ("directPosts", j.directPosts), ("postDirect", j.postDirect),
     ("kind", j.kindRaw.getD JobKind.review.toString), ("sampleId", optStr j.sampleId),
-    ("runId", optStr j.runId)]
+    ("runId", optStr j.runId),
+    ("notesVersion", (j.notesVersion.map fun v => (v : Json)).getD .null)]
 
 def Job.ofRow (row : Store.JobRow) : Job :=
   { id := row.id, owner := row.owner, name := row.name, prNumber := row.pr_number.toNat
@@ -350,7 +373,8 @@ def Job.ofRow (row : Store.JobRow) : Job :=
   , postStartedAt := row.post_started_at, postedUrl := row.posted_url, postNote := row.post_note
   , postedReview := row.posted_review, rubricVersion := row.rubric_version.map (·.toNat)
   , directPosts := (row.direct_posts.getD 0).toNat, postDirect := row.post_direct.getD false
-  , kindRaw := row.kind, sampleId := row.sample_id, runId := row.run_id }
+  , kindRaw := row.kind, sampleId := row.sample_id, runId := row.run_id
+  , notesVersion := row.notes_version.map (·.toNat) }
 
 def Job.toRow (j : Job) : Store.JobRow :=
   { id := j.id, owner := j.owner, name := j.name, pr_number := j.prNumber
@@ -362,7 +386,8 @@ def Job.toRow (j : Job) : Store.JobRow :=
   , post_started_at := j.postStartedAt, posted_url := j.postedUrl, post_note := j.postNote
   , posted_review := j.postedReview, rubric_version := j.rubricVersion.map Int.ofNat
   , direct_posts := some j.directPosts, post_direct := some j.postDirect
-  , kind := j.kindRaw, sample_id := j.sampleId, run_id := j.runId }
+  , kind := j.kindRaw, sample_id := j.sampleId, run_id := j.runId
+  , notes_version := j.notesVersion.map Int.ofNat }
 
 /-- The largest pull request number accepted: what fits a 32-bit column with room to spare. -/
 def maxPrNumber : Nat := 2147483647
@@ -384,10 +409,9 @@ structure RubricVersion where
   version   : Nat
   createdAt : String
   documentRaw : String
-  /-- The calibration samples whose evidence it was written from: those of the rubric proposal it
-      was accepted from, and every earlier version's — a version a person wrote over a derived one
-      may keep what it learned. -/
-  derivedSamples : List String := []
+  /-- What it was derived from: the rubric proposal it came from, and every earlier version's —
+      a version a person wrote over a derived one may keep what it learned. -/
+  derived : Provenance := {}
 
 def RubricVersion.rubric? (r : RubricVersion) : Except String Rubric :=
   (Json.parse r.documentRaw).bind Rubric.ofJson
@@ -395,7 +419,8 @@ def RubricVersion.rubric? (r : RubricVersion) : Except String Rubric :=
 def RubricVersion.toJson (r : RubricVersion) : Json :=
   let fields : List (String × Json) :=
     [("owner", r.owner), ("name", r.name), ("version", r.version), ("createdAt", r.createdAt),
-     ("derivedFrom", .arr (r.derivedSamples.map Json.str).toArray)]
+     ("derivedFrom", .arr (r.derived.samples.map Json.str).toArray),
+     ("derivedFromPulls", .arr (r.derived.prs.map Json.str).toArray)]
   -- The document's own fields, those this build does not know among them, under the version's.
   match r.rubric? with
   | .ok doc =>
@@ -410,18 +435,20 @@ def RubricVersion.toJson (r : RubricVersion) : Json :=
 /-- The fields of a rubric answer that are the version's, not the document's: a client that sends
     the answer back as its next write sends them too, and they are not kept as the document's. -/
 def RubricVersion.fields : List String :=
-  ["version", "owner", "name", "createdAt", "documentError", "derivedFrom"]
+  ["version", "owner", "name", "createdAt", "documentError", "derivedFrom", "derivedFromPulls",
+   "fromProposal"]
 
 /-- The answer for a repository with no rubric yet: version 0, an empty document. -/
 def RubricVersion.none (owner name : String) : Json :=
   .mkObj [("owner", owner), ("name", name), ("version", (0 : Nat)), ("createdAt", .null),
-          ("derivedFrom", .arr #[]), ("defaultRubric", ""), ("prTypes", .arr #[]),
-          ("documentError", .null)]
+          ("derivedFrom", .arr #[]), ("derivedFromPulls", .arr #[]), ("defaultRubric", ""),
+          ("prTypes", .arr #[]), ("documentError", .null)]
 
 private def RubricVersion.ofRow (row : Store.RubricRow) : RubricVersion :=
   { owner := row.owner, name := row.name, version := row.version.toNat
   , createdAt := row.created_at, documentRaw := row.document
-  , derivedSamples := stringsOfRaw row.derived_samples }
+  , derived := { samples := stringsOfRaw row.derived_samples
+               , prs := stringsOfRaw row.derived_prs } }
 
 /-- Who wrote a revision of a job's review. -/
 inductive Author where
@@ -492,9 +519,61 @@ structure RepoUpdate where
   trustedReviewers : Option (List String) := none
   styleNotes       : Option String := none
   evalShare        : Option Nat := none
+  /-- Run first in the write's transaction: what the style notes written are derived from (a
+      rubric proposal they came from, which it marks accepted), or why nothing is to be written. -/
+  provenance       : Sqlite.M (Except String Provenance) := pure (.ok {})
   /-- The version of the settings the client last read (0 for a repository not yet registered);
       `none` writes whatever is there. -/
   expected         : Option Nat := none
+
+/-- One version of a repository's style notes, and what it was derived from. -/
+structure NotesVersion where
+  version : Nat
+  notes   : String
+  derived : Provenance
+
+private def NotesVersion.ofRow (r : Store.NotesRow) : NotesVersion :=
+  { version := r.version.toNat, notes := r.notes
+  , derived := { samples := stringsOfRaw (some r.derived_samples)
+               , prs := stringsOfRaw (some r.derived_prs) } }
+
+/-- The latest version of `owner/name`'s style notes, if there is one. -/
+def fetchNotes (owner name : String) : Sqlite.M (Option NotesVersion) := do
+  let rows ← HasModel.fetch <| query% do
+    let n ← from Store.NotesRow
+    guard n.owner = owner
+    guard n.name = name
+    select n
+    order_by_desc n.version
+    limit 1
+  return rows[0]?.map NotesVersion.ofRow
+
+/-- Every version of `owner/name`'s style notes, newest first. -/
+def notesHistory (owner name : String) : IO (Array NotesVersion) := do
+  let rows ← Store.run <| HasModel.fetch <| query% do
+    let n ← from Store.NotesRow
+    guard n.owner = owner
+    guard n.name = name
+    select n
+    order_by_desc n.version
+  return rows.map NotesVersion.ofRow
+
+/-- `repo` with its style notes recorded: a new notes version when they, or what they are derived
+    from, differ from the latest — derived from the latest's provenance and `derived` together, so
+    that nothing a version learned is forgotten, not even across a delete and a registration
+    again. The latest is the repository's otherwise. -/
+def writeNotesIn (repo : Repo) (derived : Provenance) (now : String) : Sqlite.M Repo := do
+  let latest ← fetchNotes repo.owner repo.name
+  let base := (latest.map (·.derived)).getD {}
+  let prov := base.union derived
+  let same := latest.any fun l => l.notes == repo.styleNotes && l.derived == prov
+  if same || (latest.isNone && repo.styleNotes.isEmpty && derived == {}) then
+    return { repo with styleNotesVersion := (latest.map (·.version)).getD 0 }
+  let version := (latest.map (·.version)).getD 0 + 1
+  HasModel.save ({ owner := repo.owner, name := repo.name, version, notes := repo.styleNotes
+                 , derived_samples := rawOfStrings prov.samples
+                 , derived_prs := rawOfStrings prov.prs, created_at := now } : Store.NotesRow)
+  return { repo with styleNotesVersion := version }
 
 /-- The last settings version of `owner/name` when it was deleted, if it ever was. -/
 private def fetchTombstone (owner name : String) : Sqlite.M (Option Store.TombstoneRow) := do
@@ -528,13 +607,19 @@ def putRepo (owner name : String) (u : RepoUpdate) : IO (Except String (Bool × 
       unless v == current do
         return .error s!"the settings of {owner}/{name} have changed since they were read \
 (version {v}, now {current}); reload them"
-    let old : Repo := existing.getD { owner, name, createdAt := now, version := last }
+    let latest ← fetchNotes owner name
+    let old : Repo := existing.getD { owner, name, createdAt := now, version := last
+                                    , styleNotesVersion := (latest.map (·.version)).getD 0 }
     let trusted := (u.trustedReviewers.map (·.map String.toLower |>.eraseDups)).getD
       old.trustedReviewers
     let repo : Repo :=
       { old with mode := u.mode.getD old.mode, autoReview := u.autoReview.getD old.autoReview
                  trustedReviewers := trusted, styleNotes := u.styleNotes.getD old.styleNotes
                  evalShare := u.evalShare.getD old.evalShare, version := old.version + 1 }
+    let prov ← match ← u.provenance with
+      | .ok p => pure p
+      | .error why => return .error why
+    let repo ← writeNotesIn repo prov now
     HasModel.save repo.toRow
     return .ok (existing.isSome, repo)
 
@@ -547,12 +632,12 @@ def fetchRepo (owner name : String) : Sqlite.M (Option Repo) := do
     select r
   return rows[0]?.map Repo.ofRow
 
-/-- Write `notes` as `repo`'s style notes, derived from the samples `derived` (on top of those the
-    notes were derived from before), as the next version of its settings: for a write that has
-    made its own checks in the transaction it is part of (accepting a rubric proposal). -/
-def saveStyleNotes (repo : Repo) (notes : String) (derived : List String) : Sqlite.M Repo := do
-  let repo := { repo with styleNotes := notes, version := repo.version + 1
-                          styleNotesDerived := (repo.styleNotesDerived ++ derived).eraseDups }
+/-- Write `notes` as `repo`'s style notes, derived from `derived`, as the next version of its
+    settings: for a write that has made its own checks in the transaction it is part of
+    (accepting a rubric proposal). -/
+def saveStyleNotes (repo : Repo) (notes : String) (derived : Provenance) : Sqlite.M Repo := do
+  let repo ← writeNotesIn { repo with styleNotes := notes, version := repo.version + 1 } derived
+    (← nowIso)
   HasModel.save repo.toRow
   return repo
 
@@ -793,7 +878,7 @@ def rubricAt (owner name : String) (version : Nat) : IO (Option RubricVersion) :
 /-- `putRubric`'s check and write, inside a transaction the caller holds: for a write that changes
     the rubric together with something else (accepting a rubric proposal). -/
 def putRubricIn (owner name : String) (expected : Nat) (doc : Rubric) (now : String)
-    (derived : List String := []) : Sqlite.M (Except UpdateError RubricVersion) := do
+    (derived : Provenance := {}) : Sqlite.M (Except UpdateError RubricVersion) := do
   let cur ← fetchCurrentRubric owner name
   if let some c := cur then
     if let .error e := c.rubric? then
@@ -805,10 +890,11 @@ read by this build ({e}); it is left as it is")
 (version {expected}, now {current}); reload it")
   -- What the version learned from is never forgotten: a version is derived from what the one it
   -- replaces was, and from what a proposal accepted as it drew on.
-  let derived := ((cur.map (·.derivedSamples)).getD [] ++ derived).eraseDups
+  let derived := ((cur.map fun (c : RubricVersion) => c.derived).getD {}).union derived
   let row : Store.RubricRow :=
     { owner, name, version := current + 1, document := doc.toJson.compress, created_at := now
-    , derived_samples := some (rawOfStrings derived) }
+    , derived_samples := some (rawOfStrings derived.samples)
+    , derived_prs := some (rawOfStrings derived.prs) }
   HasModel.save row
   return .ok (RubricVersion.ofRow row)
 

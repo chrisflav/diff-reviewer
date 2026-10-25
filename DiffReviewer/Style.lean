@@ -26,8 +26,10 @@ scored against a draw.
 with one of the agent's comments, that comment's category is the example's; otherwise it has
 none, and is shown without.
 
-**Only the pool, only the past.** Examples are of `pool` samples: the `eval` ones are what
-calibration measures by, and an agent shown them would be scored against what it was shown. And
+**Only the pool, only the past.** Examples are of `pool` samples, and of none whose pull request
+has an `eval` sample (`Calibration.poolSamples`): the `eval` ones are what calibration measures by,
+and an agent shown them, or another review of the same pull request, would be scored against what
+it was shown. And
 only of reviews submitted before the review the job is — a calibration job's sample's, or, for a
 review, before the job was made — so that no example says what was learned since; a sample of no
 known time is not shown. An example is its text and category only: no file or lines to look up.
@@ -151,11 +153,9 @@ def reviewTime (job : Job) : IO (Option String) := do
 def examplesFor (repo : Repo) (job : Job) : IO (Array Example) := do
   if repo.trustedReviewers.isEmpty then return #[]
   let some before ← reviewTime job | return #[]
-  Calibration.assignSplits repo
-  let samples := (← Calibration.listSamples repo.owner repo.name).filter fun s =>
+  let samples := (← Calibration.poolSamples repo).filter fun s =>
     s.prNumber != job.prNumber && repo.trustedReviewers.contains s.reviewer &&
-      (s.scope == "full" || s.scope == "partial") && s.split == some "pool" &&
-      s.submittedAt.any (· < before)
+      (s.scope == "full" || s.scope == "partial") && s.submittedAt.any (· < before)
   let samples := samples.extract 0 maxSamplesRead
   let cats ← pairedCategories repo.owner repo.name
   let candidates := samples.flatMap fun s =>

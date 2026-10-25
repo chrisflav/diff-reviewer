@@ -21,20 +21,26 @@ or rejects it.
     most `maxProposalsPerDay` are made per repository in 24 hours; both are checked in the
     transaction that makes the job.
   * **What the agent reads** (`contextJson`): the current rubric and its version, the style
-    notes, calibration's aggregates (by category and severity among them), the people's comments
-    the agent missed and the agent's that nobody matched in recent runs, and what people changed
-    in the agent's drafts before posting them — each at most `maxContextItems`.
+    notes, calibration's aggregates of the pool (by category and severity among them), the
+    people's comments the agent missed and the agent's that nobody matched in recent runs, and
+    what people changed in the agent's drafts before posting them — each at most
+    `maxContextItems`, and none of a pull request with an `eval` sample. Its first read records
+    the style notes it was given; every read, the samples and pull requests it drew on
+    (`Store.ContextRow`): the provenance every rubric and notes version made from the proposal
+    records (`Platform.Provenance`).
   * **What it submits** (`submit`): a whole rubric document, checked as a rubric `PUT` is, new
     style notes if it has any, and a rationale; stored as a `pending` proposal against the rubric
     version it was written from. The job is then a `draft`, its output written.
   * **Accepting** (`accept`) is a versioned write of the rubric: the person names the rubric
     version they read, and if the rubric has moved since the proposal's base — or since they read
     it — nothing is written and both versions are given back (`AcceptError.moved`), so that they
-    rebase it in the editor rather than overwrite a change the proposal never saw. Accepting
-    writes the style notes too, if the proposal has them, unless the repository's have changed
-    since the proposal was submitted (`conflict`). One transaction: the rubric, the notes and the
-    proposal's decision are written together or not at all. **Rejecting** (`reject`) records the
-    decision and writes nothing else.
+    rebase it in the editor rather than overwrite a change the proposal never saw — and save the
+    result with `fromProposal` (`saveRubricFrom`, `adoptIn`), which records the proposal's
+    provenance and marks it accepted. Accepting writes the style notes too only when asked
+    (`applyStyleNotes`), and only if the repository's are still the ones the agent was given at its
+    first read (`conflict`). One transaction: the rubric, the notes and the proposal's decision are
+    written together or not at all. **Rejecting** (`reject`) records the decision and writes
+    nothing else.
 
 The agent's routes are of the repository and the job (`/api/agent/v1/repos/{owner}/{name}/
 proposals/{jobId}`): kleis binds them to the task's repository, and the platform to the job, which
@@ -74,11 +80,11 @@ structure Proposal where
   baseVersion : Nat
   documentRaw : String
   styleNotes  : Option String
-  /-- The style notes its agent read (`ContextRow`), which accepting its notes checks are still
-      the repository's. -/
+  /-- The style notes its agent was given at its first read of its context (`ContextRow`), which
+      applying its notes checks are still the repository's. -/
   baseStyleNotes : Option String
-  /-- The calibration samples its context drew on. -/
-  contextSamples : List String := []
+  /-- The calibration samples and pull requests its context drew on. -/
+  context : Provenance := {}
   rationale   : String
   /-- `pending`, `accepted` or `rejected`. -/
   status      : String
@@ -92,7 +98,8 @@ def Proposal.rubric? (p : Proposal) : Except String Rubric :=
 private def Proposal.ofRow (r : Store.ProposalRow) : Proposal :=
   { id := r.id, owner := r.owner, name := r.name, jobId := r.job_id
   , baseVersion := r.base_version.toNat, documentRaw := r.document, styleNotes := r.style_notes
-  , baseStyleNotes := r.base_style_notes, contextSamples := stringsOfRaw r.context_samples
+  , baseStyleNotes := r.base_style_notes
+  , context := { samples := stringsOfRaw r.context_samples, prs := stringsOfRaw r.context_prs }
   , rationale := r.rationale, status := r.status
   , createdAt := r.created_at, decidedAt := r.decided_at
   , acceptedVersion := r.accepted_version.map (·.toNat) }
@@ -101,7 +108,8 @@ private def Proposal.toRow (p : Proposal) : Store.ProposalRow :=
   { id := p.id, owner := p.owner, name := p.name, job_id := p.jobId
   , base_version := p.baseVersion, document := p.documentRaw, style_notes := p.styleNotes
   , base_style_notes := p.baseStyleNotes
-  , context_samples := some (rawOfStrings p.contextSamples), rationale := p.rationale
+  , context_samples := some (rawOfStrings p.context.samples)
+  , context_prs := some (rawOfStrings p.context.prs), rationale := p.rationale
   , status := p.status
   , created_at := p.createdAt, decided_at := p.decidedAt
   , accepted_version := p.acceptedVersion.map Int.ofNat }
@@ -249,7 +257,8 @@ first, and a proposal is submitted once")
       { id := pid, owner := repo.owner, name := repo.name, jobId := id
       , baseVersion := sub.baseVersion, documentRaw := sub.rubric.toJson.compress
       , styleNotes := sub.styleNotes, baseStyleNotes := some ctx.style_notes
-      , contextSamples := stringsOfRaw (some ctx.sample_ids)
+      , context := { samples := stringsOfRaw (some ctx.sample_ids)
+                   , prs := stringsOfRaw (some ctx.prs) }
       , rationale := sub.rationale, status := "pending", createdAt := now, decidedAt := none
       , acceptedVersion := none }
     HasModel.save p.toRow
@@ -297,12 +306,13 @@ def accept (repo : Repo) (id : String) (version : Nat) (applyStyleNotes : Bool) 
       unless current == p.baseVersion do
         abort (.moved p.baseVersion current s!"the rubric of {repo.slug} is at version \
 {current}, and proposal {id} was written from version {p.baseVersion}; rebase it on the current \
-rubric in the editor and save that instead")
+rubric in the editor and save that with \"fromProposal\": \"{id}\"")
       unless version == current do
         abort (.moved p.baseVersion current s!"the rubric of {repo.slug} has changed since it \
-was read (version {version}, now {current}); reload it")
+was read (version {version}, now {current}); reload it, or rebase the proposal in the editor and \
+save that with \"fromProposal\": \"{id}\"")
       let written ← match ← Platform.putRubricIn repo.owner repo.name version doc now
-          (derived := p.contextSamples) with
+          (derived := p.context) with
         | .ok v => pure v
         | .error (.conflict why) | .error (.invalid why) => abort (.conflict why)
         | .error .notFound => abort .notFound
@@ -315,11 +325,55 @@ was read (version {version}, now {current}); reload it")
           abort (.conflict s!"the style notes of {repo.slug} have changed since the agent of \
 proposal {id} read them; accept it without 'applyStyleNotes', and copy what you want of its notes \
 into the settings")
-        let _ ← Platform.saveStyleNotes fresh notes p.contextSamples
+        let _ ← Platform.saveStyleNotes fresh notes p.context
       let p := { p with status := "accepted", decidedAt := some now
                         acceptedVersion := some written.version }
       HasModel.save p.toRow
       return .ok (p, written)
+  catch e =>
+    match ← failed.get with
+    | some why => return .error why
+    | none => throw e
+
+/-- Inside the transaction of a person's write — a rubric `PUT` or a settings `PUT` naming
+    `fromProposal` — proposal `id` of `repo`: its provenance, for the write to record, and the
+    proposal marked accepted (with the rubric version written, `rubricVersion`, when there is
+    one). A proposal rejected is refused: what it said was turned down, and a write that keeps
+    some of it records its provenance only by being accepted. One accepted already gives its
+    provenance again, keeping the rubric version it records. -/
+def adoptIn (repo : Repo) (id : String) (rubricVersion : Option Nat) (now : String) :
+    Sqlite.M (Except String Provenance) := do
+  let some p := (← fetchProposals repo.owner repo.name).find? (·.id == id)
+    | return .error s!"'fromProposal': {id} is not a proposal of {repo.slug}"
+  if p.status == "rejected" then
+    return .error s!"'fromProposal': proposal {id} was rejected"
+  let p := { p with status := "accepted", decidedAt := p.decidedAt <|> some now
+                    acceptedVersion := p.acceptedVersion <|> rubricVersion }
+  HasModel.save p.toRow
+  return .ok p.context
+
+/-- A person's rubric `doc` of `repo`, over version `expected`, made from proposal `id` — what
+    the editor saves after rebasing a proposal the rubric had moved on from: written as the next
+    rubric version with the proposal's provenance (`Platform.putRubricIn`), and the proposal
+    marked accepted with it (`adoptIn`). One transaction. -/
+def saveRubricFrom (repo : Repo) (id : String) (expected : Nat) (doc : Rubric) :
+    IO (Except Platform.UpdateError RubricVersion) := do
+  let now ← nowIso
+  let failed : IO.Ref (Option Platform.UpdateError) ← IO.mkRef none
+  let abort {α : Type} (e : Platform.UpdateError) : Sqlite.M α := do
+    failed.set (some e)
+    throw (IO.userError "the rubric was not written")
+  try
+    Store.transact do
+      let some p := (← fetchProposals repo.owner repo.name).find? (·.id == id)
+        | abort (.invalid s!"'fromProposal': {id} is not a proposal of {repo.slug}")
+      let written ← match ← Platform.putRubricIn repo.owner repo.name expected doc now
+          (derived := p.context) with
+        | .ok v => pure v
+        | .error e => abort e
+      match ← adoptIn repo id (some written.version) now with
+      | .ok _ => return .ok written
+      | .error why => abort (.conflict why)
   catch e =>
     match ← failed.get with
     | some why => return .error why
@@ -375,8 +429,9 @@ def diffJson (before after : Rubric) (notes : Option (String × String) := none)
           ("styleNotes", (notes.map fun (b, a) => change b a).getD .null)]
 
 /-- A proposal as a person reads it. With `detail`, its document and style notes, and its diff
-    against its base and the repository's style notes when it was submitted; and whether the
-    rubric has moved since its base (`rebaseNeeded`), which accepting would refuse. -/
+    against its base and against the style notes its agent was given at its first read of its
+    context (which only `applyStyleNotes` writes); and whether the rubric has moved since its base
+    (`rebaseNeeded`), which accepting would refuse — rebase it and save with `fromProposal`. -/
 def Proposal.toJson (p : Proposal) (current : Nat) (detail : Bool) : IO Json := do
   let fields : List (String × Json) :=
     [("id", p.id), ("owner", p.owner), ("name", p.name), ("jobId", p.jobId),
@@ -444,13 +499,13 @@ private def agentCommentJson (pr : Nat) (a : Json) : Option Json := do
 
 /-- The people's comments the agent missed and the agent's nobody matched, most recent scores
     first, at most `maxContextItems` each — and the samples they are of, which every rubric and
-    style notes accepted from the proposal record: of the scores by the current matcher that are
-    not stale, of `pool` samples — never the `eval` ones calibration measures by — that are not
-    deleted, whose reviewer is still trusted, and that were scored for their comments (`full`). -/
+    style notes version made from the proposal records: of each sample's newest score by the
+    current matcher that is not stale, of `pool` samples whose pull request has no `eval` sample
+    (`Calibration.poolSamples`) — never what calibration measures by — whose reviewer is still
+    trusted, and that were scored for their comments (`full`). -/
 def misses (repo : Repo) : IO (Array Json × Array Json × List String) := do
-  Calibration.assignSplits repo
-  let samples := (← Calibration.listSamples repo.owner repo.name).filter fun s =>
-    s.split == some "pool" && repo.trustedReviewers.contains s.reviewer
+  let samples := (← Calibration.poolSamples repo).filter fun s =>
+    repo.trustedReviewers.contains s.reviewer
   let rows := (← Calibration.scoresOf repo.owner repo.name).filter fun r =>
     r.stale != some true && samples.any (·.id == r.sample_id)
   let rows := rows.qsort fun a b => a.created_at > b.created_at ||
@@ -459,10 +514,12 @@ def misses (repo : Repo) : IO (Array Json × Array Json × List String) := do
   let mut agent : Array Json := #[]
   let mut used : List String := []
   for r in rows do
+    -- The newest score of a sample only: an older run of it says what the agent did then.
+    if used.contains r.sample_id then continue
+    used := used ++ [r.sample_id]
     let some score := (Json.parse r.score).toOption | continue
     unless (score.getObjValAs? String "scope").toOption == some "full" do continue
     let pr := ((samples.find? (·.id == r.sample_id)).map (·.prNumber)).getD 0
-    unless used.contains r.sample_id do used := used ++ [r.sample_id]
     let arr (k : String) : Array Json :=
       ((score.getObjVal? k).toOption.bind (·.getArr?.toOption)).getD #[]
     for h in arr "unmatchedHuman" do
@@ -484,12 +541,15 @@ private def commentJson (c : InlineComment) : Json :=
            ("severity", (c.severity.map (Json.str ·.toString)).getD .null)])
 
 /-- What people changed in the agent's drafts before posting them: of the repository's posted
-    review jobs, most recently changed first, each comment of the agent's first draft against the
-    same comment (by its id) as GitHub holds it — changed, removed, or added by the person — at
-    most `maxContextItems`. -/
-def personEdits (owner name : String) : IO (Array Json) := do
+    review jobs of a pull request with no `eval` sample, most recently changed first, each comment
+    of the agent's first draft against the same comment (by its id) as GitHub holds it — changed,
+    removed, or added by the person — at most `maxContextItems`; and the pull requests they are of.
+    A held-out pull request's posted review is often what a trusted reviewer then reviewed. -/
+def personEdits (owner name : String) : IO (Array Json × List Nat) := do
+  let held ← Calibration.evalPulls owner name
   let jobs := (← Platform.listJobs).filter fun j =>
-    j.owner == owner && j.name == name && j.isReview && j.status? == some .posted
+    j.owner == owner && j.name == name && j.isReview && j.status? == some .posted &&
+      !held.contains j.prNumber
   let jobs := (jobs.qsort fun a b => a.updatedAt > b.updatedAt).extract 0 maxEditedJobsRead
   let mut out : Array Json := #[]
   for j in jobs do
@@ -515,7 +575,9 @@ def personEdits (owner name : String) : IO (Array Json) := do
     for a in p.comments do
       unless a.id.any fun i => d.comments.any (·.id == some i) do
         out := out.push (item "added" none (some a))
-  return out.extract 0 maxContextItems
+  let kept := out.extract 0 maxContextItems
+  let prs := (kept.toList.filterMap (·.getObjValAs? Nat "prNumber" |>.toOption)).eraseDups
+  return (kept, prs)
 
 /-- What a proposal agent is told: the task, what it reads, and what to submit. -/
 def instructions : String :=
@@ -597,8 +659,12 @@ def contextJson (repo : Repo) (job : Job) : IO Json := do
     | some v => v.toJson
     | none => RubricVersion.none repo.owner repo.name
   let (human, agent, used) ← misses repo
+  let (edits, editPrs) ← personEdits repo.owner repo.name
+  let samples ← Calibration.listSamples repo.owner repo.name (deleted := true)
+  let prs := ((used.filterMap fun id => (samples.find? (·.id == id)).map (·.prNumber)) ++ editPrs)
+    |>.eraseDups |>.map (prKey repo.owner repo.name)
   -- What the agent was first given is kept for accepting (`Store.ContextRow`): the notes it read
-  -- first, and every sample any of its reads drew on.
+  -- first, and every sample and pull request any of its reads drew on.
   let now ← nowIso
   Store.transact do
     let prev ← fetchContext job.id
@@ -606,12 +672,13 @@ def contextJson (repo : Repo) (job : Job) : IO Json := do
                    , style_notes := (prev.map (·.style_notes)).getD repo.styleNotes
                    , sample_ids := rawOfStrings
                        ((stringsOfRaw (prev.map (·.sample_ids)) ++ used).eraseDups)
+                   , prs := rawOfStrings ((stringsOfRaw (prev.map (·.prs)) ++ prs).eraseDups)
                    , read_at := (prev.map (·.read_at)).getD now } : Store.ContextRow)
   return .mkObj [
     ("jobId", job.id), ("owner", repo.owner), ("name", repo.name), ("status", job.statusRaw),
     ("instructions", instructions), ("rubric", rubric), ("styleNotes", repo.styleNotes),
     ("calibration", ← Calibration.summaryJson repo.owner repo.name (split := "pool")),
     ("missedHuman", .arr human), ("unmatchedAgent", .arr agent),
-    ("personEdits", .arr (← personEdits repo.owner repo.name))]
+    ("personEdits", .arr edits)]
 
 end DiffReviewer.Proposal

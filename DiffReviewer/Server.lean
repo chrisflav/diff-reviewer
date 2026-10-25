@@ -50,6 +50,11 @@ credentials reach it, none of which stands in for another:
     nothing else. Agents never hold it: an agent's request goes through kleis, which replaces the
     placeholder the agent sends with this token, and only for the routes, repository and pull
     request its grant allows.
+  * **the proposals' agent token** (`proposerAgentToken`), the only credential of a rubric
+    proposal's agent routes (`/api/agent/v1/repos/{owner}/{name}/proposals/…`), which the agent
+    token does not reach, as it reaches no other: should kleis's grants ever let a review agent's
+    request through to them, or a proposal agent's to a pull request, the platform still refuses
+    it. kleis holds it, under an account of its own.
 
 Writes must be `application/json`, which with `SameSite=Strict` is what keeps a cross-site form
 from making one.
@@ -98,6 +103,9 @@ structure Config where
   /-- The bearer for `/api/agent/v1/` (`DIFF_REVIEWER_AGENT_TOKEN_FILE`). Without one the agent API
       refuses everything. -/
   agentToken : Option String := none
+  /-- The bearer of a rubric proposal's agent routes (`DIFF_REVIEWER_PROPOSER_AGENT_TOKEN_FILE`),
+      and of nothing else. Without one they refuse everything. -/
+  proposerAgentToken : Option String := none
   /-- The platform's tokens on orchestra, for reviews and for rubric proposals: not served with,
       but checked with the others, so that no two credentials are one. -/
   orchestraToken : Option String := none
@@ -124,22 +132,19 @@ structure Config where
     used for two credentials, which would make them interchangeable. -/
 def Config.check (cfg : Config) : Except String Unit := do
   if cfg.password.length < 12 then throw "the password is shorter than 12 characters"
-  for (what, tok?) in [("API", cfg.apiToken), ("agent", cfg.agentToken)] do
-    if let some tok := tok? then
-      if tok.length < 32 then throw s!"the {what} token is shorter than 32 characters"
-      if tok == cfg.password then throw s!"the {what} token is the password"
-  if let (some a, some b) := (cfg.apiToken, cfg.agentToken) then
-    if a == b then throw "the API token and the agent token are the same"
-  -- Orchestra refuses a token two clients share, and names neither; and a token of the platform's
-  -- own that reached orchestra, or one of orchestra's that reached the platform, must not open
-  -- the other.
-  if let some p := cfg.proposerToken then
-    if p.length < 32 then throw "the orchestra proposer token is shorter than 32 characters"
-    let others := [("the password", some cfg.password), ("the API token", cfg.apiToken),
-                   ("the agent token", cfg.agentToken),
-                   ("the orchestra token", cfg.orchestraToken)]
-    for (what, tok?) in others do
-      if tok? == some p then throw s!"the orchestra proposer token is {what}"
+  -- Every token stands for one credential only: the platform's own, and its two on orchestra —
+  -- which refuses a token two clients share, and a token of one side that reached the other must
+  -- not open it.
+  let tokens : List (String × String) :=
+    [("the API token", cfg.apiToken), ("the agent token", cfg.agentToken),
+     ("the proposals' agent token", cfg.proposerAgentToken),
+     ("the orchestra token", cfg.orchestraToken),
+     ("the orchestra proposer token", cfg.proposerToken)].filterMap fun (w, t) => t.map (w, ·)
+  for ((what, tok), i) in tokens.zipIdx do
+    if tok.length < 32 then throw s!"{what} is shorter than 32 characters"
+    if tok == cfg.password then throw s!"{what} is the password"
+    for (other, tok') in tokens.drop (i + 1) do
+      if tok == tok' then throw s!"{what} and {other} are the same"
 
 private def nowEpoch : IO Int :=
   return (← Std.Time.Timestamp.now).toSecondsSinceUnixEpoch.val
@@ -220,10 +225,10 @@ def authenticated (st : State) (r : Req) : IO Bool := do
     return ← sessionValid st sid
   return false
 
-/-- Whether a request carries the agent token. Nothing else counts: not a session, not the API
-    token. -/
-def agentAuthenticated (st : State) (r : Req) : Bool :=
-  match bearer r, st.cfg.agentToken with
+/-- Whether a request carries the agent token — or, with `proposal`, the proposals' agent token.
+    Nothing else counts: not a session, not the API token, not the other agent token. -/
+def agentAuthenticated (st : State) (r : Req) (proposal := false) : Bool :=
+  match bearer r, (if proposal then st.cfg.proposerAgentToken else st.cfg.agentToken) with
   | some tok, some expected => constantTimeEq tok expected
   | _, _ => false
 
@@ -396,7 +401,9 @@ private def page (query : String) (xs : Array Json) : IO Reply := do
 private def parseBody (body : String) : Except String Json :=
   (Json.parse body).mapError (s!"the body is not valid JSON: " ++ ·)
 
-/-- Register a repository or change its settings. Every field is optional. `mode` and
+/-- Register a repository or change its settings. Every field is optional. `fromProposal` names
+    the rubric proposal the style notes written come from: they record its provenance, and it is
+    accepted with the write. `mode` and
     `autoReview` take their defaults when left out, as they always have; `trustedReviewers` and
     `styleNotes` keep what they were, so that a client that does not know them cannot wipe them.
     `version`, when given, is the version of the settings last read (0 for a repository not
@@ -448,8 +455,18 @@ private def putRepo (owner name body : String) : IO Reply := do
     | .ok v => match v.getNat? with
       | .ok n => pure (some n)
       | .error _ => return .error "'version' must be a whole number" .badRequest
+  -- Style notes a person wrote from a rubric proposal — after rebasing it, say — record its
+  -- provenance, and the proposal is accepted with the write.
+  let provenance ← match j.getObjVal? "fromProposal" with
+    | .error _ | .ok .null => pure (pure (.ok {}))
+    | .ok (.str id) =>
+      let now ← nowIso
+      let repo : Repo := { owner := owner.toLower, name := name.toLower, createdAt := now }
+      pure (Proposal.adoptIn repo id none now)
+    | .ok _ => return .error "'fromProposal' must be a proposal's id" .badRequest
   match ← Platform.putRepo owner name
-      { mode, autoReview, trustedReviewers := trusted, styleNotes, evalShare, expected } with
+      { mode, autoReview, trustedReviewers := trusted, styleNotes, evalShare, expected
+      , provenance } with
   | .ok (existed, repo) => return .json repo.toJson (if existed then .ok else .created)
   | .error why => return .error why .conflict
 
@@ -675,7 +692,15 @@ private def putRubric (owner name body : String) : IO Reply := do
     | .ok d => pure d
     | .error e => return .error e .badRequest
   if let .error e := doc.validate then return .error e .badRequest
-  match ← Platform.putRubric owner name version doc with
+  let fromProposal ← match j.getObjVal? "fromProposal" with
+    | .error _ | .ok .null => pure none
+    | .ok (.str id) => pure (some id)
+    | .ok _ => return .error "'fromProposal' must be a proposal's id" .badRequest
+  let some repo ← Platform.findRepo owner name | return .error "not found" .notFound
+  let written ← match fromProposal with
+    | some id => Proposal.saveRubricFrom repo id version doc
+    | none => Platform.putRubric owner name version doc
+  match written with
   | .ok v => return .json v.toJson
   | .error .notFound => return .error "not found" .notFound
   | .error (.conflict why) => return .error why .conflict
@@ -1085,10 +1110,14 @@ private def agentShow (job : Job) : IO Reply := do
   let some repo ← Platform.findRepo job.owner job.name | return .error "not found" .notFound
   let examples ← Style.examplesFor repo job
   let answer (j : Job) := agentJobJson j rubric repo.styleNotes examples
-  if job.status? != some .queued then return .json (answer job)
+  -- The notes version the agent is given, recorded as the rubric's is on submission: what its
+  -- score is judged derived by. Written only when it changes, or the job starts.
+  let notes := some repo.styleNotesVersion
+  if job.status? != some .queued && job.notesVersion == notes then return .json (answer job)
   match ← Platform.updateJob job.id fun j => do
-      unless j.status? == some .queued do return j
-      return { j with statusRaw := JobStatus.running.toString }
+      unless j.status? == some .queued || j.status? == some .running do return j
+      let st := if j.status? == some .queued then JobStatus.running.toString else j.statusRaw
+      return { j with statusRaw := st, notesVersion := notes }
   with
   | .ok j => return .json (answer j)
   | .error _ => return .error "not found" .notFound
@@ -1200,7 +1229,11 @@ show` first")
                         ("error", (job.error.map Json.str).getD .null)])
 
 private def agentRoute (st : State) (r : Req) : IO Reply := do
-  unless agentAuthenticated st r do return .error "unauthorized" .unauthorized
+  -- A rubric proposal's routes take the proposals' agent token, and every other the agent token.
+  let proposalRoute := match agentSegments r.path with
+    | some ("repos" :: _ :: _ :: "proposals" :: _) => true
+    | _ => false
+  unless agentAuthenticated st r proposalRoute do return .error "unauthorized" .unauthorized
   let some segs := agentSegments r.path | return .error "not found" .notFound
   if r.method == .post && !isJsonContentType (r.header "content-type") then
     return .error "writes must be sent as application/json" .unsupportedMediaType

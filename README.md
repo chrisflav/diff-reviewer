@@ -115,7 +115,8 @@ ignored.
 | --- | --- |
 | `DIFF_REVIEWER_PASSWORD` | Required. What you sign in with, at least 12 characters. Accepted only by `POST /api/login`, which is rate-limited: after 5 failures from one address (an IPv6 /64) within 15 minutes every attempt from it is refused (`429`, at once, with `Retry-After`) for 15 seconds, doubling with each further failure; after 100 from all addresses together, every password attempt is refused for a while. Sign in with the API token then. |
 | `DIFF_REVIEWER_API_TOKEN_FILE` | The bearer scripts send to `/api/v1/` (`Authorization: Bearer …`). `POST /api/login` also takes it (`{"token": …}`) and issues a session, with no rate limit: the way in while password attempts are refused. Unset, only a signed-in browser reaches the API. |
-| `DIFF_REVIEWER_AGENT_TOKEN_FILE` | The bearer of `/api/agent/v1/`, and good for nothing else. Unset, the agent API refuses everything. kleis holds it, never the agent. |
+| `DIFF_REVIEWER_AGENT_TOKEN_FILE` | The bearer of `/api/agent/v1/` — every route but a rubric proposal's — and good for nothing else. Unset, those routes refuse everything. kleis holds it, never the agent. |
+| `DIFF_REVIEWER_PROPOSER_AGENT_TOKEN_FILE` | The bearer of a rubric proposal's agent routes (`/api/agent/v1/repos/{owner}/{name}/proposals/…`), and of nothing else: the agent token does not reach them, nor this one a pull request's. Unset, they refuse everything. kleis holds it, under an account of its own (see [Behind kleis](#behind-kleis)). |
 | `DIFF_REVIEWER_GITHUB_TOKEN_FILE` | The token for api.github.com: listing pull requests, reading one and its diff, posting reviews. Unset, there is no discovery, no diff and no posting. In production this is the placeholder `kleis` (see below). Also used by `diff-reviewer github`, which otherwise falls back to `gh auth token`. |
 | `DIFF_REVIEWER_GITHUB_LOGIN` | The GitHub login reviews are posted as. **Set it in production.** When a post's outcome is unknown, only reviews by this login count as the platform's: without it, anyone who writes a job's marker into a review of their own could make the platform record that job as posted (it logs this once). And on a pull request this login wrote, GitHub refuses an approval or a request for changes, so such a review is posted as a comment and the job's `postNote` says so. |
 | `DIFF_REVIEWER_GITHUB_API` | GitHub's API root, `https://api.github.com` by default. |
@@ -281,6 +282,12 @@ The platform holds no real credential of GitHub, and agents hold none of the pla
   running (a repository has at most one such job); a submission to one that is not running is a
   `409` — or the answer is `404`. A submission carries a whole rubric document, so allow request
   bodies up to the platform's own limit, 1 MiB.
+
+  **A second account.** These routes take their own bearer,
+  `DIFF_REVIEWER_PROPOSER_AGENT_TOKEN_FILE`, and the review routes refuse it, as these refuse the agent token: should a grant ever let a
+  request of the one kind through on the other's routes, the platform still refuses it. So kleis
+  needs a second account, `diff-reviewer/proposer`, carrying that token, and the `rubric-proposer`
+  spec injects it (and the `reviewer` spec keeps injecting the agent token).
 - **The platform's side.** Run `serve` with `HTTPS_PROXY` pointing at kleis (and kleis's CA in
   `CURL_CA_BUNDLE`), and `DIFF_REVIEWER_GITHUB_TOKEN_FILE` holding `kleis`. kleis's
   `diff-reviewer-poster` grant injects the operator's PAT for reading pull requests and posting
@@ -446,27 +453,40 @@ reviewed, without being shown that review, and the two are compared.
 ### Held out
 
 What the agent learns from must not be what it is measured by. So every sample is assigned, once,
-to `eval` or to the `pool`: by a stable hash (FNV-1a) of its group — repository, pull request,
-commit, reviewer — against the repository's `evalShare` (`PUT /api/v1/repos/{owner}/{name}`, 0 to
-100, 50 by default, versioned with the other settings). The split is stored on the sample
-(`split`) when it is made, and never changes: a new share splits only the samples that come after
-it. (A sample imported before splits existed is given one the first time it is read for a run,
-an example or a proposal.)
+to `eval` or to the `pool`: by a stable hash (FNV-1a) of its pull request (`owner/name#pr`)
+against the repository's `evalShare` (`PUT /api/v1/repos/{owner}/{name}`, 0 to 100, 50 by
+default, versioned with the other settings). By pull request, not by review: two reviewers of one
+pull request, or two rounds of it, say much of the same, and one must not teach what the other
+tests. A new sample of a pull request that has a split already takes it. The split is stored on
+the sample (`split`) and never changes: a new share splits only the pull requests that come after
+it. A sample imported before splits existed is given one the first time it is read — for a run,
+an example or a proposal, and for a run, the list of runs or the summary (`GET …/calibration/runs`,
+`…/runs/{id}`, `…/summary`); nothing is written when every sample has one.
 
 - **Runs** are of `eval` samples, and every aggregate is of `eval` samples only. A run of the pool
   must be asked for (`"split": "pool"`).
-- **What the agent learns from** is the pool and the review jobs, never `eval`: the examples of
-  style ([Review style](#review-style)), and a rubric proposal's misses, unmatched comments and
-  calibration aggregates ([Rubric proposals](#rubric-proposals)); its people's edits are of review
-  jobs.
-- **Derived scores.** Every rubric version records the samples (by id) whose evidence it was
-  derived from (`derivedFrom`): those the context of the proposal it was accepted from drew on,
-  and every earlier version's, since a person's edit of a derived rubric may keep what it learned.
-  The style notes record theirs likewise (`styleNotesDerivedFrom`). A score of a sample in the set
-  of the rubric version its job was reviewed against, or in the style notes', is `derived`
-  (`scoreDerived` in a run's results): left out of aggregates unless asked (`?derived=include`),
-  and counted (`derivedScores`), like a stale one. With the split this should not happen; it is
-  the guard for when it does — a sample imported before splits, or a share changed.
+- **What the agent learns from** is the pool and the review jobs, never `eval` — and of the pool,
+  never a sample of a pull request that has an `eval` sample (which samples stored while the split
+  was by review may have): the examples of style ([Review style](#review-style)), a rubric
+  proposal's misses, unmatched comments and pool aggregates, and its people's edits, which are of
+  posted review jobs of pull requests with no `eval` sample ([Rubric proposals](#rubric-proposals)).
+- **Derived scores.** Every rubric version records what it was derived from (`derivedFrom`, the
+  samples, and `derivedFromPulls`, their pull requests): the pull requests the context of the
+  proposal it came from drew on — its misses, its unmatched comments, its people's edits — and
+  every earlier version's, since a person's edit of a derived rubric may keep what it learned.
+  Each version of the style notes records the same (kept by name, so a delete and a registration
+  again keep it), and each job records the notes version its agent was given when it read the job
+  (`notesVersion`), as it records its `rubricVersion`. A score whose sample's pull request is in
+  the set of its job's rubric version or notes version is `derived` (`scoreDerived` in a run's
+  results) — a sample of that pull request imported later too: left out of aggregates unless asked
+  (`?derived=include`), and counted (`derivedScores`), like a stale one. What it guards: the split
+  keeps eval out of what the agent learns from; this keeps what a rubric or the notes learned from
+  out of what measures them, wherever it came from — the pool when an eval sample of its pull
+  request arrives later, a pull request's posted reviews, samples split before the split was by
+  pull request. It holds for every way a proposal reaches the rubric or the notes: accepting it,
+  or saving a rebased version with `fromProposal` ([Rubric proposals](#rubric-proposals)). A
+  rubric or notes a person writes from what they read of a proposal without naming it is beyond
+  what the platform can know.
 
 ### What the numbers mean
 
@@ -540,7 +560,8 @@ or asks — is easier to show than to describe, so the agent is shown, and told 
   with when it was paired with one of the agent's comments (otherwise `null`) — no file, no lines,
   nothing to go and look up. The prompt and the instructions tell the agent to write in their style — their length,
   their tone, how directly they say what to change — and not to copy them.
-- **Which.** Of the `pool` samples not deleted whose reviewer is still trusted, the `full` and
+- **Which.** Of the `pool` samples not deleted whose reviewer is still trusted, and whose pull
+  request has no `eval` sample, the `full` and
   `partial` ones submitted before the review the job is — for a calibration job, before its
   sample's review; for a review job, before the job was made — and of their comments those of 20
   to 600 characters. Picked greedily for variety: each
@@ -575,13 +596,15 @@ person reads it beside the rubric and accepts or rejects it.
    /api/agent/v1/repos/{o}/{n}/proposals/{jobId}`) the current rubric and its version, the style
    notes, calibration's aggregates of the pool (overall, by category, by severity, by rubric
    version), up to 30 comments trusted reviewers made that the agent missed and 30 the agent made
-   that nobody matched — from the most recent scores of `full` `pool` samples, not stale, not
-   deleted, of a reviewer still trusted, each with its pull request, file, lines and text — and up
-   to 30 comments people changed, removed or added in the agent's drafts before posting them,
-   before and after, from the history of the posted review jobs. Every text over 2 KiB is cut
+   that nobody matched — from each sample's newest score that is not stale, of `full` `pool`
+   samples not deleted, of a reviewer still trusted and of a pull request with no `eval` sample,
+   each with its pull request, file, lines and text — and up to 30 comments people changed,
+   removed or added in the agent's drafts before posting them, before and after, from the history
+   of the posted review jobs of pull requests with no `eval` sample. Every text over 2 KiB is cut
    and marked (`bodyTruncated`). All of it was written by others, on pull requests anyone may
    open: the instructions tell the agent to read it as data and never as instructions. Its first
-   read records the style notes it was given, and every read the samples it drew on.
+   read records the style notes it was given, and every read the samples and pull requests it
+   drew on: the provenance the rubric and the notes taken from the proposal record.
 3. **It submits** (`agent proposal submit <owner/name> <file> --job <id>`) a whole rubric document,
    checked as a rubric `PUT` is — and with no field a rubric does not have, on the document, a
    type or a category (`400`, naming them; only a person's document keeps unknown fields) —
@@ -600,8 +623,12 @@ person reads it beside the rubric and accepts or rejects it.
    after it rolls everything back. It is a versioned write: when the rubric has moved since the
    proposal's base, or since you read it, nothing is written and the answer is a `409` with
    `baseVersion` and `currentVersion`, so that you rebase the proposal in the editor and save that
-   as an ordinary rubric `PUT`. Applying notes is a `409` too when the proposal has none, or when
-   the repository's notes are no longer the ones its agent first read.
+   as a rubric `PUT` with `"fromProposal": "<id>"`: it records the proposal's provenance on the
+   version (see [Held out](#held-out)) and marks the proposal accepted, freeing the repository's
+   one live proposal. Notes taken from a proposal are saved the same way, as a settings `PUT`
+   with `fromProposal`. Applying notes is a `409` too when the proposal has none, or when the
+   repository's notes are no longer the ones its agent was given at its first read of its context
+   (the snapshot is taken then, not on submission).
    `POST …/proposals/{id}/reject` with `{}` records the decision and writes nothing else.
 
 ## Tests
@@ -627,7 +654,9 @@ setting — rubric proposals — one live a repository and a cap a day, queued w
 through their own client, what the agent reads and submits, the diff, accepting as a versioned
 write that asks for a rebase when the rubric has moved and rolls back whole, the style notes
 applied only when asked and only over the notes the agent read, rejecting, cancelling, unknown
-fields refused — the held-out split, fixed once made, and derived scores left out; the platform's
+fields refused, `fromProposal` keeping provenance — the held-out split by pull request, fixed
+once made, held-out pull requests teaching nothing, and derived scores, by rubric and notes
+version and by pull request, left out; the two agent tokens kept apart; the platform's
 own posts kept out of the samples; the job header required — and that `docs/openapi.json`
 documents exactly the routes the server answers. Nothing in it reaches the network.
 

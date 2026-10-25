@@ -41,15 +41,20 @@ repository trusts (`Repo.trustedReviewers`) wrote on its past pull requests:
     (`maxCalibrationJobsPerDay`): a charge when a run makes one and another when a person runs it
     again (`retryJob`), each checked in one transaction with the write it allows. What the agent is
     given names no sample and says nothing of the person's review.
-  * **Held out** (`splitOf`, `assignSplits`). Every sample is `eval` or `pool`, by a stable hash
-    of its group — repository, pull request, commit, reviewer — against the repository's
-    `evalShare` (50 by default), fixed once assigned and stored: changing the share changes only
-    samples assigned later. Runs measure on `eval` samples; a run may be asked of the `pool`, to
-    give rubric proposals evidence, and its scores are never in an aggregate. What the agent
-    learns from — the examples of style, a rubric proposal's misses — is of `pool` samples only.
-    A score of a sample a rubric version or the style notes were derived from (`derivedOf`) is
-    `derived` and left out of aggregates unless asked, like a stale one: what a rubric learned
-    from is no test of it.
+  * **Held out, by pull request** (`splitOf`, `assignSplits`, `poolSamples`). Every sample is
+    `eval` or `pool`, by a stable hash of its pull request against the repository's `evalShare`
+    (50 by default), fixed once assigned and stored; a sample of a pull request that has a split
+    already takes it. By pull request, not by review: two reviewers of one pull request, or two
+    rounds of it, say much the same, and one must not teach what the other tests. Changing the
+    share changes only the pull requests split later. Runs measure on `eval` samples; a run may be
+    asked of the `pool`, to give rubric proposals evidence, and its scores are never in an
+    aggregate. What the agent learns from — the examples of style, a rubric proposal's misses and
+    pool aggregates — is of `pool` samples whose pull request has no `eval` sample (which samples
+    stored before the split was by pull request may have).
+  * **Derived** (`derivedOf`). A score is `derived`, and left out of aggregates unless asked like
+    a stale one, when its sample's pull request is one the rubric version or the style notes
+    version its job was reviewed under was derived from (`Platform.Provenance`): what a rubric
+    learned from is no test of it.
   * **Not the platform's own.** An import skips the reviews the platform posted — by GitHub's id
     of a job's `postedReview`, or by the marker in their body — and counts them as `ownPosts`: the
     agent is not to be scored against, nor learn from, itself.
@@ -168,24 +173,51 @@ def listSamples (owner name : String) (deleted := false) : IO (Array Sample) := 
 def stableHash (s : String) : UInt64 :=
   s.toUTF8.foldl (fun h b => (h ^^^ b.toUInt64) * 1099511628211) 14695981039346656037
 
-/-- The split of a sample of `owner/name` of pull request `pr`, commit `commit` and reviewer
-    `reviewer`, with `evalShare` percent held out: `eval` when its group's hash falls under the
-    share. -/
-def splitOf (owner name : String) (pr : Nat) (commit reviewer : String) (evalShare : Nat) :
-    String :=
-  let bucket := (stableHash s!"{owner}/{name}#{pr}@{commit}:{reviewer}").toNat % 100
+/-- The split of the samples of pull request `pr` of `owner/name`, with `evalShare` percent held
+    out: `eval` when the hash of `owner/name#pr` falls under the share. -/
+def splitOf (owner name : String) (pr : Nat) (evalShare : Nat) : String :=
+  let bucket := (stableHash (prKey owner name pr)).toNat % 100
   if bucket < evalShare then "eval" else "pool"
 
-/-- Give every sample of `repo` without a split one, by `splitOf` with the repository's share
-    now, and store it: a split, once made, never changes. One transaction. -/
+/-- The split a new sample of pull request `pr` takes, among `samples`: the one a sample of the
+    pull request has already — the first stored, should an old database hold two — or `splitOf`'s
+    with the share now. -/
+def splitFor (samples : Array Sample) (owner name : String) (pr : Nat) (evalShare : Nat) :
+    String :=
+  match (samples.filter (·.prNumber == pr)).toList.filterMap (·.split) with
+  | s :: _ => s
+  | [] => splitOf owner name pr evalShare
+
+/-- Give every sample of `repo` without a split one (`splitFor`), and store it: a split, once
+    made, never changes. Nothing is written, and no write lock taken, when every sample has one;
+    otherwise in one transaction that reads the repository's share again. -/
 def assignSplits (repo : Repo) : IO Unit := do
+  let all ← Store.run (fetchSamples repo.owner repo.name)
+  unless all.any (·.split.isNone) do return
   let now ← nowIso
   Store.transact do
-    for s in ← fetchSamples repo.owner repo.name do
+    let some repo ← Platform.fetchRepo repo.owner repo.name | return
+    let mut all ← fetchSamples repo.owner repo.name
+    for i in [0:all.size] do
+      let some s := all[i]? | continue
       if s.split.isSome then continue
-      let split := splitOf s.owner s.name s.prNumber s.commitId s.reviewer repo.evalShare
-      let s : Sample := { s with split := some split, updatedAt := now }
+      let s : Sample := { s with split := some (splitFor all s.owner s.name s.prNumber
+                                                  repo.evalShare), updatedAt := now }
       HasModel.save s.toRow
+      all := all.set! i s
+
+/-- The pull requests of `owner/name` that have an `eval` sample, deleted or not. -/
+def evalPulls (owner name : String) : IO (List Nat) := do
+  let all ← Store.run (fetchSamples owner name)
+  return ((all.filter (·.split == some "eval")).toList.map (·.prNumber)).eraseDups
+
+/-- The samples of `repo` an agent may learn from: of the `pool`, not deleted, and of a pull
+    request no `eval` sample is of. The most recently reviewed first. -/
+def poolSamples (repo : Repo) : IO (Array Sample) := do
+  assignSplits repo
+  let held ← evalPulls repo.owner repo.name
+  return (← listSamples repo.owner repo.name).filter fun s =>
+    s.split == some "pool" && !held.contains s.prNumber
 
 /-- The ids of `owner/name`'s deleted samples. -/
 def deletedSamples (owner name : String) : IO (List String) := do
@@ -453,7 +485,8 @@ private def storeGroup (repo : Repo) (p : PullRef) (base : String) (parts : List
       , prBody := p.body, commentsRaw := "[]", droppedLeft := 0, droppedOutdated := 0
       , droppedReplies := 0, scope := "decision", submittedAt := none, importedAt := now
       , updatedAt := now, deletedAt := none
-      , split := some (splitOf repo.owner repo.name p.number commit reviewer repo.evalShare) }
+      , split := some (splitFor (← fetchSamples repo.owner repo.name) repo.owner repo.name
+                         p.number repo.evalShare) }
     let comments := old.comments ++ parts.flatMap (·.kept.toList)
     let bodies := ([old.body] ++ parts.map (·.review.body)).filter (!·.trimAscii.isEmpty)
     let body := "\n\n".intercalate bodies
@@ -913,15 +946,23 @@ def scorePending : IO Nat := do
 
 private def isStale (r : Store.ScoreRow) : Bool := r.stale == some true
 
-/-- Which of the scores of `owner/name` are `derived`: of a sample the rubric version the job was
-    reviewed against was derived from (`RubricVersion.derivedSamples`), or the repository's style
-    notes were. Neither is a test of what learned from it. -/
+/-- Which of the scores of `owner/name` are `derived`: of a sample whose pull request — or which
+    itself — the rubric version the job was reviewed against, or the style notes version its agent
+    was given (`Job.notesVersion`), was derived from. By pull request, so that a sample of such a
+    pull request imported later is flagged too. Neither is a test of what learned from it. -/
 def derivedOf (owner name : String) : IO (Store.ScoreRow → Bool) := do
   let rubrics ← Platform.rubricHistory owner name
-  let notes := ((← Platform.findRepo owner name).map (·.styleNotesDerived)).getD []
+  let notes ← Platform.notesHistory owner name
+  let samples ← Store.run (fetchSamples owner name)
+  let jobs ← calibrationJobs owner name
   return fun r =>
-    notes.contains r.sample_id || rubrics.any fun v =>
-      r.rubric_version == some (v.version : Int) && v.derivedSamples.contains r.sample_id
+    let pr := (samples.find? (·.id == r.sample_id)).map fun s => prKey owner name s.prNumber
+    let hit (p : Provenance) : Bool :=
+      p.samples.contains r.sample_id || pr.any (p.prs.contains ·)
+    let byRubric := rubrics.any fun v => r.rubric_version == some (v.version : Int) && hit v.derived
+    let notesVersion := (jobs.find? (·.id == r.job_id)).bind (·.notesVersion)
+    let byNotes := notes.any fun n => notesVersion == some n.version && hit n.derived
+    byRubric || byNotes
 
 /-- What an aggregate leaves out, and what it is asked to take in. -/
 structure Filter where
@@ -954,8 +995,13 @@ def filterOf (owner name : String) (includeStale includeDerived : Bool) (split :
     IO Filter := do
   if let some repo ← Platform.findRepo owner name then assignSplits repo
   let all ← Store.run (fetchSamples owner name)
+  -- The pool's aggregates, which a proposal reads, leave out every sample of a pull request that
+  -- is held out, whatever its own split.
+  let held ← evalPulls owner name
+  let outside (s : Sample) : Bool :=
+    s.split != some split || (split == "pool" && held.contains s.prNumber)
   return { deleted := ← deletedSamples owner name
-         , others := (all.filter (·.split != some split)).toList.map (·.id)
+         , others := (all.filter outside).toList.map (·.id)
          , derived := ← derivedOf owner name, includeStale, includeDerived }
 
 /-- How many of `jobs` are in each status, as `{status: n}`. -/

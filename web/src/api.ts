@@ -62,8 +62,11 @@ export interface Repo {
    * are the `pool` examples and proposals learn from. Absent before API 0.6.0.
    */
   evalShare?: number;
-  /** The calibration samples the style notes were derived from, by accepted proposals. */
-  styleNotesDerivedFrom?: string[];
+  /**
+   * The version of the style notes, 0 before any; each records what it was derived from. Absent
+   * before API 0.6.0.
+   */
+  styleNotesVersion?: number;
   /** Incremented by every write of the settings; sent back to have a stale write refused (409). */
   version: number;
   createdAt: string;
@@ -82,8 +85,10 @@ export interface RepoSettings {
   trustedReviewers?: string[];
   /** Kept when left out; an empty string clears them. */
   styleNotes?: string;
-  /** 0 to 100; kept when left out. Changes only the samples split after it. */
+  /** 0 to 100; kept when left out. Changes only the pull requests split after it. */
   evalShare?: number;
+  /** The rubric proposal the style notes written were taken from: records its provenance. */
+  fromProposal?: string;
   version?: number;
   [field: string]: unknown;
 }
@@ -150,6 +155,8 @@ export interface RubricDocument {
    * every earlier version's). Absent before API 0.6.0.
    */
   derivedFrom?: string[];
+  /** The pull requests (`owner/name#pr`) it was derived from. Absent before API 0.6.0. */
+  derivedFromPulls?: string[];
   [field: string]: unknown;
 }
 
@@ -215,6 +222,8 @@ export interface Job {
   /** The calibration sample and run of a `calibration` job. */
   sampleId?: string | null;
   runId?: string | null;
+  /** The style notes version the agent was given when it read the job (API 0.6.0). */
+  notesVersion?: number | null;
 }
 
 /** `proposal`: a rubric proposal of the repository (`prNumber` 0), never posted (API 0.6.0). */
@@ -595,16 +604,22 @@ export const api = {
 
   rubrics: (owner: string, name: string) =>
     request<RubricDocument>("GET", `/api/v1/repos/${seg(owner)}/${seg(name)}/rubrics`),
-  /** Replace the whole document; `version` is the one last read (0 for none). */
+  /**
+   * Replace the whole document; `version` is the one last read (0 for none). `fromProposal` names
+   * the rubric proposal it was rebased from: the version records its provenance, and the
+   * proposal is accepted (API 0.6.0).
+   */
   putRubrics: (
     owner: string,
     name: string,
     version: number,
     doc: { defaultRubric: string; prTypes: PrType[]; [field: string]: unknown },
+    fromProposal?: string,
   ) =>
     request<RubricDocument>("PUT", `/api/v1/repos/${seg(owner)}/${seg(name)}/rubrics`, {
       version,
       ...doc,
+      ...(fromProposal === undefined ? {} : { fromProposal }),
     }),
   /** One page of the versions of the document, newest first. */
   rubricHistory: (owner: string, name: string, limit = 50, offset = 0) =>

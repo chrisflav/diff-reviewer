@@ -32,7 +32,7 @@ def history : IO FakeHistory := do
 
 def agentProposalReq (method : Std.Http.Method) (job : String) (body : String := "")
     (repo : String := "acme/widgets") : Req :=
-  req method s!"/api/agent/v1/repos/{repo}/proposals/{job}" body (token := agentToken)
+  req method s!"/api/agent/v1/repos/{repo}/proposals/{job}" body (token := proposerAgentToken)
 
 def examplesOf (r : Reply) : List Json :=
   (((bodyJson r).getObjVal? "examples").toOption.bind (·.getArr?.toOption)).map (·.toList)
