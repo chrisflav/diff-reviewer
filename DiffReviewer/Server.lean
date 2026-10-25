@@ -58,6 +58,8 @@ structure Req where
   /-- Look up a header, case-insensitively. -/
   header  : String → Option String := fun _ => none
   body    : String := ""
+  /-- The address of the socket's other end, when known. -/
+  peer    : Option String := none
 
 /-- What `route` answers. -/
 structure Reply where
@@ -97,6 +99,11 @@ structure Config where
   dbPath : System.FilePath := "diff-reviewer.db"
   /-- Seconds between the passes of the background workers. -/
   interval : Nat := 60
+  /-- The address of the reverse proxy in front, whose `X-Forwarded-For` names the client. A
+      request from anywhere else is taken to come from its socket's peer. -/
+  trustedProxy : Option String := none
+  /-- The bounds the workers keep to. -/
+  limits : Workers.Limits := {}
 
 /-- Why `cfg`'s credentials are unsafe to serve with, if they are: a short secret, or one secret
     used for two credentials, which would make them interchangeable. -/
@@ -112,16 +119,23 @@ def Config.check (cfg : Config) : Except String Unit := do
 private def nowEpoch : IO Int :=
   return (← Std.Time.Timestamp.now).toSecondsSinceUnixEpoch.val
 
+/-- The failed logins of one client, or of all: their times within the window, and until when
+    attempts are refused. -/
+structure Lockout where
+  failures    : Array Int := #[]
+  lockedUntil : Int := 0
+  deriving Inhabited
+
 structure State where
   cfg : Config
   /-- Session ids with their expiry, in epoch seconds. In memory: a restart logs everyone out. -/
   sessions : IO.Ref (Array (String × Int))
   /-- GitHub, orchestra, and the posting guard. -/
   services : Workers.Services
-  /-- The times of the failed logins in the current window. -/
-  loginFailures : IO.Ref (Array Int)
-  /-- Until when every login attempt is refused. -/
-  loginLockedUntil : IO.Ref Int
+  /-- Failed logins by client address. -/
+  loginByAddress : IO.Ref (Array (String × Lockout))
+  /-- Failed logins from everywhere. -/
+  loginGlobal : IO.Ref Lockout
   /-- The current epoch second; replaced in the suite. -/
   clock : IO Int := nowEpoch
 
@@ -130,8 +144,8 @@ def State.new (cfg : Config) (services : Option Workers.Services := none)
   let services ← match services with
     | some s => pure s
     | none => Workers.Services.new
-  return { cfg, sessions := ← IO.mkRef #[], services, loginFailures := ← IO.mkRef #[]
-         , loginLockedUntil := ← IO.mkRef 0, clock }
+  return { cfg, sessions := ← IO.mkRef #[], services, loginByAddress := ← IO.mkRef #[]
+         , loginGlobal := ← IO.mkRef {}, clock }
 
 def sessionCookieName : String := "diff_reviewer_session"
 
@@ -190,29 +204,69 @@ def agentAuthenticated (st : State) (r : Req) : Bool :=
 
 /-! ## Login rate limiting -/
 
-/-- Failed logins allowed within `loginWindowSeconds` before attempts are refused. -/
+/-- Failed logins allowed from one address within `loginWindowSeconds` before its attempts are
+    refused. -/
 def loginFailureLimit : Nat := 5
+
+/-- Failed logins allowed from all addresses together: a ceiling for a guess spread over many
+    addresses, high enough that one address cannot lock the operator out by itself. -/
+def loginGlobalLimit : Nat := 100
 
 def loginWindowSeconds : Int := 900
 
-/-- How long attempts are refused after the `n`th failure in the window (`n ≥ loginFailureLimit`):
-    15 seconds, doubling, at most the window. -/
-def loginBackoff (n : Nat) : Int :=
-  min loginWindowSeconds (15 * 2 ^ (min 10 (n - loginFailureLimit)))
+/-- The most addresses whose failures are remembered; past it the least recent is forgotten. -/
+def loginMaxAddresses : Nat := 4096
 
-/-- The seconds a login attempt must still wait, or `none` if it may be made. -/
-private def loginWait (st : State) : IO (Option Int) := do
-  let now ← st.clock
-  let until_ ← st.loginLockedUntil.get
-  return if now < until_ then some (until_ - now) else none
+/-- How long attempts are refused after the `n`th failure in the window (`n ≥ limit`): 15 seconds,
+    doubling, at most the window. -/
+def loginBackoff (n : Nat) (limit : Nat := loginFailureLimit) : Int :=
+  min loginWindowSeconds (15 * 2 ^ (min 10 (n - limit)))
 
-private def loginFailed (st : State) : IO Unit := do
+def Lockout.wait (l : Lockout) (now : Int) : Option Int :=
+  if now < l.lockedUntil then some (l.lockedUntil - now) else none
+
+def Lockout.fail (l : Lockout) (now : Int) (limit : Nat) : Lockout :=
+  let failures := (l.failures.filter (· > now - loginWindowSeconds)).push now
+  { failures
+  , lockedUntil := if failures.size ≥ limit then now + loginBackoff failures.size limit
+                   else l.lockedUntil }
+
+/-- Whether `l` holds nothing a later attempt is judged by. -/
+private def Lockout.expired (l : Lockout) (now : Int) : Bool :=
+  l.lockedUntil ≤ now && l.failures.all (· ≤ now - loginWindowSeconds)
+
+/-- The client a request is from: the last address of `X-Forwarded-For` when the request comes
+    from the trusted proxy — the one that proxy added — and otherwise the socket's peer. A header
+    from anyone else is ignored, or any client could claim a fresh address for every guess. -/
+def clientAddress (st : State) (r : Req) : String :=
+  let peer := r.peer.getD "unknown"
+  if st.cfg.trustedProxy == some peer then
+    match (r.header "x-forwarded-for").bind fun h =>
+        ((h.splitOn ",").map (·.trimAscii.toString)).filter (!·.isEmpty) |>.getLast? with
+    | some a => a
+    | none => peer
+  else peer
+
+/-- The seconds a login attempt from `addr` must still wait, or `none` if it may be made. -/
+private def loginWait (st : State) (addr : String) : IO (Option Int) := do
   let now ← st.clock
-  let n ← st.loginFailures.modifyGet fun fs =>
-    let fs := (fs.filter (· > now - loginWindowSeconds)).push now
-    (fs.size, fs)
-  if n ≥ loginFailureLimit then
-    st.loginLockedUntil.set (now + loginBackoff n)
+  let mine := ((← st.loginByAddress.get).find? (·.1 == addr)).map (·.2)
+  let waits := [mine.bind (·.wait now), (← st.loginGlobal.get).wait now].filterMap id
+  return waits.max?
+
+private def loginFailed (st : State) (addr : String) : IO Unit := do
+  let now ← st.clock
+  st.loginGlobal.modify (·.fail now loginGlobalLimit)
+  st.loginByAddress.modify fun t =>
+    let mine := ((t.find? (·.1 == addr)).map (·.2)).getD {}
+    let rest := (t.filter fun (a, l) => a != addr && !l.expired now)
+    -- Bounded: forget the address whose last failure is oldest.
+    let rest := if rest.size < loginMaxAddresses then rest else
+      (rest.qsort fun x y => x.2.failures.back?.getD 0 > y.2.failures.back?.getD 0).pop
+    rest.push (addr, mine.fail now loginFailureLimit)
+
+private def loginSucceeded (st : State) (addr : String) : IO Unit :=
+  st.loginByAddress.modify (·.filter (·.1 != addr))
 
 /-! ## Paths -/
 
@@ -286,7 +340,8 @@ private def createJob (body : String) : IO Reply := do
     | .ok (.str sha) =>
       let sha := sha.toLower
       unless validSha sha do
-        return .error s!"'headSha' must be a commit id (7 to 64 hex digits), not '{sha}'" .badRequest
+        return .error s!"'headSha' must be a whole commit id (40 or 64 hex digits), not '{sha}'"
+          .badRequest
       pure (some sha)
     | .ok _ => return .error "'headSha' must be a string" .badRequest
   let some repo ← Platform.findRepo owner.toLower name.toLower
@@ -391,6 +446,7 @@ private def diffReply (st : State) (job : Job) (text : Bool) : IO Reply := do
     return .json (.mkObj [("headSha", head), ("diff", diff)])
   | .error .noHead => return .error Workers.DiffError.noHead.message .conflict
   | .error .unavailable => return .error Workers.DiffError.unavailable.message .serviceUnavailable
+  | .error (.tooLarge why) => return .error why .payloadTooLarge
   | .error (.github why) => return .error s!"the diff could not be read: {why}" .badGateway
 
 /-- Every route under `/api/v1/`, with the methods it answers. `DiffReviewerTest.Server` checks
@@ -449,10 +505,26 @@ def agentSegments (path : String) : Option (List String) :=
     apiSegments ("/api/v1/" ++ (path.drop "/api/agent/v1/".length).toString)
   else none
 
-/-- The job an agent is running for a pull request: the newest that is `queued` or `running`. -/
-private def activeJob (owner name : String) (pr : Nat) : IO (Option Job) := do
-  return (← Platform.jobsOfPull owner.toLower name.toLower pr).find? fun j =>
+/-- The job an agent is running for a pull request: one that is `queued` or `running` — the one the
+    agent names (`X-Diff-Reviewer-Job`, from `--job`), or else the only one. With two, an agent
+    that does not say which it runs is told so rather than given one: the run of a superseded head
+    must not take over the review of the new one. -/
+private def activeJob (owner name : String) (pr : Nat) (jobId : Option String) :
+    IO (Except Reply Job) := do
+  let active := (← Platform.jobsOfPull owner.toLower name.toLower pr).filter fun j =>
     j.status? == some .queued || j.status? == some .running
+  let notRun := Reply.error s!"no review of {owner}/{name}#{pr} is being run" .notFound
+  match jobId with
+  | some id => return match active.find? (·.id == id) with
+    | some j => .ok j
+    | none => .error (Reply.error s!"job {id} is not a review of {owner}/{name}#{pr} being run"
+        .notFound)
+  | none =>
+    match active.toList with
+    | [] => return .error notRun
+    | [j] => return .ok j
+    | _ => return .error (Reply.error s!"{active.size} reviews of {owner}/{name}#{pr} are being \
+run; name yours with --job" .conflict)
 
 private def agentJobJson (job : Job) : Json :=
   .mkObj [("jobId", job.id), ("owner", job.owner), ("name", job.name), ("prNumber", job.prNumber),
@@ -489,6 +561,9 @@ private def agentSubmit (st : State) (job : Job) (body : String) : IO Reply := d
     | .ok r => pure r
     | .error e => return .error s!"'review' is not a review: {e}" .badRequest
   if let .error e := review.validate then return .error s!"'review': {e}" .badRequest
+  -- GitHub refuses a comment off the diff; the agent is told now, while it can still fix it.
+  if let .ok (_, d) ← Workers.diffOf st.services job then
+    if let .error e := Diff.check review d then return .error s!"'review': {e}" .badRequest
   let headSha := headSha.toLower
   let drafted ← Platform.updateJob job.id fun j => do
     unless j.status? == some .running do
@@ -518,9 +593,9 @@ private def agentRoute (st : State) (r : Req) : IO Reply := do
     return .error "writes must be sent as application/json" .unsupportedMediaType
   let pull (owner name pr : String) (k : Job → IO Reply) : IO Reply := do
     let some n := pr.toNat? | return .error "not found" .notFound
-    let some job ← activeJob owner name n
-      | return .error s!"no review of {owner}/{name}#{pr} is being run" .notFound
-    k job
+    match ← activeJob owner name n (r.header "x-diff-reviewer-job") with
+    | .ok job => k job
+    | .error reply => return reply
   match segs, r.method with
   | ["repos", o, n, "pulls", pr], .get => pull o n pr agentShow
   | ["repos", o, n, "pulls", pr, "diff"], .get => pull o n pr (diffReply st · (text := true))
@@ -595,14 +670,15 @@ def route (st : State) (r : Req) : IO Reply := do
     let supplied := (Json.parse r.body).toOption.bind (·.getObjValAs? String "password" |>.toOption)
     let some p := supplied
       | return .error "expected a JSON body of the form {\"password\": \"…\"}" .badRequest
-    if let some wait ← loginWait st then
+    let addr := clientAddress st r
+    if let some wait ← loginWait st addr then
       return { Reply.error s!"too many failed logins; try again in {wait} seconds"
                  .tooManyRequests with
                headers := [("Cache-Control", "no-store"), ("Retry-After", toString wait)] }
     unless constantTimeEq p st.cfg.password do
-      loginFailed st
+      loginFailed st addr
       return .error "invalid password" .unauthorized
-    st.loginFailures.set #[]
+    loginSucceeded st addr
     let sid ← issueSession st
     return { Reply.json (.mkObj [("authenticated", true)]) with
              headers := [("Cache-Control", "no-store"),
@@ -656,8 +732,12 @@ private instance : Handler Server where
     let body : String ← if req.line.method == .post || req.line.method == .put then
         req.body.readAll (maximumSize := some maxBodyBytes)
       else pure ""
+    let peer := (req.extensions.get Std.Http.Server.RemoteAddr).map fun a =>
+      match a.addr with
+      | .v4 v => toString v.addr
+      | .v6 v => toString v.addr
     let r : Req :=
-      { method := req.line.method, path := toString req.line.uri.path, body
+      { method := req.line.method, path := toString req.line.uri.path, body, peer
       , header := fun n => (req.line.headers.get? (Header.Name.ofString! n)).map toString }
     toResponse (← route s.st r)
   onFailure _ _ := pure ()

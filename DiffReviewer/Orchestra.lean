@@ -53,27 +53,37 @@ def terminal (status : String) : Bool :=
   ["done", "failed", "unfinished", "cancelled"].contains status
 
 structure Client where
-  queue : QueueRequest → IO (Except String Entry)
-  entry : (id : String) → IO (Except String Entry)
+  queue  : QueueRequest → IO (Except String Entry)
+  entry  : (id : String) → IO (Except String Entry)
+  /-- Stop the run of entry `id`, or withdraw it if it has not started. -/
+  cancel : (id : String) → IO (Except String Unit)
 
 private def errorOf (r : Http.Response) : String :=
   let msg := ((Json.parse r.body).toOption.bind (·.getObjValAs? String "error" |>.toOption))
   s!"orchestra answered {r.status}{(msg.map (": " ++ ·)).getD ""}"
 
-/-- The client that talks to orchestra at `url` with `token`, through curl. -/
+/-- The client that talks to orchestra at `url` with `token`, through curl. Orchestra is reached
+    directly, never through `HTTPS_PROXY`: the proxy is kleis, there for GitHub, and the orchestra
+    token is the platform's own, not one kleis should see. -/
 def Client.curl (url token : String) : Client :=
   let url := (url.dropEndWhile (· == '/')).toString
-  let call (method path : String) (body : Option Json) : IO (Except String Entry) := do
+  let send (method path : String) (body : Option Json) : IO (Except String Http.Response) := do
     let headers := [("Authorization", s!"Bearer {token}"), ("Accept", "application/json")] ++
       (if body.isSome then [("Content-Type", "application/json")] else [])
-    match ← Http.send { method, url := url ++ path, headers, body := body.map (·.compress) } with
-    | .error e => return .error e
+    match ← Http.send { method, url := url ++ path, headers, body := body.map (·.compress)
+                      , noproxy := some (Http.hostOf url) } with
+    | .error e => return .error e.message
     | .ok r =>
       unless 200 ≤ r.status && r.status < 300 do return .error (errorOf r)
-      return (Json.parse r.body).bind Entry.ofJson |>.mapError
+      return .ok r
+  let call (method path : String) (body : Option Json) : IO (Except String Entry) := do
+    return (← send method path body).bind fun r =>
+      (Json.parse r.body).bind Entry.ofJson |>.mapError
         (s!"orchestra's answer is not a queue entry: " ++ ·)
   { queue := fun req => call "POST" "/api/v1/queue" (some req.toJson)
-    entry := fun id => call "GET" s!"/api/v1/queue/{id}" none }
+    entry := fun id => call "GET" s!"/api/v1/queue/{id}" none
+    cancel := fun id => do
+      return (← send "POST" s!"/api/v1/queue/{id}/cancel" (some (.mkObj []))).map fun _ => () }
 
 /-- The client configured by `DIFF_REVIEWER_ORCHESTRA_URL` and
     `DIFF_REVIEWER_ORCHESTRA_TOKEN_FILE`, or `none` unless both are set. -/

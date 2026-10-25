@@ -75,23 +75,25 @@ private def fail (msg : String) : IO UInt32 := do
   return 1
 
 /-- One request to the agent API about pull request `pr` of `slug`; `suffix` is `""`, `/diff` or
-    `/review`. -/
-def request (cfg : Config) (method slug pr suffix : String) (body : Option String := none) :
-    IO (Except String Http.Response) := do
+    `/review`. `job` is the job the agent's prompt named (`--job`), sent as `X-Diff-Reviewer-Job`
+    so that the platform can tell this run from an older one of the same pull request. -/
+def request (cfg : Config) (method slug pr suffix : String) (body : Option String := none)
+    (job : Option String := none) : IO (Except String Http.Response) := do
   let some (owner, name) := splitSlug slug | return .error s!"'{slug}' is not owner/name"
   let some _ := pr.toNat? | return .error s!"'{pr}' is not a pull request number"
   let headers := [("Authorization", s!"Bearer {cfg.token}"), ("Accept", "application/json")] ++
-    (if body.isSome then [("Content-Type", "application/json")] else [])
+    (if body.isSome then [("Content-Type", "application/json")] else []) ++
+    (job.map (fun j => ("X-Diff-Reviewer-Job", j))).toList
   let url := s!"{cfg.url}/api/agent/v1/repos/{owner}/{name}/pulls/{pr}{suffix}"
-  Http.send { method, url, headers, body }
+  return (← Http.send { method, url, headers, body }).mapError (·.message)
 
 /-- Make one request and print its answer; answers the exit code. -/
-private def call (method slug pr suffix : String) (body : Option String) (pretty : Bool) :
-    IO UInt32 := do
+private def call (method slug pr suffix : String) (body : Option String) (pretty : Bool)
+    (job : Option String) : IO UInt32 := do
   let cfg ← match ← loadConfig with
     | .ok c => pure c
     | .error e => return ← fail e
-  match ← request cfg method slug pr suffix body with
+  match ← request cfg method slug pr suffix body job with
   | .error e => fail e
   | .ok r =>
     let shown := if pretty then ((Json.parse r.body).toOption.map (·.pretty)).getD r.body
@@ -102,15 +104,23 @@ private def call (method slug pr suffix : String) (body : Option String) (pretty
       return 0
     fail s!"the platform answered {r.status}: {shown}"
 
-def showPull (slug pr : String) : IO UInt32 := call "GET" slug pr "" none true
+def showPull (slug pr : String) (job : Option String := none) : IO UInt32 :=
+  call "GET" slug pr "" none true job
 
-def printDiff (slug pr : String) : IO UInt32 := call "GET" slug pr "/diff" none false
+def printDiff (slug pr : String) (job : Option String := none) : IO UInt32 :=
+  call "GET" slug pr "/diff" none false job
 
 /-- Submit the review in `path` (`-` for standard input). -/
-def submit (slug pr path : String) : IO UInt32 := do
+def submit (slug pr path : String) (job : Option String := none) : IO UInt32 := do
   let contents ← if path == "-" then (← IO.getStdin).readToEnd else IO.FS.readFile path
   match parseSubmission contents with
   | .error e => fail e
-  | .ok j => call "POST" slug pr "/review" (some j.compress) true
+  | .ok j => call "POST" slug pr "/review" (some j.compress) true job
+
+/-- `[]` or `["--job", id]`: the optional trailing flag of every subcommand. -/
+def jobFlag : List String → Option (Option String)
+  | [] => some none
+  | ["--job", id] => some (some id)
+  | _ => none
 
 end DiffReviewer.Agent

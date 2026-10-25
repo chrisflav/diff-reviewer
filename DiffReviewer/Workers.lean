@@ -1,6 +1,7 @@
 import DiffReviewer.Platform
 import DiffReviewer.GitHub
 import DiffReviewer.Orchestra
+import DiffReviewer.Diff
 
 open Lean (Json)
 
@@ -10,17 +11,37 @@ open Lean (Json)
 What `serve` does without being asked, on a loop every `--interval` seconds (`start`):
 
   * **discovery** — for each repository with `autoReview`, list its open pull requests and make a
-    job for every head commit that has none; a draft or approved review of an older head of the
-    same pull request is `stale`, since its line numbers no longer name the code under review.
-  * **queueing** — put each `pending` job on orchestra, as the platform's API client, and record
-    the queue entry. Orchestra's `external_id` is the job's id (with the attempt for a retry), so a
-    request whose answer was lost is answered with the entry it made rather than queued twice.
+    job for every head commit that has none, at most `maxJobsPerDay` a day per repository. A job of
+    an older head of the same pull request is `stale` — its line numbers no longer name the code
+    under review — and if it is queued or running, its orchestra run is cancelled: nothing is spent
+    on a commit nobody will merge.
+  * **queueing** — check each `pending` job's head is still its pull request's, fetch its diff
+    (a diff past `maxDiffBytes` fails the job), and put it on orchestra, as the platform's API
+    client, recording the queue entry. Orchestra's `external_id` is the job's id (with the attempt
+    for a retry), so a request whose answer was lost is answered with the entry it made rather than
+    queued twice.
   * **following** — read each queued or running job's entry (and whatever entry continues it) and
     move the job to `running` when the run starts, or to `failed` when it ends without the agent
     having submitted a review.
 
-And, on request: fetching a diff (`diffOf`, cached per commit) and posting an approved review
-(`postJob`), which a person asks for, or the agent's submission does for a `direct` repository.
+And it drops the kept diffs no live job needs. On request: fetching a diff (`diffOf`, cached per
+commit) and posting an approved review (`postJob`), which a person asks for, or the agent's
+submission does for a `direct` repository.
+
+## Posting once
+
+A review posted twice under the operator's name cannot be taken back, and a request can time out
+after GitHub has acted on it. So posting is claimed in the database first (`post_started_at`, set
+only on an `approved` job without a recent claim), the posted body carries the marker
+`<!-- diff-reviewer job <id> -->`, and whenever the outcome is unknown — a claim left by an
+earlier attempt, no answer, a `5xx` — the pull request's reviews are searched for the marker
+before anything is posted again. Only a definite refusal (a `4xx`) leaves the job plainly to be
+posted again.
+
+Only a person's `POST /api/v1/jobs/{id}/post` posts an approval or a request for changes. A
+`direct` repository's review is always posted as a comment, and so is any review of a pull request
+the operator (`DIFF_REVIEWER_GITHUB_LOGIN`) wrote, which GitHub would refuse; the job's `postNote`
+says so.
 
 The clients are passed in as `Services`, so that the suite runs all of it against fakes. Without
 an orchestra client the platform still runs — jobs simply stay `pending` — and says so once.
@@ -32,10 +53,26 @@ that the job is still in the state the call was made for.
 
 namespace DiffReviewer.Workers
 
+/-- The bounds the workers keep to. -/
+structure Limits where
+  /-- New jobs discovery makes per repository in 24 hours. -/
+  maxJobsPerDay : Nat := 50
+  /-- The largest diff reviewed, in bytes. -/
+  maxDiffBytes : Nat := GitHub.defaultMaxDiffBytes
+  /-- The GitHub login reviews are posted as, when known. -/
+  githubLogin : Option String := none
+  /-- Days a fetched diff is kept at most. -/
+  diffRetentionDays : Nat := 30
+  /-- How long a claim to post is taken to be a post still in flight, perhaps from another
+      process; past it, the claim is an attempt whose outcome must be checked. More than curl's
+      timeout. -/
+  postClaimSeconds : Nat := 120
+
 structure Services where
   github    : Option GitHub.Client
   orchestra : Option Orchestra.Client
   log       : String → IO Unit
+  limits    : Limits
   /-- The jobs being posted right now, so that two requests to post one review post it once. -/
   posting   : IO.Ref (List String)
   /-- The keys of the messages `logOnce` has already written. -/
@@ -43,8 +80,12 @@ structure Services where
 
 def Services.new (github : Option GitHub.Client := none)
     (orchestra : Option Orchestra.Client := none)
-    (log : String → IO Unit := fun m => IO.eprintln s!"diff-reviewer: {m}") : IO Services := do
-  return { github, orchestra, log, posting := ← IO.mkRef [], logged := ← IO.mkRef [] }
+    (log : String → IO Unit := fun m => IO.eprintln s!"diff-reviewer: {m}")
+    (limits : Limits := {}) : IO Services := do
+  return { github, orchestra, log, limits, posting := ← IO.mkRef [], logged := ← IO.mkRef [] }
+
+private def nowEpoch : IO Int :=
+  return (← Std.Time.Timestamp.now).toSecondsSinceUnixEpoch.val
 
 /-- Log `msg` the first time `key` is logged, and never again: for a state that holds on every
     pass of the loop, such as orchestra not being configured. -/
@@ -61,14 +102,19 @@ def prompt (job : Job) : String :=
   let slug := s!"{job.owner}/{job.name}"
   s!"Review pull request #{job.prNumber} of {slug} for the diff-reviewer platform (job {job.id}).
 
-1. Run `diff-reviewer agent show {slug} {job.prNumber}`. It prints the pull request — its head \
-and base commits, title and description — and the instructions for the review; follow them.
+1. Run `diff-reviewer agent show {slug} {job.prNumber} --job {job.id}`. It prints the pull \
+request — its head and base commits, title and description — and the instructions for the \
+review; follow them.
 2. The repository is checked out read-only in your working directory. Check out the head commit it \
 names (`git fetch origin pull/{job.prNumber}/head && git checkout <headSha>`) and read the change \
-in context. `diff-reviewer agent diff {slug} {job.prNumber}` prints the diff under review.
+in context. `diff-reviewer agent diff {slug} {job.prNumber} --job {job.id}` prints the diff under \
+review.
 3. Write the review as a JSON file `\{\"headSha\": …, \"prType\": null, \"review\": …}` and \
-submit it with `diff-reviewer agent submit {slug} {job.prNumber} <file>`. Fix what it reports and \
-submit again until it is accepted.
+submit it with `diff-reviewer agent submit {slug} {job.prNumber} <file> --job {job.id}`. Fix what \
+it reports and submit again until it is accepted.
+
+A review may carry at most {maxInlineComments} inline comments; merge or drop the least \
+important rather than exceed it.
 
 Do not comment on, review or otherwise write to the pull request on GitHub yourself: the review \
 is posted, once accepted, by the platform."
@@ -111,6 +157,7 @@ not comment on what is fine.
 - A comment's lines are line numbers of the file at the head commit (the right-hand side of the
   diff), and must lie in a hunk of the diff. `suggestion`, when given, replaces lines
   `start_line`..`end_line` exactly.
+- At most 200 inline comments: if you have more, merge related ones or drop the least important.
 - A review is posted only after the platform accepts it; a person may edit it first."
 
 /-! ## Pull request metadata and diffs -/
@@ -129,12 +176,14 @@ inductive DiffError where
   | noHead
   /-- No GitHub client is configured, and the diff is not cached. -/
   | unavailable
+  /-- The diff is past `maxDiffBytes`. -/
+  | tooLarge (why : String)
   | github (why : String)
 
 def DiffError.message : DiffError → String
   | .noHead => "the job names no head commit yet"
   | .unavailable => "GitHub is not configured (DIFF_REVIEWER_GITHUB_TOKEN_FILE)"
-  | .github why => why
+  | .tooLarge why | .github why => why
 
 /-- The head commit and diff of `job`: from the cache, or from GitHub, then cached. A job that does
     not know its base yet takes the pull request's current one. -/
@@ -147,11 +196,14 @@ def diffOf (s : Services) (job : Job) : IO (Except DiffError (String × String))
     | some b => pure b
     | none => match ← gh.getPull job.owner job.name job.prNumber with
       | .ok p => pure p.baseSha
-      | .error e => return .error (.github e)
+      | .error e => return .error (.github e.message)
   if let some d ← Platform.cachedDiff job.owner job.name base head then return .ok (head, d)
   match ← gh.diff job.owner job.name base head with
-  | .error e => return .error (.github e)
+  | .error (.tooLarge n) => return .error (.tooLarge (GitHub.Error.tooLarge n).message)
+  | .error e => return .error (.github e.message)
   | .ok d =>
+    if d.utf8ByteSize > s.limits.maxDiffBytes then
+      return .error (.tooLarge (GitHub.Error.tooLarge s.limits.maxDiffBytes).message)
     Platform.cacheDiff job.owner job.name base head d
     return .ok (head, d)
 
@@ -162,17 +214,46 @@ inductive PostError where
   | conflict (why : String)
   /-- No GitHub client is configured. -/
   | unavailable
-  /-- GitHub refused or could not be reached; the job, with the error recorded, is still
+  /-- GitHub refused, or could not be reached; the job, with the error recorded, is still
       `approved`. -/
   | github (why : String) (job : Job)
 
-/-- Post job `id`'s review to its pull request and mark it `posted`. The job must be `approved` and,
-    when `version` is given, at that version; the review is pinned to the job's head commit.
+/-- The marker the posted body of job `id`'s review ends with, by which it is found again. -/
+def marker (id : String) : String := s!"<!-- diff-reviewer job {id} -->"
 
-    If GitHub refuses, the job stays `approved` with the reason in its `error`, so that it can be
-    posted again. Once GitHub has the review the job is `posted` whatever happened to it meanwhile
-    — that is now what happened — with the review that was posted. -/
-def postJob (s : Services) (id : String) (version : Option Nat := none) :
+/-- The review as it is posted: its body, then the marker. -/
+def withMarker (id : String) (r : Review) : Review :=
+  { r with body := if r.body.isEmpty then marker id else r.body ++ "\n\n" ++ marker id }
+
+/-- The review of job `id` already on the pull request, if there is one. -/
+private def findPosted (gh : GitHub.Client) (job : Job) :
+    IO (Except GitHub.Error (Option GitHub.PostedReview)) := do
+  return (← gh.listReviews job.owner job.name job.prNumber).map fun rs =>
+    rs.find? fun r => (r.body.splitOn (marker job.id)).length > 1
+
+/-- What a review is posted as, and why, when that is not its own decision. -/
+def postedEvent (direct : Bool) (decision : Decision) (author login : Option String) :
+    Decision × Option String :=
+  if decision == .comment then (.comment, none)
+  else if direct then
+    (.comment, some "posted as a comment: in direct mode the platform never approves or requests \
+changes")
+  else if author.isSome && author.map (·.toLower) == login.map (·.toLower) then
+    (.comment, some s!"posted as a comment: {author.getD ""} wrote the pull request, and GitHub \
+does not let its author approve it or request changes")
+  else (decision, none)
+
+/-- Post job `id`'s review to its pull request and mark it `posted`. The job must be `approved` and,
+    when `version` is given, at that version; the review is pinned to the job's head commit, and
+    its comments are checked against the diff first. `direct` posts it as a comment, whatever its
+    decision.
+
+    See "Posting once" above: the claim is written before GitHub is asked, the body carries the
+    marker, and an unknown outcome is settled by looking for the marker. If GitHub refuses, the job
+    stays `approved` with the reason in its `error`, so that it can be posted again. Once GitHub
+    has the review the job is `posted` whatever happened to it meanwhile — that is now what
+    happened — with the review that was posted. -/
+def postJob (s : Services) (id : String) (version : Option Nat := none) (direct := false) :
     IO (Except PostError Job) := do
   let claimed ← s.posting.modifyGet fun ids =>
     if ids.contains id then (false, ids) else (true, id :: ids)
@@ -187,27 +268,75 @@ def postJob (s : Services) (id : String) (version : Option Nat := none) :
 {job.version}); reload it")
     let some (.ok review) := job.review?
       | return .error (.conflict s!"job {id} has no review this build can read")
+    if let .error e := review.validate then
+      return .error (.conflict s!"job {id}'s review would be refused by GitHub: {e}")
     let some head := job.headSha
       | return .error (.conflict s!"job {id} names no head commit to pin the review to")
     let some gh := s.github | return .error .unavailable
-    match ← gh.postReview job.owner job.name job.prNumber review (some head) (pending := false) with
-    | .error e =>
-      let recorded ← Platform.updateJob id fun j => do
-        unless j.status? == some .approved do throw (.conflict "moved on")
-        return { j with error := some s!"posting failed: {e}" }
-      return .error (.github e (match recorded with | .ok j => j | .error _ => job))
-    | .ok url =>
-      s.log s!"posted the review of {job.owner}/{job.name}#{job.prNumber} (job {id}): {url}"
+    if let .ok (_, d) ← diffOf s job then
+      if let .error e := Diff.check review d then
+        return .error (.conflict s!"job {id}'s review would be refused by GitHub: {e}")
+    -- A claim an earlier attempt left: it may have posted.
+    let earlier := job.postStartedAt.isSome
+    -- The claim, in the same transaction as the check that the job is still what was read.
+    let now ← nowEpoch
+    let recent := isoOfEpoch (now - s.limits.postClaimSeconds)
+    let claim ← Platform.updateJob id fun j => do
+      unless j.status? == some .approved do
+        throw (.conflict s!"job {id} is {j.statusRaw}; only an approved review is posted")
+      if let some v := version then
+        unless j.version == v do throw (.conflict s!"job {id} has changed since it was read")
+      if let some t := j.postStartedAt then
+        if t > recent then
+          throw (.conflict s!"posting job {id} began at {t} and may still be under way; try \
+again in a few minutes")
+      return { j with postStartedAt := some (isoOfEpoch now) }
+    let job ← match claim with
+      | .ok j => pure j
+      | .error .notFound => return .error .notFound
+      | .error (.conflict why) | .error (.invalid why) => return .error (.conflict why)
+    let author ← if s.limits.githubLogin.isNone || direct then pure none else
+      pure ((← gh.getPull job.owner job.name job.prNumber).toOption.map (·.author))
+    let (event, note) := postedEvent direct review.decision author s.limits.githubLogin
+    let markPosted (r : GitHub.PostedReview) : IO (Except PostError Job) := do
+      s.log s!"posted the review of {job.owner}/{job.name}#{job.prNumber} (job {id}): {r.url}"
       match ← Platform.updateJob id fun j =>
-          return { j.setReview review with statusRaw := JobStatus.posted.toString, error := none }
+          return { j.setReview review with statusRaw := JobStatus.posted.toString, error := none
+                                           postStartedAt := none, postedUrl := some r.url
+                                           postNote := note }
       with
       | .ok j => return .ok j
       | .error _ => return .error .notFound
+    -- Leave the job to be posted again, with why; `keepClaim` while whether it was posted is
+    -- still unknown, so that the next attempt looks before it posts.
+    let failed (why : String) (keepClaim : Bool) : IO (Except PostError Job) := do
+      let recorded ← Platform.updateJob id fun j =>
+        return { j with error := some why
+                        postStartedAt := if keepClaim then j.postStartedAt else none }
+      return .error (.github why (match recorded with | .ok j => j | .error _ => job))
+    if earlier then
+      match ← findPosted gh job with
+      | .ok (some r) => return ← markPosted r
+      | .ok none => pure ()
+      | .error e =>
+        return ← failed s!"an earlier attempt to post may have succeeded, and GitHub's reviews \
+could not be read to tell ({e.message})" true
+    match ← gh.postReview job.owner job.name job.prNumber (withMarker id review) (some head)
+        (some event) with
+    | .ok r => markPosted r
+    | .error (.definite why) => failed s!"posting failed: {why}" false
+    | .error e =>
+      match ← findPosted gh job with
+      | .ok (some r) => markPosted r
+      | .ok none => failed s!"posting failed: {e.message}" false
+      | .error e2 =>
+        failed s!"posting may have failed ({e.message}); GitHub's reviews could not be read to \
+tell ({e2.message}), and are looked at before the next attempt" true
   finally
     s.posting.modify (·.erase id)
 
 /-- After the agent's submission to a `direct` repository: approve the draft at `version` and post
-    it. -/
+    it, as a comment. -/
 def postDirect (s : Services) (id : String) (version : Nat) : IO (Except PostError Job) := do
   let approved ← Platform.updateJob id fun j => do
     unless j.status? == some .draft && j.version == version do
@@ -216,7 +345,7 @@ def postDirect (s : Services) (id : String) (version : Nat) : IO (Except PostErr
   match approved with
   | .error .notFound => return .error .notFound
   | .error (.conflict why) | .error (.invalid why) => return .error (.conflict why)
-  | .ok j => postJob s id (some j.version)
+  | .ok j => postJob s id (some j.version) (direct := true)
 
 /-! ## The loop -/
 
@@ -230,9 +359,25 @@ private def recordError (id : String) (status : JobStatus) (why : String) : IO U
     unless j.status? == some status do throw (.conflict "moved on")
     return { j with error := some why }
 
-/-- Discovery: a job for every new head of an open pull request of an `autoReview` repository, and
-    `stale` for the drafts and approvals of heads that are no longer the pull request's. GitHub
-    draft pull requests are left until they are marked ready for review. -/
+/-- Move `job` to `to` (`stale` or `failed`) with `why`, if it is still in the status it was read
+    in. A queued or running job's orchestra run is cancelled first: nothing more is to be spent on
+    it. -/
+def retire (s : Services) (job : Job) (to : JobStatus) (why : String) : IO Unit := do
+  if job.status? == some .queued || job.status? == some .running then
+    if let (some orch, some entry) := (s.orchestra, job.queueEntry) then
+      if let .error e ← orch.cancel entry then
+        s.log s!"cancelling entry {entry} of job {job.id}: {e}"
+  let _ ← Platform.updateJob job.id fun j => do
+    unless j.statusRaw == job.statusRaw do throw (.conflict "moved on")
+    return { j with statusRaw := to.toString, error := some why }
+  s.log s!"job {job.id} is {to.toString}: {why}"
+
+/-- The statuses in which a job of a superseded head is made `stale`. -/
+private def supersedable : List JobStatus := [.pending, .queued, .running, .draft, .approved]
+
+/-- Discovery: a job for every new head of an open pull request of an `autoReview` repository, up
+    to `maxJobsPerDay` a day, and `stale` for the jobs of heads that are no longer the pull
+    request's. GitHub draft pull requests are left until they are marked ready for review. -/
 def discover (s : Services) : IO Unit := do
   let repos := (← Platform.listRepos).filter (·.autoReview)
   if repos.isEmpty then return
@@ -241,21 +386,27 @@ def discover (s : Services) : IO Unit := do
 repositories with autoReview are not searched for pull requests"
   for repo in repos do
     match ← gh.listOpenPulls repo.owner repo.name with
-    | .error e => s.log s!"discovery on {repo.slug}: {e}"
+    | .error e => s.log s!"discovery on {repo.slug}: {e.message}"
     | .ok pulls =>
+      let now ← nowEpoch
+      let mut made ← Platform.jobsSince repo.owner repo.name (isoOfEpoch (now - 86400))
       for p in pulls do
         if p.draft then continue
-        if let some job ← Platform.createJobForHead repo p.number p.headSha
-            (some p.baseSha) (some p.title) (some p.body) then
-          s.log s!"new job {job.id} for {repo.slug}#{p.number} at {p.headSha}"
-        for old in ← Platform.jobsOfPull repo.owner repo.name p.number do
+        let jobs ← Platform.jobsOfPull repo.owner repo.name p.number
+        unless jobs.any (·.headSha == some p.headSha) do
+          if made ≥ s.limits.maxJobsPerDay then
+            s.logOnce s!"cap-{repo.slug}-{now / 86400}" s!"{repo.slug} has had \
+{s.limits.maxJobsPerDay} new jobs in 24 hours, the most allowed (--max-jobs-per-day); its new \
+heads wait"
+          else if let some job ← Platform.createJobForHead repo p.number p.headSha
+              (some p.baseSha) (some p.title) (some p.body) then
+            made := made + 1
+            s.log s!"new job {job.id} for {repo.slug}#{p.number} at {p.headSha}"
+        for old in jobs do
           let some sha := old.headSha | continue
           if sha == p.headSha then continue
-          unless old.status? == some .draft || old.status? == some .approved do continue
-          let _ ← Platform.updateJob old.id fun j => do
-            unless j.version == old.version do throw (.conflict "moved on")
-            return { j with statusRaw := JobStatus.stale.toString
-                            error := some s!"the pull request moved on to {p.headSha}" }
+          unless old.status?.any (supersedable.contains ·) do continue
+          retire s old .stale s!"the pull request moved on to {p.headSha}"
 
 /-- Orchestra's id for attempt `attempts` at job `id`: the id itself for the first, so that it is
     the job id the contract names, and `id.n` for the `n`th, since orchestra answers an id it has
@@ -263,7 +414,8 @@ repositories with autoReview are not searched for pull requests"
 def externalId (id : String) (attempts : Nat) : String :=
   if attempts == 0 then id else s!"{id}.{attempts + 1}"
 
-/-- Queueing: every `pending` job of a registered repository, onto orchestra. -/
+/-- Queueing: every `pending` job of a registered repository whose head is still its pull
+    request's, onto orchestra, once its diff has been fetched and found small enough. -/
 def queuePending (s : Services) : IO Unit := do
   let jobs ← Platform.jobsWithStatus [.pending]
   if jobs.isEmpty then return
@@ -273,15 +425,32 @@ DIFF_REVIEWER_ORCHESTRA_TOKEN_FILE); pending jobs stay pending"
   for job in jobs do
     if (← Platform.findRepo job.owner job.name).isNone then continue
     let mut job := job
-    unless hasPull job do
-      let some gh := s.github
-        | recordError job.id .pending "the job does not know its pull request's head and base, \
+    match s.github with
+    | none =>
+      unless hasPull job do
+        recordError job.id .pending "the job does not know its pull request's head and base, \
 and GitHub is not configured to read them"
-          continue
+        continue
+    | some gh =>
       match ← gh.getPull job.owner job.name job.prNumber with
-      | .ok p => job := setPull job p
       | .error e =>
-        recordError job.id .pending s!"reading the pull request: {e}"
+        recordError job.id .pending s!"reading the pull request: {e.message}"
+        continue
+      | .ok p =>
+        if p.state != "open" then
+          retire s job .stale s!"the pull request is {p.state}"
+          continue
+        if job.headSha.any (· != p.headSha) then
+          retire s job .stale s!"the pull request moved on to {p.headSha}"
+          continue
+        job := setPull job p
+      match ← diffOf s job with
+      | .ok _ => pure ()
+      | .error (.tooLarge why) =>
+        retire s job .failed why
+        continue
+      | .error e =>
+        recordError job.id .pending s!"reading the diff: {e.message}"
         continue
     let req : Orchestra.QueueRequest :=
       { prompt := prompt job, goal := goal job, upstream := s!"{job.owner}/{job.name}"
@@ -339,15 +508,21 @@ def follow (s : Services) : IO Unit := do
 
 /-- One pass of the loop. A step that throws is logged, and the next step still runs. -/
 def tick (s : Services) : IO Unit := do
+  let prune : IO Unit := do
+    let before := isoOfEpoch ((← nowEpoch) - s.limits.diffRetentionDays * 86400)
+    let n ← Platform.pruneDiffs before
+    if n > 0 then s.log s!"dropped {n} kept diff(s)"
   for (what, step) in [("discovery", discover s), ("queueing", queuePending s),
-                       ("following", follow s)] do
+                       ("following", follow s), ("pruning diffs", prune)] do
     try step catch e => s.log s!"{what}: {e}"
 
-/-- Run `tick` every `interval` seconds, on a thread of its own, for as long as the process. -/
+/-- Run `tick` every `interval` seconds, on a thread of its own, for as long as the process. A pass
+    that throws anyway is logged, and the loop goes on: a worker that died would stop every review
+    without a word. -/
 def start (s : Services) (interval : Nat) : IO Unit := do
   let _ ← IO.asTask (prio := .dedicated) do
     repeat
-      tick s
+      try tick s catch e => s.log s!"worker pass: {e}"
       IO.sleep (interval * 1000).toUInt32
   return
 

@@ -85,6 +85,12 @@ export interface Job {
   prType: string | null;
   /** How many times the job has been queued on orchestra. */
   attempts: number;
+  /** When posting last began, while its outcome is not known. */
+  postStartedAt: string | null;
+  /** The posted review on GitHub. */
+  postedUrl: string | null;
+  /** How the review was posted, when that differs from its decision. */
+  postNote: string | null;
 }
 
 /** Thrown when the server could not be reached at all. */

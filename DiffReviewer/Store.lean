@@ -62,6 +62,14 @@ structure JobRow where
   pr_type : Option String
   /-- How many times the job has been queued on orchestra (`0002`); none is 0. -/
   attempts : Option Int
+  /-- When posting the review to GitHub last began: the claim that keeps it from being posted
+      twice, kept until the outcome is known (`0002`). -/
+  post_started_at : Option String
+  /-- The posted review on GitHub (`0002`). -/
+  posted_url : Option String
+  /-- How the review was posted, when that differs from what it says — a decision posted as a
+      comment (`0002`). -/
+  post_note : Option String
   deriving Repr
 
 /-- The diff of a pull request at one head commit, as GitHub gave it. A commit's diff never
@@ -107,8 +115,9 @@ def migration0001 : Db.Migration.Migration where
         primaryKey := ["id"] }]
 
 /-- `0002_m1`: what queueing on orchestra and posting to GitHub keep — a repository's
-    `auto_review`, a job's pull request metadata, last error, pull request type and attempts, and
-    the diff cache. Every new column is nullable, so the rows `0001` wrote are valid as they are. -/
+    `auto_review`, a job's pull request metadata, last error, pull request type, attempts and
+    posting record, and the diff cache. Every new column is nullable, so the rows `0001` wrote are
+    valid as they are. -/
 def migration0002 : Db.Migration.Migration where
   name := "0002_m1"
   steps := [
@@ -119,6 +128,9 @@ def migration0002 : Db.Migration.Migration where
     .addColumn "review_job" "error" { type := .text, nullable := true },
     .addColumn "review_job" "pr_type" { type := .text, nullable := true },
     .addColumn "review_job" "attempts" { type := .int, nullable := true },
+    .addColumn "review_job" "post_started_at" { type := .text, nullable := true },
+    .addColumn "review_job" "posted_url" { type := .text, nullable := true },
+    .addColumn "review_job" "post_note" { type := .text, nullable := true },
     .createTable "pull_diff"
       { columns := .ofList
           [("owner", { type := .text, nullable := false }),
@@ -173,8 +185,21 @@ def run {α : Type} (x : Sqlite.M α) : IO α := do
 
 /-- `run`, inside one transaction: for a read and the write that depends on it. The lock keeps the
     threads of this process apart, and the transaction keeps out a second process on the same file
-    — a `serve` started twice by mistake, a repair by hand — which the lock knows nothing of. -/
+    — a `serve` started twice by mistake, a repair by hand — which the lock knows nothing of.
+
+    `BEGIN IMMEDIATE` rather than the default deferred `BEGIN`: it takes the write lock before the
+    read, so two processes cannot both read a job and then both try to write it, which in SQLite
+    ends with one of them failing `SQLITE_BUSY` without waiting. -/
 def transact {α : Type} (x : Sqlite.M α) : IO α :=
-  run (DBMonadTransactional.withTransaction x)
+  run do
+    let db ← read
+    SQLite.exec db "BEGIN IMMEDIATE"
+    try
+      let a ← x
+      SQLite.exec db "COMMIT"
+      return a
+    catch e =>
+      try SQLite.exec db "ROLLBACK" catch _ => pure ()
+      throw e
 
 end DiffReviewer.Store

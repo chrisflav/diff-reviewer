@@ -171,6 +171,12 @@ structure Job where
   prType     : Option String := none
   /-- How many times the job has been queued on orchestra. -/
   attempts   : Nat := 0
+  /-- When posting the review last began, while its outcome is not known. -/
+  postStartedAt : Option String := none
+  /-- The posted review on GitHub. -/
+  postedUrl  : Option String := none
+  /-- How the review was posted, when that differs from what it says. -/
+  postNote   : Option String := none
 
 def Job.status? (j : Job) : Option JobStatus := JobStatus.ofString? j.statusRaw
 
@@ -196,7 +202,9 @@ def Job.toJson (j : Job) : Json :=
     ("queueEntry", optStr j.queueEntry), ("review", review), ("reviewError", reviewError),
     ("version", j.version), ("createdAt", j.createdAt), ("updatedAt", j.updatedAt),
     ("baseSha", optStr j.baseSha), ("title", optStr j.title), ("prBody", optStr j.prBody),
-    ("error", optStr j.error), ("prType", optStr j.prType), ("attempts", j.attempts)]
+    ("error", optStr j.error), ("prType", optStr j.prType), ("attempts", j.attempts),
+    ("postStartedAt", optStr j.postStartedAt), ("postedUrl", optStr j.postedUrl),
+    ("postNote", optStr j.postNote)]
 
 private def Job.ofRow (row : Store.JobRow) : Job :=
   { id := row.id, owner := row.owner, name := row.name, prNumber := row.pr_number.toNat
@@ -204,7 +212,8 @@ private def Job.ofRow (row : Store.JobRow) : Job :=
   , reviewRaw := row.review, version := row.version.toNat
   , createdAt := row.created_at, updatedAt := row.updated_at
   , baseSha := row.base_sha, title := row.title, prBody := row.pr_body, error := row.error
-  , prType := row.pr_type, attempts := (row.attempts.getD 0).toNat }
+  , prType := row.pr_type, attempts := (row.attempts.getD 0).toNat
+  , postStartedAt := row.post_started_at, postedUrl := row.posted_url, postNote := row.post_note }
 
 private def Job.toRow (j : Job) : Store.JobRow :=
   { id := j.id, owner := j.owner, name := j.name, pr_number := j.prNumber
@@ -212,14 +221,17 @@ private def Job.toRow (j : Job) : Store.JobRow :=
   , review := j.reviewRaw, version := j.version
   , created_at := j.createdAt, updated_at := j.updatedAt
   , base_sha := j.baseSha, title := j.title, pr_body := j.prBody, error := j.error
-  , pr_type := j.prType, attempts := some j.attempts }
+  , pr_type := j.prType, attempts := some j.attempts
+  , post_started_at := j.postStartedAt, posted_url := j.postedUrl, post_note := j.postNote }
 
 /-- The largest pull request number accepted: what fits a 32-bit column with room to spare. -/
 def maxPrNumber : Nat := 2147483647
 
-/-- Whether `s` can be a git commit id: 7 to 64 hexadecimal digits. -/
+/-- Whether `s` is a whole git commit id: 40 hexadecimal digits (SHA-1), or 64 (SHA-256). Never an
+    abbreviation: a job's head is what a review is pinned to and compared against, and a prefix is
+    neither unique nor what GitHub answers. -/
 def validSha (s : String) : Bool :=
-  s.length ≥ 7 && s.length ≤ 64 && s.all fun c => c.isDigit || ('a' ≤ c && c ≤ 'f')
+  (s.length == 40 || s.length == 64) && s.all fun c => c.isDigit || ('a' ≤ c && c ≤ 'f')
 
 /-! ## The store -/
 
@@ -328,6 +340,32 @@ def createJobForHead (repo : Repo) (prNumber : Nat) (headSha : String)
     if rows.any (·.head_sha == some headSha) then return none
     HasModel.save job.toRow
     return some job
+
+/-- How many jobs of `owner/name` were made at or after `since` (RFC 3339, so that the strings
+    compare as the instants do). -/
+def jobsSince (owner name since : String) : IO Nat := do
+  let rows ← Store.run <| HasModel.fetch <| query% do
+    let j ← from Store.JobRow
+    guard j.owner = owner
+    guard j.name = name
+    select j
+  return (rows.filter (·.created_at ≥ since)).size
+
+/-- The statuses in which a job still has a use for its diff. -/
+def liveStatuses : List JobStatus := [.pending, .queued, .running, .draft, .approved]
+
+/-- Drop the kept diffs no live job is of, and every one fetched before `before`. Answers how many
+    were dropped. -/
+def pruneDiffs (before : String) : IO Nat := do
+  -- `before` is an instant this process formatted, and the statuses are constants: nothing in the
+  -- statement comes from a request.
+  let live := ", ".intercalate (liveStatuses.map fun st => s!"'{st.toString}'")
+  Store.run do
+    let db ← read
+    SQLite.exec db s!"DELETE FROM pull_diff WHERE fetched_at < '{before}' OR NOT EXISTS \
+(SELECT 1 FROM review_job j WHERE j.owner = pull_diff.owner AND j.name = pull_diff.name AND \
+j.base_sha = pull_diff.base_sha AND j.head_sha = pull_diff.head_sha AND j.status IN ({live}))"
+    return (← db.changes).toInt.toNat
 
 /-- The diff kept for a pull request with base `base` at head `head`. -/
 def cachedDiff (owner name base head : String) : IO (Option String) := do

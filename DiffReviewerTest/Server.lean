@@ -136,11 +136,15 @@ def fine : String := "{\"decision\": \"comment\", \"body\": \"Fine.\", \"comment
 def statusBody (status : String) (version : Nat) : String :=
   s!"\{\"status\": \"{status}\", \"version\": {version}}"
 
+/-- The head of the suite's jobs: a whole commit id. -/
+def jobHead : String := "abcdef1234567890abcdef1234567890abcdef12"
+
 /-- A registered repository and a new job on it; answers the job reply. -/
 def newJob (st : State) : IO Reply := do
   let _ ← route st (req .put "/api/v1/repos/Acme/Widgets" "{\"mode\": \"staged\"}")
   route st (req .post "/api/v1/jobs"
-    "{\"owner\": \"acme\", \"name\": \"widgets\", \"prNumber\": 7, \"headSha\": \"ABCDEF1\"}")
+    s!"\{\"owner\": \"acme\", \"name\": \"widgets\", \"prNumber\": 7, \
+\"headSha\": \"{jobHead.toUpper}\"}")
 
 def aReviewIsDraftedAndApproved : Test := do
   let st ← State.new cfg
@@ -161,7 +165,7 @@ def aReviewIsDraftedAndApproved : Test := do
     return checkStatus again 200 "the same repository, in other case"
       ++ checkStatus missing 404 "a job for a repository nobody registered"
       ++ checkStatus job 201 "a new job"
-      ++ checkEq (field job "headSha") (some "abcdef1") "the commit, in lower case"
+      ++ checkEq (field job "headSha") (some jobHead) "the commit, in lower case"
       ++ checkStatus early 409 "approving before there is a draft"
       ++ checkStatus review 200 "the draft"
       ++ checkEq (field review "status") (some "draft") "the job after its review"
@@ -181,6 +185,8 @@ def inputsAreChecked : Test := do
       "{\"owner\": \"acme\", \"name\": \"widgets\", \"prNumber\": 0}")
     let sha ← route st (req .post "/api/v1/jobs"
       "{\"owner\": \"acme\", \"name\": \"widgets\", \"prNumber\": 1, \"headSha\": \"main\"}")
+    let short ← route st (req .post "/api/v1/jobs"
+      "{\"owner\": \"acme\", \"name\": \"widgets\", \"prNumber\": 1, \"headSha\": \"abcdef1\"}")
     let line0 ← route st (req .put s!"/api/v1/jobs/{id}/review" (reviewBody 1
       "{\"decision\": \"comment\", \"body\": \"\", \"comments\": [{\"file\": \"A.lean\", \"start_line\": 0, \"end_line\": 0, \"body\": \"x\"}]}"))
     let backwards ← route st (req .put s!"/api/v1/jobs/{id}/review" (reviewBody 1
@@ -189,6 +195,7 @@ def inputsAreChecked : Test := do
     return checkStatus huge 400 "a pull request number past 2^31"
       ++ checkStatus zero 400 "pull request 0"
       ++ checkStatus sha 400 "a head that is not a commit id"
+      ++ checkStatus short 400 "an abbreviated commit id"
       ++ checkStatus line0 400 "a comment on line 0"
       ++ checkStatus backwards 400 "a comment ending before it starts"
       ++ checkStatus listed 200 "the job list after all that"
@@ -206,7 +213,8 @@ def whatThisBuildCannotReadIsKept : Test := do
       ({ id, owner := j.owner, name := j.name, pr_number := j.prNumber, head_sha := j.headSha
        , status := "escalated", queue_entry := none, review := some odd, version := 1
        , created_at := j.createdAt, updated_at := j.updatedAt, base_sha := none, title := none
-       , pr_body := none, error := none, pr_type := none, attempts := none } : Store.JobRow)
+       , pr_body := none, error := none, pr_type := none, attempts := none
+       , post_started_at := none, posted_url := none, post_note := none } : Store.JobRow)
     let read ← route st (req .get s!"/api/v1/jobs/{id}")
     let write ← route st (req .post s!"/api/v1/jobs/{id}/status" (statusBody "rejected" 1))
     let edit ← route st (req .put s!"/api/v1/jobs/{id}/review" (reviewBody 1 fine))

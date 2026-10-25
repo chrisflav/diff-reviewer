@@ -17,39 +17,70 @@ submitted, approved, posted — is driven here without a request leaving the pro
 
 namespace DiffReviewerTest.Workers
 
+/-- How the fake answers a post. -/
+inductive PostOutcome where
+  | ok
+  /-- A `422`: nothing posted. -/
+  | refused
+  /-- Posted, and the answer lost on the way back. -/
+  | lostAnswer
+  /-- A `502`, and nothing posted. -/
+  | failedUnposted
+  deriving BEq
+
 structure FakeGitHub where
   pulls     : IO.Ref (Array GitHub.Pull)
-  /-- Each posted review: the pull request, the review and the commit it was pinned to. -/
-  posted    : IO.Ref (Array (Nat × Review × Option String))
+  /-- Each posted review: the pull request, the review as posted, its commit and its event. -/
+  posted    : IO.Ref (Array (Nat × Review × Option String × Option Decision))
   diffCalls : IO.Ref Nat
-  /-- What posting fails with, while it is set. -/
-  failPost  : IO.Ref (Option String)
+  outcome   : IO.Ref PostOutcome
+  /-- Whether listing the reviews fails. -/
+  listFails : IO.Ref Bool
+  diffText  : IO.Ref String
+
+/-- A diff whose new side of `A.lean` is lines 1 to 20. -/
+def sampleDiff : String :=
+  "diff --git a/A.lean b/A.lean\n--- a/A.lean\n+++ b/A.lean\n@@ -1,3 +1,20 @@\n def x := 1\n"
 
 def FakeGitHub.new (pulls : Array GitHub.Pull := #[]) : IO FakeGitHub := do
   return { pulls := ← IO.mkRef pulls, posted := ← IO.mkRef #[], diffCalls := ← IO.mkRef 0
-         , failPost := ← IO.mkRef none }
+         , outcome := ← IO.mkRef .ok, listFails := ← IO.mkRef false
+         , diffText := ← IO.mkRef sampleDiff }
 
 def FakeGitHub.client (f : FakeGitHub) : GitHub.Client where
   listOpenPulls _ _ := return .ok (← f.pulls.get)
   getPull _ _ n := do
     match (← f.pulls.get).find? (·.number == n) with
     | some p => return .ok p
-    | none => return .error "GitHub answered 404: Not Found"
-  diff _ _ base head := do
+    | none => return .error (.definite "GitHub answered 404: Not Found")
+  diff _ _ _ _ := do
     f.diffCalls.modify (· + 1)
-    return .ok s!"diff --git a/A.lean b/A.lean\n--- {base}\n+++ {head}\n"
-  postReview _ _ n review commit pending := do
-    if let some e ← f.failPost.get then return .error e
-    unless !pending do return .error "the platform posted a pending review"
-    f.posted.modify (·.push (n, review, commit))
-    return .ok s!"https://github.example/pull/{n}#review"
+    return .ok (← f.diffText.get)
+  listReviews _ _ n := do
+    if ← f.listFails.get then return .error (.indefinite "GitHub answered 503")
+    return .ok (((← f.posted.get).filter (·.1 == n)).mapIdx fun i (_, r, _, _) =>
+      { id := i, body := r.body, url := s!"https://github.example/review/{i}" })
+  postReview _ _ n review commit event := do
+    let record := do
+      f.posted.modify (·.push (n, review, commit, event))
+      return ((← f.posted.get).size - 1)
+    match ← f.outcome.get with
+    | .refused => return .error (.definite "GitHub answered 422: Unprocessable Entity")
+    | .failedUnposted => return .error (.indefinite "GitHub answered 502")
+    | .lostAnswer =>
+      let _ ← record
+      return .error (.indefinite "curl: (28) Operation timed out")
+    | .ok =>
+      let i ← record
+      return .ok { id := i, body := review.body, url := s!"https://github.example/review/{i}" }
 
 structure FakeOrchestra where
-  queued  : IO.Ref (Array Orchestra.QueueRequest)
-  entries : IO.Ref (Array Orchestra.Entry)
+  queued    : IO.Ref (Array Orchestra.QueueRequest)
+  entries   : IO.Ref (Array Orchestra.Entry)
+  cancelled : IO.Ref (Array String)
 
 def FakeOrchestra.new : IO FakeOrchestra := do
-  return { queued := ← IO.mkRef #[], entries := ← IO.mkRef #[] }
+  return { queued := ← IO.mkRef #[], entries := ← IO.mkRef #[], cancelled := ← IO.mkRef #[] }
 
 /-- Set entry `id`'s status and successor. -/
 def FakeOrchestra.set (f : FakeOrchestra) (id status : String)
@@ -72,12 +103,16 @@ def FakeOrchestra.client (f : FakeOrchestra) : Orchestra.Client where
     match (← f.entries.get).find? (·.id == id) with
     | some e => return .ok e
     | none => return .error "orchestra answered 404"
+  cancel id := do
+    f.cancelled.modify (·.push id)
+    f.set id "cancelled"
+    return .ok ()
 
-def headA : String := "aaaaaaaa11111111"
+def headA : String := "aaaaaaaa11111111aaaaaaaa11111111aaaaaaaa"
 
-def headB : String := "bbbbbbbb22222222"
+def headB : String := "bbbbbbbb22222222bbbbbbbb22222222bbbbbbbb"
 
-def base : String := "cccccccc33333333"
+def base : String := "cccccccc33333333cccccccc33333333cccccccc"
 
 def pull7 (head : String := headA) (draft := false) : GitHub.Pull :=
   { number := 7, title := "Add widgets", body := "Widgets.", headSha := head, baseSha := base
@@ -214,7 +249,7 @@ def anAgentReviewsAndItIsPosted : Test := withTempDb do
     ++ checkEq (field posted "status") (some "posted") "the job after posting"
     ++ checkStatus postedTwice 409 "posting a posted review"
     ++ checkEq postedReviews.size 1 "reviews on GitHub"
-    ++ checkEq (postedReviews.map (·.2.2)) #[some headA] "the commit the review is pinned to"
+    ++ checkEq (postedReviews.map (·.2.2.1)) #[some headA] "the commit the review is pinned to"
     ++ checkStatus jobDiff 200 "the job's diff for the front-end"
     ++ checkEq (field jobDiff "headSha") (some headA) "the diff's head"
 
@@ -229,14 +264,14 @@ def aFailedPostStaysApproved : Test := withTempDb do
   let drafted ← route st (req .put s!"/api/v1/jobs/{id}/review" (reviewBody 1 fine))
   let approved ← route st (req .post s!"/api/v1/jobs/{id}/status"
     (statusBody "approved" (versionOf drafted)))
-  gh.failPost.set (some "GitHub answered 422: Unprocessable Entity")
+  gh.outcome.set .refused
   let refused ← route st (req .post s!"/api/v1/jobs/{id}/post"
     s!"\{\"version\": {versionOf approved}}")
   let some after ← Platform.findJob id | return #["the job is gone"]
   let noGitHub ← State.new cfg (← services none none logs)
   let unavailable ← route noGitHub (req .post s!"/api/v1/jobs/{id}/post"
     s!"\{\"version\": {after.version}}")
-  gh.failPost.set none
+  gh.outcome.set .ok
   let retried ← route st (req .post s!"/api/v1/jobs/{id}/post" s!"\{\"version\": {after.version}}")
   return checkStatus refused 502 "GitHub refusing"
     ++ checkEq after.statusRaw "approved" "the job after the refusal"
@@ -265,7 +300,7 @@ def aDirectReviewIsPostedOnSubmission : Test := withTempDb do
 /-- Following the queue entry: running when it runs, through `continuedBy`, and failed when the run
     ends without a submission; a person's retry queues a new attempt under a new external id. -/
 def followingMovesTheJob : Test := withTempDb do
-  let gh ← FakeGitHub.new #[pull7]
+  let gh ← FakeGitHub.new #[pull7 jobHead]
   let orch ← FakeOrchestra.new
   let logs ← IO.mkRef #[]
   let svc ← services gh orch logs
@@ -307,8 +342,9 @@ def followingMovesTheJob : Test := withTempDb do
 def aRepeatedFailureIsRecordedOnce : Test := withTempDb do
   let logs ← IO.mkRef #[]
   let failing : Orchestra.Client :=
-    { queue := fun _ => return .error "orchestra answered 429", entry := fun _ => return .error "" }
-  let gh ← FakeGitHub.new #[pull7]
+    { queue := fun _ => return .error "orchestra answered 429", entry := fun _ => return .error ""
+      cancel := fun _ => return .ok () }
+  let gh ← FakeGitHub.new #[pull7 jobHead]
   let svc ← Workers.Services.new (some gh.client) (some failing) (fun m => logs.modify (·.push m))
   let st ← State.new cfg svc
   let job ← newJob st
@@ -340,20 +376,30 @@ def theAgentCliChecksItsInput : Test := do
     ++ checkEq (Agent.splitSlug "acme/widgets") (some ("acme", "widgets")) "a slug"
     ++ checkEq (Agent.splitSlug "acme") none "half a slug"
 
-/-- What curl is handed: every value quoted, so a header or body cannot end the line it is on. -/
+/-- What curl is handed: every value quoted, so that nothing can end the line it is on; the body
+    by file, not inline; and the requests it must not make refused before it is run. -/
 def curlConfigIsQuoted : Test := do
-  let c := Http.config { method := "POST", url := "https://x.example/a"
-                       , headers := [("Authorization", "Bearer t\"\nurl = https://evil")]
-                       , body := some "{\"a\": \"b\\\\c\"}" }
+  let r : Http.Request := { method := "POST", url := "https://x.example/a"
+                          , headers := [("Authorization", "Bearer t\"x")]
+                          , body := some "{}", noproxy := some "orch.example" }
+  let c := Http.config r (some "/tmp/body")
   let lines := c.splitOn "\n"
   return checkEq (Http.quote "a\"b\\c\nd") "\"a\\\"b\\\\c\\nd\"" "quoting"
-    ++ check (!lines.any (·.startsWith "url = https://evil")) "a header cannot add a line"
-    ++ check (lines.contains "data-binary = \"{\\\"a\\\": \\\"b\\\\\\\\c\\\"}\"") "the body"
+    ++ check (lines.contains "data-binary = \"@/tmp/body\"") "the body, from its file"
+    ++ check (!lines.any (·.startsWith "data-binary = \"{")) "no body inline"
+    ++ check (lines.contains "noproxy = \"orch.example\"") "orchestra past the proxy"
+    ++ check (Http.check r).isNone "a good request"
+    ++ check (Http.check { r with headers := [("Authorization", "Bearer t\r\nX-Evil: 1")] }).isSome
+      "a header with a line break"
+    ++ check (Http.check { r with url := "http://x.example/a" }).isSome "plain http"
+    ++ check (Http.check { r with url := "http://127.0.0.1:8090/a" }).isNone "http to loopback"
+    ++ checkEq (Http.hostOf "https://orch.example:8443/api") "orch.example" "a host"
+    ++ checkEq (Http.hostOf "http://[::1]:80/") "::1" "an IPv6 host"
 
 /-- The agent CLI against a real server on loopback: curl, the config it is handed, and the agent
     API's answer. -/
 def theAgentCliTalksToTheServer : Test := withTempDb do
-  let gh ← FakeGitHub.new #[pull7]
+  let gh ← FakeGitHub.new #[pull7 jobHead]
   let orch ← FakeOrchestra.new
   let logs ← IO.mkRef #[]
   let svc ← services gh orch logs
@@ -368,7 +414,7 @@ def theAgentCliTalksToTheServer : Test := withTempDb do
     let diff ← Agent.request agent "GET" "acme/widgets" "7" "/diff"
     let wrong ← Agent.request { agent with token := "kleis" } "GET" "acme/widgets" "7" ""
     let submitted ← Agent.request agent "POST" "acme/widgets" "7" "/review"
-      (some (submission "abcdef1"))
+      (some (submission jobHead))
     let status (r : Except String Http.Response) := match r with
       | .ok r => r.status
       | .error _ => 0

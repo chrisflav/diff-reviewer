@@ -1,5 +1,6 @@
 import DiffReviewer.Types
 import DiffReviewer.Http
+import DiffReviewer.Diff
 import DiffReviewer.Orchestra
 import DiffReviewer.Workers
 import DiffReviewer.Agent

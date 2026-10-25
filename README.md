@@ -7,7 +7,7 @@ posted to the pull request under your name.
 It is built in milestones. The first two are here:
 
 - **A review format** (`DiffReviewer/Types.lean`): a decision (comment, approve, request changes),
-  a summary, and inline comments on file line ranges with optional suggestions.
+  a summary, and at most 200 inline comments on file line ranges with optional suggestions.
 - **The platform server** (`diff-reviewer serve`): a REST API over a SQLite database, holding the
   repositories it reviews and one *job* per review of a pull request at one head commit. A job
   moves `pending → queued → running → draft → approved → posted`; `rejected` is a discarded draft,
@@ -15,15 +15,24 @@ It is built in milestones. The first two are here:
   `docs/openapi.json` describes the API and is served at `/api/openapi.json`.
 - **Background workers** inside `serve` (`DiffReviewer/Workers.lean`), every `--interval` seconds:
   *discovery* makes a job for every new head of an open pull request of a repository with
-  `autoReview` (GitHub draft pull requests wait until they are ready), and marks the drafts and
-  approvals of older heads `stale`; *queueing* puts each `pending` job on
+  `autoReview` (GitHub draft pull requests wait until they are ready; at most
+  `--max-jobs-per-day` a repository), and makes every job of an older head `stale`, cancelling its
+  orchestra run if it has one; *queueing* checks a `pending` job's head is still the pull
+  request's, fetches its diff (past `--max-diff-bytes` the job `failed`s) and puts it on
   [orchestra](https://github.com/chrisflav/orchestra) as an API client; *following* reads the
   queue entry and moves the job to `running`, or to `failed` when the run ends without a review.
+  Kept diffs no live job needs, and any older than 30 days, are dropped.
 - **The agent API** (`/api/agent/v1/repos/{owner}/{name}/pulls/{pr}…`) and **the agent CLI**
-  (`diff-reviewer agent show|diff|submit`): what the reviewing agent reads and how it submits.
-  A submission becomes a `draft`; in a `direct` repository it is posted at once.
+  (`diff-reviewer agent show|diff|submit … --job <id>`): what the reviewing agent reads and how
+  it submits. A submission is checked as GitHub would check it — its comments must be on the
+  diff's new side — and becomes a `draft`; in a `direct` repository it is posted at once, always
+  as a comment.
 - **Posting** (`POST /api/v1/jobs/{id}/post`): an approved review is posted to the pull request
-  under the operator's GitHub account, pinned to the job's head commit.
+  under the operator's GitHub account, pinned to the job's head commit, as its decision. Only this
+  route, a person's, ever approves or requests changes. A review is posted once: the attempt is
+  claimed in the database first, the posted body carries a marker
+  (`<!-- diff-reviewer job <id> -->`), and when GitHub's answer is lost the pull request's
+  reviews are searched for it before anything is posted again.
 - **A web front-end** (`web/`): sign in, register repositories, request a review, read a review,
   edit it, approve or reject it. Every write names the version of the job it was made on, so a
   stale page is refused rather than overwriting.
@@ -47,9 +56,15 @@ DIFF_REVIEWER_ORCHESTRA_TOKEN_FILE=/etc/diff-reviewer/orchestra-token \
 ```
 
 It listens on `127.0.0.1:8090` (`--host`, `--port`) and runs the workers every 60 seconds
-(`--interval`). The server is plain HTTP: put TLS in front of anything wider than loopback, and
-pass `--secure-cookie`. Releases (`v*` tags) attach a Linux x86_64 binary and its sha256 to the
-GitHub release; it runs on Debian bookworm and newer.
+(`--interval`). The server is plain HTTP: put TLS in front of anything wider than loopback, pass
+`--secure-cookie`, and name the reverse proxy with `--trusted-proxy <ip>`: failed logins are
+counted per client address, which is the socket's peer unless the request comes from that proxy,
+when it is the last address of `X-Forwarded-For`. `--max-jobs-per-day` (default 50) bounds the
+jobs discovery makes per repository, and `--max-diff-bytes` (default 5242880) the diff reviewed.
+
+Releases (`v*` tags) attach a Linux x86_64 binary and its sha256 to the GitHub release; it runs on
+Debian bookworm and newer. The workflow builds with read-only permissions and only its publishing
+job may write; its actions are pinned by commit.
 
 ### Configuration
 
@@ -59,20 +74,27 @@ ignored.
 
 | Variable | |
 | --- | --- |
-| `DIFF_REVIEWER_PASSWORD` | Required. What you sign in with, at least 12 characters. Accepted only by `POST /api/login`, which is rate-limited: after 5 failures within 15 minutes every attempt is refused (`429`) for 15 seconds, doubling with each further failure. |
+| `DIFF_REVIEWER_PASSWORD` | Required. What you sign in with, at least 12 characters. Accepted only by `POST /api/login`, which is rate-limited: after 5 failures from one address within 15 minutes every attempt from it is refused (`429`) for 15 seconds, doubling with each further failure; after 100 from all addresses together, every attempt is. |
 | `DIFF_REVIEWER_API_TOKEN_FILE` | The bearer scripts send to `/api/v1/` (`Authorization: Bearer …`). Unset, only a signed-in browser reaches the API. |
 | `DIFF_REVIEWER_AGENT_TOKEN_FILE` | The bearer of `/api/agent/v1/`, and good for nothing else. Unset, the agent API refuses everything. kleis holds it, never the agent. |
 | `DIFF_REVIEWER_GITHUB_TOKEN_FILE` | The token for api.github.com: listing pull requests, reading one and its diff, posting reviews. Unset, there is no discovery, no diff and no posting. In production this is the placeholder `kleis` (see below). Also used by `diff-reviewer github`, which otherwise falls back to `gh auth token`. |
+| `DIFF_REVIEWER_GITHUB_LOGIN` | The GitHub login reviews are posted as. On a pull request it wrote, GitHub refuses an approval or a request for changes, so such a review is posted as a comment and the job's `postNote` says so. |
 | `DIFF_REVIEWER_GITHUB_API` | GitHub's API root, `https://api.github.com` by default. |
-| `DIFF_REVIEWER_ORCHESTRA_URL`, `DIFF_REVIEWER_ORCHESTRA_TOKEN_FILE` | Orchestra, and the platform's API client token on it. Without both, jobs stay `pending` (and the log says so once). |
-| `HTTPS_PROXY`, `CURL_CA_BUNDLE`, `SSL_CERT_FILE` | Every outgoing request is made with `curl`, which reads these as usual. |
+| `DIFF_REVIEWER_ORCHESTRA_URL`, `DIFF_REVIEWER_ORCHESTRA_TOKEN_FILE` | Orchestra, and the platform's API client token on it. Without both, jobs stay `pending` (and the log says so once). Orchestra is always reached directly, never through `HTTPS_PROXY` (its host is curl's `noproxy`): the proxy is kleis, there for GitHub, and the orchestra token is not one kleis should see. Add the host to `NO_PROXY` too, for anything else in the environment. |
+| `HTTPS_PROXY`, `NO_PROXY`, `CURL_CA_BUNDLE`, `SSL_CERT_FILE` | Every outgoing request is made with `curl`, which reads these as usual (and no `~/.curlrc`: it runs with `-q`). Only `https` is used, or `http` to loopback. |
 
 The three secrets must differ, and each token must be at least 32 characters
 (`openssl rand -hex 32`): `serve` refuses to start otherwise.
 
 The agent CLI reads `~/.config/diff-reviewer/agent.json`, `{"url": "https://reviews.example",
 "token": "kleis"}`, and `DIFF_REVIEWER_URL` and `DIFF_REVIEWER_TOKEN` override either field.
-(`DIFF_REVIEWER_URL` is also where `npm run dev` proxies `/api` to.)
+(`DIFF_REVIEWER_URL` is also where `npm run dev` proxies `/api` to.) The prompt gives the agent
+its job id, which it passes as `--job <id>`: with two reviews of one pull request running — an
+old head's, not yet cancelled, and the new one's — a request that names none is refused rather
+than given the wrong one.
+
+Head commits are always whole commit ids (40 or 64 hex digits); `POST /api/v1/jobs` refuses an
+abbreviation.
 
 ### On orchestra
 
@@ -98,7 +120,9 @@ with `diff_reviewer_token` in orchestra's `secrets.json` and the same value in t
 on the platform: orchestra refuses (`400`) a repository it does not list, and the job stays
 `pending` with that reason in its `error`. Each request names the prompt, a goal, the upstream,
 the pull request (`issue_number`) and the job id as `external_id` — `<id>.2`, `<id>.3`, … for a
-retry, since orchestra answers an `external_id` it has seen with the entry it already made. The
+retry, since orchestra answers an `external_id` it has seen with the entry it already made. When a
+pull request moves on, the platform cancels the runs of its older heads
+(`POST /api/v1/queue/{id}/cancel`). The
 agent image needs `curl` and the `diff-reviewer` binary from a release on its `PATH`.
 
 ### Behind kleis
@@ -124,10 +148,11 @@ lake test
 
 The suite covers the review format, the job transitions, that the migrations build the declared
 schema and bring an old database up to date, the credentials (each reaches only its own routes)
-and the login rate limit, a review's whole life over the API, the workers — discovery, queueing,
-following, posting, direct mode — against a fake GitHub and a fake orchestra, the agent CLI
-against the server on loopback, and that `docs/openapi.json` documents exactly the routes the
-server answers. Nothing in it reaches the network.
+and the login rate limit per address, a review's whole life over the API, the workers —
+discovery, its cap and cancellations, queueing, following, posting once whatever GitHub answers,
+direct mode — against a fake GitHub and a fake orchestra, the checks of a review against its diff,
+the agent CLI against the server on loopback, and that `docs/openapi.json` documents exactly the
+routes the server answers. Nothing in it reaches the network.
 
 `docs/openapi.json` is embedded in the binary with `include_str`, and Lake rebuilds a module when
 its own source changes, not when a file it includes does: after editing the spec, touch

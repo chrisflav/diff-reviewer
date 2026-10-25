@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "diff-reviewer platform API",
-    "version": "0.2.0",
+    "version": "0.3.0",
     "description": "The review platform: the repositories whose pull requests it reviews, and one review job per review. A job moves `pending → queued → running → draft → approved → posted`; `rejected` is a discarded draft, `stale` a draft whose pull request has moved on, and `failed` a run that ended without a review.\n\nThree credentials, none standing in for another. The password (`$DIFF_REVIEWER_PASSWORD`) is accepted only by `POST /api/login`, which sets the session cookie; failed logins are rate-limited (`429` with `Retry-After`). Every route under `/api/v1/` needs the session cookie or the API token (`$DIFF_REVIEWER_API_TOKEN_FILE`) as `Authorization: Bearer <token>`. Every route under `/api/agent/v1/` needs the agent token (`$DIFF_REVIEWER_AGENT_TOKEN_FILE`) as a bearer, and nothing else reaches it; an agent's requests go through kleis, which supplies it.\n\nEvery write must be `application/json` (`415` otherwise). Every write to a job under `/api/v1/` names the job's `version` as last read, and is a `409` if the job has changed since. A request the server fails on is a `500` whose reason goes to the server log; a method a route does not answer is a `405`. Collections answer `{\"items\": [...]}`. Instants are RFC 3339 in UTC; an absent value is `null`."
   },
   "security": [
@@ -50,7 +50,7 @@
             "$ref": "#/components/responses/Error"
           }
         },
-        "description": "After 5 failed attempts within 15 minutes every attempt, right or wrong, is a `429` for a delay that starts at 15 seconds and doubles with each further failure (at most 15 minutes); `Retry-After` says how long. A success clears the count."
+        "description": "Failed attempts are counted per client address — the socket's peer, or, for a request from the proxy `--trusted-proxy` names, the last address of its `X-Forwarded-For`. After 5 failures from one address within 15 minutes every attempt from it, right or wrong, is a `429` for a delay that starts at 15 seconds and doubles with each further failure (at most 15 minutes); after 100 from all addresses together, every attempt is. `Retry-After` says how long. A success clears its address's count."
       }
     },
     "/api/logout": {
@@ -288,8 +288,8 @@
                   },
                   "headSha": {
                     "type": "string",
-                    "pattern": "^[0-9a-fA-F]{7,64}$",
-                    "description": "The head commit the review is for; stored in lower case."
+                    "pattern": "^[0-9a-fA-F]{40}([0-9a-fA-F]{24})?$",
+                    "description": "The head commit the review is for: a whole commit id (40 or 64 hex digits; an abbreviation is a `400`), stored in lower case. Queueing checks it is still the pull request's head, and makes the job `stale` if it is not."
                   }
                 }
               }
@@ -515,7 +515,7 @@
       ],
       "post": {
         "summary": "Post an approved review to GitHub",
-        "description": "Posts the job's review to its pull request — submitted, with the job's decision as the event, pinned to `headSha` with every comment on the right-hand side — and then marks the job `posted`. The job must be `approved` and at the `version` named. If GitHub refuses, the job stays `approved` with the reason in its `error` (a `502` that carries the job), so it can be posted again. `503` when the platform has no GitHub token.",
+        "description": "Posts the job's review to its pull request — submitted, pinned to `headSha` with every comment on the right-hand side, its body ending in the marker `<!-- diff-reviewer job <id> -->` — and then marks the job `posted`. The event is the review's decision, except on a pull request the operator (`DIFF_REVIEWER_GITHUB_LOGIN`) wrote, where an approval or a request for changes is posted as a comment and `postNote` says so. The job must be `approved` and at the `version` named, its review valid and its comments on the diff (`409` otherwise). Posting is claimed first (`postStartedAt`); a claim less than two minutes old is a `409`, as a post that may still be under way. When the outcome is unknown — a claim an earlier attempt left, no answer from GitHub, a `5xx` — the pull request's reviews are searched for the marker, and a review found is recorded rather than posted again. If GitHub refuses, or nothing was posted, the job stays `approved` with the reason in its `error` (a `502` that carries the job), so it can be posted again. `503` when the platform has no GitHub token.",
         "operationId": "postJob",
         "requestBody": {
           "required": true,
@@ -602,7 +602,7 @@
       ],
       "get": {
         "summary": "The diff under review",
-        "description": "The unified diff of the pull request at the job's head commit, from its merge base with the base commit — what GitHub shows as the pull request's diff. Fetched from GitHub once per base and head and then kept. `409` for a job that names no head commit yet; `502` when GitHub cannot be read; `503` when the platform has no GitHub token.",
+        "description": "The unified diff of the pull request at the job's head commit, from its merge base with the base commit — what GitHub shows as the pull request's diff. Fetched from GitHub once per base and head and then kept. `409` for a job that names no head commit yet; `502` when GitHub cannot be read; `503` when the platform has no GitHub token. `413` for a diff past `--max-diff-bytes`.",
         "operationId": "getJobDiff",
         "responses": {
           "200": {
@@ -641,6 +641,9 @@
           },
           "503": {
             "$ref": "#/components/responses/Error"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error"
           }
         }
       }
@@ -671,11 +674,20 @@
             "type": "integer",
             "minimum": 1
           }
+        },
+        {
+          "name": "X-Diff-Reviewer-Job",
+          "in": "header",
+          "required": false,
+          "schema": {
+            "type": "string"
+          },
+          "description": "The job the agent's prompt named (`--job`). Without it, the request is about the pull request's only queued or running job, and with two it is a `409`: an older run must not take over a newer review."
         }
       ],
       "get": {
         "summary": "The review the agent is running",
-        "description": "The newest job of the pull request that is `queued` or `running`; reading a `queued` one moves it to `running`. `404` when no review of the pull request is being run.",
+        "description": "The job the agent runs (see `X-Diff-Reviewer-Job`), `queued` or `running`; reading a `queued` one moves it to `running`. `404` when no review of the pull request is being run.",
         "operationId": "agentShow",
         "security": [
           {
@@ -697,6 +709,9 @@
             "$ref": "#/components/responses/Error"
           },
           "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
             "$ref": "#/components/responses/Error"
           }
         }
@@ -728,6 +743,15 @@
             "type": "integer",
             "minimum": 1
           }
+        },
+        {
+          "name": "X-Diff-Reviewer-Job",
+          "in": "header",
+          "required": false,
+          "schema": {
+            "type": "string"
+          },
+          "description": "The job the agent's prompt named (`--job`). Without it, the request is about the pull request's only queued or running job, and with two it is a `409`: an older run must not take over a newer review."
         }
       ],
       "get": {
@@ -764,6 +788,9 @@
           },
           "503": {
             "$ref": "#/components/responses/Error"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error"
           }
         }
       }
@@ -794,11 +821,20 @@
             "type": "integer",
             "minimum": 1
           }
+        },
+        {
+          "name": "X-Diff-Reviewer-Job",
+          "in": "header",
+          "required": false,
+          "schema": {
+            "type": "string"
+          },
+          "description": "The job the agent's prompt named (`--job`). Without it, the request is about the pull request's only queued or running job, and with two it is a `409`: an older run must not take over a newer review."
         }
       ],
       "post": {
         "summary": "Submit the review",
-        "description": "The job must be `running` and `headSha` must be its head (`409` otherwise); the review must be one GitHub would take (`400`). The job becomes a `draft`. For a repository in `direct` mode the platform then approves and posts it; if posting fails the job is left `approved` with the reason in `error`, and the submission still stands.",
+        "description": "The job must be `running` and `headSha` must be its head (`409` otherwise). The review must be one GitHub would take (`400`, saying what to fix): at most 200 inline comments, a summary unless it approves, and every comment's lines in one hunk of the diff's new side. The job becomes a `draft`. For a repository in `direct` mode the platform then posts it — always as a comment, whatever its decision, which the job keeps; if posting fails the job is left `approved` with the reason in `error`, and the submission still stands.",
         "operationId": "agentSubmit",
         "security": [
           {
@@ -993,7 +1029,10 @@
           "prBody",
           "error",
           "prType",
-          "attempts"
+          "attempts",
+          "postStartedAt",
+          "postedUrl",
+          "postNote"
         ],
         "properties": {
           "id": {
@@ -1015,7 +1054,7 @@
               "string",
               "null"
             ],
-            "pattern": "^[0-9a-f]{7,64}$"
+            "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$"
           },
           "status": {
             "type": "string",
@@ -1097,6 +1136,28 @@
             "type": "integer",
             "minimum": 0,
             "description": "How many times the job has been queued on orchestra."
+          },
+          "postStartedAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When posting last began, while its outcome is not known: the claim that keeps the review from being posted twice."
+          },
+          "postedUrl": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The posted review on GitHub."
+          },
+          "postNote": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "How the review was posted when that differs from its decision: in `direct` mode, or on a pull request the operator wrote, an approval or request for changes is posted as a comment."
           }
         }
       },
@@ -1124,9 +1185,12 @@
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/InlineComment"
-            }
+            },
+            "maxItems": 200,
+            "description": "At most 200. A comment's lines must lie in one hunk of the diff's new side."
           }
-        }
+        },
+        "description": "A `comment` or `request_changes` review must have a non-empty `body`; GitHub refuses either without one."
       },
       "InlineComment": {
         "type": "object",

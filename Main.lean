@@ -18,19 +18,24 @@ USAGE:
 
   diff-reviewer serve [--db <path>] [--host <ip>] [--port <n>] [--site <dir>]
                       [--secure-cookie] [--interval <seconds>]
+                      [--trusted-proxy <ip>] [--max-jobs-per-day <n>]
+                      [--max-diff-bytes <n>]
       Run the review platform: the HTTP API, the front-end built into <dir>
       (web/dist), and the workers that find pull requests, queue reviews on
       orchestra and follow them, every --interval seconds. Configured by the
       environment; see the README. Defaults: --db diff-reviewer.db,
-      --host 127.0.0.1, --port 8090, --interval 60.
+      --host 127.0.0.1, --port 8090, --interval 60, --max-jobs-per-day 50,
+      --max-diff-bytes 5242880. --trusted-proxy is the reverse proxy whose
+      X-Forwarded-For names the client, for the login rate limit.
 
-  diff-reviewer agent show   <owner/repo> <pr-number>
-  diff-reviewer agent diff   <owner/repo> <pr-number>
-  diff-reviewer agent submit <owner/repo> <pr-number> <submission.json | ->
+  diff-reviewer agent show   <owner/repo> <pr-number> [--job <id>]
+  diff-reviewer agent diff   <owner/repo> <pr-number> [--job <id>]
+  diff-reviewer agent submit <owner/repo> <pr-number> <submission.json | -> [--job <id>]
       What a reviewing agent runs: the review it is to write, the diff under
       review, and submitting the review. The platform's URL and token are in
       ~/.config/diff-reviewer/agent.json ({\"url\": …, \"token\": …}), and
-      $DIFF_REVIEWER_URL and $DIFF_REVIEWER_TOKEN override them.
+      $DIFF_REVIEWER_URL and $DIFF_REVIEWER_TOKEN override them. --job names
+      the job the agent's prompt gave it.
 "
 
 private def cmdGitHub (repo : String) (prStr : String) (jsonPath : String)
@@ -58,12 +63,13 @@ private def cmdGitHub (repo : String) (prStr : String) (jsonPath : String)
           IO.eprintln "error: set DIFF_REVIEWER_GITHUB_TOKEN_FILE, or sign in with `gh auth login`"
           IO.Process.exit 1
         pure (GitHub.Client.curl out.stdout.trimAscii.toString (← GitHub.defaultApi))
-    match ← gh.postReview owner name prNumber review none pending with
-    | .ok url =>
+    let event := if pending then none else some review.decision
+    match ← gh.postReview owner name prNumber review none event with
+    | .ok r =>
       IO.println (if pending then "Review saved as pending." else "Review submitted successfully.")
-      unless url.isEmpty do IO.println url
+      unless r.url.isEmpty do IO.println r.url
     | .error e =>
-      IO.eprintln s!"error: {e}"
+      IO.eprintln s!"error: {e.message}"
       IO.Process.exit 1
 
 private def cmdFromGit (range : String) : IO Unit := do
@@ -98,6 +104,17 @@ private def serveFlags : List String → Except String (Server.Config → Server
     unless n ≥ 1 do .error "--interval must be at least 1 second"
     let f ← serveFlags rest
     return fun c => f { c with interval := n }
+  | "--trusted-proxy" :: v :: rest => do
+    let f ← serveFlags rest
+    return fun c => f { c with trustedProxy := some v }
+  | "--max-jobs-per-day" :: v :: rest => do
+    let some n := v.toNat? | .error s!"--max-jobs-per-day: '{v}' is not a number"
+    let f ← serveFlags rest
+    return fun c => f { c with limits.maxJobsPerDay := n }
+  | "--max-diff-bytes" :: v :: rest => do
+    let some n := v.toNat? | .error s!"--max-diff-bytes: '{v}' is not a number of bytes"
+    let f ← serveFlags rest
+    return fun c => f { c with limits.maxDiffBytes := n }
   | flag :: _ => .error s!"unknown flag '{flag}'"
 
 /-- The token in the file `var` names, if it is set. -/
@@ -131,10 +148,12 @@ private def cmdServe (flags : List String) : IO Unit := do
     log "no DIFF_REVIEWER_API_TOKEN_FILE: only a signed-in browser reaches /api/v1"
   if agentToken.isNone then
     log "no DIFF_REVIEWER_AGENT_TOKEN_FILE: the agent API refuses every request"
-  let github ← GitHub.Client.fromEnv
+  let login := (← IO.getEnv "DIFF_REVIEWER_GITHUB_LOGIN").filter (!·.isEmpty)
+  let cfg := { cfg with limits.githubLogin := login }
+  let github ← GitHub.Client.fromEnv cfg.limits.maxDiffBytes
   if github.isNone then
     log "no DIFF_REVIEWER_GITHUB_TOKEN_FILE: no discovery, no diffs, no posting"
-  let services ← Workers.Services.new github (← Orchestra.Client.fromEnv) log
+  let services ← Workers.Services.new github (← Orchestra.Client.fromEnv) log cfg.limits
   Store.setPath cfg.dbPath
   -- Open (and migrate) the database before listening, so a bad path fails at start-up.
   let _ ← Platform.listRepos
@@ -151,9 +170,15 @@ def main (args : List String) : IO Unit := do
   | ["github", repo, prNumber, jsonPath, "--submit"] => cmdGitHub repo prNumber jsonPath false
   | ["from-git", range]                  => cmdFromGit range
   | "serve" :: flags                     => cmdServe flags
-  | ["agent", "show", repo, pr]          => IO.Process.exit (← Agent.showPull repo pr).toUInt8
-  | ["agent", "diff", repo, pr]          => IO.Process.exit (← Agent.printDiff repo pr).toUInt8
-  | ["agent", "submit", repo, pr, path]  => IO.Process.exit (← Agent.submit repo pr path).toUInt8
+  | "agent" :: "show" :: repo :: pr :: rest =>
+    let some job := Agent.jobFlag rest | IO.print usage; IO.Process.exit 1
+    IO.Process.exit (← Agent.showPull repo pr job).toUInt8
+  | "agent" :: "diff" :: repo :: pr :: rest =>
+    let some job := Agent.jobFlag rest | IO.print usage; IO.Process.exit 1
+    IO.Process.exit (← Agent.printDiff repo pr job).toUInt8
+  | "agent" :: "submit" :: repo :: pr :: path :: rest =>
+    let some job := Agent.jobFlag rest | IO.print usage; IO.Process.exit 1
+    IO.Process.exit (← Agent.submit repo pr path job).toUInt8
   | _ =>
     IO.print usage
     IO.Process.exit 1
