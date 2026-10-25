@@ -306,10 +306,21 @@ reviewed, without being shown that review, and the two are compared.
    by a trusted reviewer becomes a **sample** (`GET …/calibration/samples`): the commit it was of,
    the merge base of the pull request's base and that commit (the base its diff had there), the
    reviewer, the review's state and body, and its inline comments on the new side of that commit.
-   Comments on the old side, comments not placed on a line of that commit, and replies in a thread
-   are dropped and counted (`dropped`); so is a review that leaves nothing to compare — no body and
-   no comment kept. A comment GitHub now shows as *outdated* is kept, at the line it was written
-   on: it is outdated only against later commits, and those are the comments the author acted on.
+   What is not kept is counted, on the sample (`dropped`) and on the import (`stats`):
+   - `droppedLeft` — comments on the old side of the diff;
+   - `droppedOutdated` — comments not anchored to a line of the review's own commit: written
+     against another commit (`original_commit_id`), or on the whole file rather than a line.
+     "Outdated" means exactly this here, and not what GitHub shows: a comment GitHub now marks
+     outdated is outdated only against later commits, is kept at the line it was written on, and
+     is usually one the author acted on — dropping it would bias the sample towards what was
+     ignored;
+   - `droppedReplies` — replies in a thread, which answer a comment rather than raise one;
+   - `empty` — reviews that leave nothing to compare (no body and no comment kept), such as a
+     reply in a thread, which GitHub files as a review of its own; not stored;
+   - `known` — reviews stored before, or deleted, not stored again;
+   - `unreachable` — reviews of a commit GitHub can no longer compare with the base, typically
+     one a force-push left unreferenced; not stored, since its diff cannot be had;
+   - `unreadable` — pull requests whose reviews or comments GitHub refused to list.
    Importing again adds only reviews not stored yet; a sample you delete
    (`DELETE …/calibration/samples/{id}`) stays deleted. When GitHub says its rate limit is
    reached the import stops where it is and goes on by itself on the next pass.
@@ -318,7 +329,11 @@ reviewed, without being shown that review, and the two are compared.
    its commit, with its base for the diff, which is queued on orchestra and reviewed exactly as a
    review job is — the same prompt, apart from fetching the commit by its id and not reading the
    pull request's later history on GitHub, and the repository's current rubric. The prompt and
-   what the agent reads name no sample and quote nothing of the person's review. A calibration
+   what the agent reads name no sample and quote nothing of the person's review, and the task
+   cannot read it either: its orchestra request carries the kleis narrowing
+   `"github: only discover, fetch"` (`kleis_narrow`), so its token reaches GitHub only to clone and
+   fetch over git — no REST or GraphQL read, no download — while the agent API, which gives it the
+   pull request and the diff, is not narrowed. A review job's request carries none. A calibration
    job is **never posted**: it cannot be approved, edited, claimed, posted or reconciled (`409`),
    in a `direct` repository too; discovery never makes it `stale`; and it counts toward
    `--max-calibration-jobs-per-day`, not `--max-jobs-per-day` (`429` past it). `GET /api/v1/jobs`
@@ -364,11 +379,14 @@ review had. Ratios are to four decimals, and `null` when there is nothing to div
   is told not to, and spread one review over several. An agent comment with no pair may be right,
   and a person's that the agent missed may be a matter of taste. Few samples make for noisy
   numbers.
-- **The agent can still look.** It reads GitHub read-only to check the code out, and is told not
-  to read the pull request's reviews or later commits; nothing enforces that.
+- **What git still shows.** The narrowing closes GitHub's API to the agent, not git: it can fetch
+  the pull request's later commits (`pull/N/head`) and see how the code changed after the review,
+  which can hint at what the reviewer asked for. It is told not to.
 - **The base is reconstructed.** It is the merge base of the base the closed pull request has now
   and the reviewed commit, which is the base GitHub's diff showed for any history but a rewritten
-  base branch; a commit lost to a force-push cannot be compared and is counted as `unreachable`.
+  base branch. A reviewed commit that a force-push left unreferenced may be gone from GitHub: it
+  cannot be compared, and its reviews are counted as `unreachable` rather than stored, so a
+  repository that force-pushes during review loses those samples.
 
 ## Tests
 

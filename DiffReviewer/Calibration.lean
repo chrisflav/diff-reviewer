@@ -26,7 +26,8 @@ repository trusts (`Repo.trustedReviewers`) wrote on its past pull requests:
     its rate limit is reached.
   * **Runs** (`createRun`). A run asks for one `calibration` job per sample, at the sample's commit
     and with its base for the diff. The jobs go through the queue and the agent as any review does,
-    with the same prompt and rubric, but the review is never posted (`Job.notPostable`), discovery
+    with the same prompt and rubric — and a token narrowed to cloning and fetching from GitHub
+    (`Workers.calibrationNarrowing`) — but the review is never posted (`Job.notPostable`), discovery
     never makes them `stale`, and they count toward a daily cap of their own
     (`maxCalibrationJobsPerDay`), checked with the run's creation in one transaction. What the
     agent is given names no sample and says nothing of the person's review.
@@ -113,8 +114,10 @@ private def fetchSamples (owner name : String) : Sqlite.M (Array Sample) := do
 /-- The samples of `owner/name` not deleted, the most recently reviewed first. -/
 def listSamples (owner name : String) : IO (Array Sample) := do
   let all ← Store.run (fetchSamples owner name)
-  let key (s : Sample) : String := (s.submittedAt.getD s.importedAt) ++ s.id
-  return (all.filter (·.deletedAt.isNone)).qsort fun a b => key a > key b
+  -- The id breaks ties between reviews submitted in the same second, so the order is total.
+  let key (s : Sample) : String := s.submittedAt.getD s.importedAt
+  return (all.filter (·.deletedAt.isNone)).qsort fun a b =>
+    key a > key b || (key a == key b && a.id > b.id)
 
 /-- Sample `id`, deleted or not. -/
 def findSample (id : String) : IO (Option Sample) := do

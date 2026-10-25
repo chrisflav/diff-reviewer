@@ -27,11 +27,18 @@ structure QueueRequest where
   /-- The platform's id for the work. Orchestra answers an entry it already holds for it rather
       than queueing a second, so a request whose answer was lost can be repeated. -/
   externalId  : String
+  /-- Narrowings of the task's kleis token (`kleis_narrow`), in kleis's `service: only op, op`
+      syntax, added to what the client file gives every task: a task can be given less than the
+      client's spec, never more. Empty for a review. -/
+  kleisNarrow : List String := []
   deriving Repr
 
 def QueueRequest.toJson (r : QueueRequest) : Json :=
-  .mkObj [("prompt", r.prompt), ("goal", r.goal), ("upstream", r.upstream),
-          ("issue_number", r.issueNumber), ("external_id", r.externalId)]
+  let fields : List (String × Json) :=
+    [("prompt", r.prompt), ("goal", r.goal), ("upstream", r.upstream),
+     ("issue_number", r.issueNumber), ("external_id", r.externalId)]
+  .mkObj (if r.kleisNarrow.isEmpty then fields
+    else fields ++ [("kleis_narrow", .arr (r.kleisNarrow.map Json.str).toArray)])
 
 /-- What the platform reads of a queue entry. -/
 structure Entry where

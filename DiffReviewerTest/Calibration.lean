@@ -347,6 +347,10 @@ def calibrationJobsAreNeverPosted : Test := withTempDb do
   let listedCal ← route st { req .get "/api/v1/jobs" with query := "kind=calibration" }
   return checkStatus made 201 "the run"
     ++ checkEq (queued.map (·.issueNumber)) #[11] "queued, though the pull request is closed"
+    ++ checkEq (queued.map (·.kleisNarrow)) #[["github: only discover, fetch"]]
+      "with its token narrowed to cloning and fetching from GitHub"
+    ++ check ((queued[0]?.map (·.toJson.getObjVal? "kleis_narrow" |>.isOk)).getD false)
+      "the narrowing is in the request orchestra is sent"
     ++ checkEq job.headSha (some headA) "at the sample's commit"
     ++ checkEq job.baseSha (some mergeBase) "with its base"
     ++ checkEq job.kindRaw (some "calibration") "of the kind"

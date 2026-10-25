@@ -243,6 +243,8 @@ def anAgentReviewsAndItIsPosted : Test := withTempDb do
     ++ checkEq q.externalId id "the external id is the job's"
     ++ checkEq q.upstream "acme/widgets" "the upstream"
     ++ checkEq q.issueNumber 7 "the pull request"
+    ++ checkEq q.kleisNarrow [] "a review's token is not narrowed"
+    ++ check (!(q.toJson.getObjVal? "kleis_narrow" |>.isOk)) "nor does its request say so"
     ++ check ((q.prompt.splitOn "diff-reviewer agent show acme/widgets 7").length > 1)
       "the prompt says to run agent show"
     ++ checkStatus early 409 "a submission before the first read"

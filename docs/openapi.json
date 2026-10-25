@@ -1653,7 +1653,7 @@
       "post": {
         "summary": "Run the agent on samples",
         "operationId": "createCalibrationRun",
-        "description": "One `calibration` job per sample, at the sample's commit and with its base for the diff, queued and run as any review is, with the same prompt and rubric, and never posted. `{\"samples\": [id, …]}` names them; `{\"count\": n}` takes the n reviewed by the fewest runs so far, the most recent first. At most 20 either way. `429` when the jobs would pass `--max-calibration-jobs-per-day` (20 by default) for the repository, a cap apart from `--max-jobs-per-day`.",
+        "description": "One `calibration` job per sample, at the sample's commit and with its base for the diff, queued and run as any review is, with the same prompt and rubric, and never posted. Each job's orchestra request carries the kleis narrowing `github: only discover, fetch`: the task clones and fetches over git, and cannot read GitHub's REST or GraphQL API, where the person's review is. `{\"samples\": [id, …]}` names them; `{\"count\": n}` takes the n reviewed by the fewest runs so far, the most recent first. At most 20 either way. `429` when the jobs would pass `--max-calibration-jobs-per-day` (20 by default) for the repository, a cap apart from `--max-jobs-per-day`.",
         "requestBody": {
           "required": true,
           "content": {
@@ -2720,20 +2720,23 @@
               },
               "unreachable": {
                 "type": "integer",
-                "description": "Reviews of a commit GitHub could not compare with the base."
+                "description": "Reviews of a commit GitHub could not compare with the base, typically one a force-push left unreferenced; not stored."
               },
               "unreadable": {
                 "type": "integer",
                 "description": "Pull requests whose reviews GitHub refused to list."
               },
               "droppedLeft": {
-                "type": "integer"
+                "type": "integer",
+                "description": "Comments on the old side."
               },
               "droppedOutdated": {
-                "type": "integer"
+                "type": "integer",
+                "description": "Comments not anchored to a line of the review's own commit (another commit, or the whole file). Not GitHub's outdated, which is against later commits."
               },
               "droppedReplies": {
-                "type": "integer"
+                "type": "integer",
+                "description": "Replies in a thread."
               }
             }
           },

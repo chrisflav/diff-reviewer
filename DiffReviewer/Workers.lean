@@ -136,7 +136,8 @@ def Services.logOnce (s : Services) (key msg : String) : IO Unit := do
 /-- The step of `prompt` that has the agent check out the commit under review. A calibration
     job's commit is of a pull request that has since been closed, and may no longer be its head:
     it is fetched by its id, and the agent is told to review it as it stood then, without reading
-    what was said about the pull request since — which is what it is scored against. -/
+    what was said about the pull request since — which is what it is scored against, and which
+    its token's narrowing (`calibrationNarrowing`) keeps it from reading. -/
 private def checkoutStep (job : Job) : String :=
   let slug := s!"{job.owner}/{job.name}"
   let diff := s!"`diff-reviewer agent diff {slug} {job.prNumber} --job {job.id}` prints the diff \
@@ -146,7 +147,8 @@ under review."
 have moved on or been closed since the head commit it names: fetch that commit itself (`git fetch \
 origin <headSha> && git checkout <headSha>`, or `git fetch origin pull/{job.prNumber}/head` first \
 if that fails) and review the change as it stands there, as if it were open for review now. Do not \
-read the pull request's reviews, comments or later commits on GitHub. {diff}"
+read the pull request's reviews, comments or later commits; this task reaches GitHub only to clone \
+and fetch, not through its API. {diff}"
   else
     s!"2. The repository is checked out read-only in your working directory. Check out the head \
 commit it names (`git fetch origin pull/{job.prNumber}/head && git checkout <headSha>`) and read \
@@ -179,6 +181,18 @@ important rather than exceed it.
 
 Do not comment on, review or otherwise write to the pull request on GitHub yourself: the review \
 is posted, once accepted, by the platform."
+
+/-- The narrowing of a calibration job's kleis token: of GitHub, only the ref advertisement
+    (`discover`) and `git-upload-pack` (`fetch`) — enough to clone and fetch the commit, and no
+    REST or GraphQL read, so the agent cannot read the review it is scored against, nor anything
+    said of the pull request since. kleis compiles it to a reject of every other operation of the
+    `github` service; the agent API (`diff-reviewer`) is not narrowed, and gives it the diff. -/
+def calibrationNarrowing : List String := ["github: only discover, fetch"]
+
+/-- The narrowings a job's orchestra task is queued with: `calibrationNarrowing` for a
+    calibration job, none for a review. -/
+def narrowingFor (job : Job) : List String :=
+  if job.kind? == some .calibration then calibrationNarrowing else []
 
 /-- The checkable sentence the run is held to. -/
 def goal (job : Job) : String :=
@@ -639,7 +653,8 @@ and GitHub is not configured to read them"
         continue
     let req : Orchestra.QueueRequest :=
       { prompt := prompt job, goal := goal job, upstream := s!"{job.owner}/{job.name}"
-      , issueNumber := job.prNumber, externalId := externalId job.id job.attempts }
+      , issueNumber := job.prNumber, externalId := externalId job.id job.attempts
+      , kleisNarrow := narrowingFor job }
     match ← orch.queue req with
     | .error e => recordError job.id .pending s!"queueing on orchestra: {e}"
     | .ok entry =>
