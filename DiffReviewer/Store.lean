@@ -75,6 +75,9 @@ structure JobRow where
   posted_review : Option String
   /-- The version of the repository's rubric the review was checked against (`0003`). -/
   rubric_version : Option Int
+  /-- How many times posting the review has been claimed: each a request to GitHub (`0003`); none
+      is 0. -/
+  post_attempts : Option Int
   deriving Repr
 
 /-- The diff of a pull request at one head commit, as GitHub gave it. A commit's diff never
@@ -171,12 +174,14 @@ def migration0002 : Db.Migration.Migration where
         primaryKey := ["owner", "name", "base_sha", "head_sha"] }]
 
 /-- `0003_m2`: rubrics, and the history of each job's review — the rubric versions of a repository,
-    a job's revisions, and the rubric version a job was reviewed against. The new column is
-    nullable: a job reviewed before rubrics existed was reviewed against none. -/
+    a job's revisions, the rubric version a job was reviewed against, and how many times posting
+    it was attempted. The new columns are nullable: a job reviewed before rubrics existed was
+    reviewed against none, and its attempts are not known. -/
 def migration0003 : Db.Migration.Migration where
   name := "0003_m2"
   steps := [
     .addColumn "review_job" "rubric_version" { type := .int, nullable := true },
+    .addColumn "review_job" "post_attempts" { type := .int, nullable := true },
     .createTable "repo_rubric"
       { columns := .ofList
           [("owner", { type := .text, nullable := false }),

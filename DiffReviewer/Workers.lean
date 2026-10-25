@@ -26,7 +26,9 @@ What `serve` does without being asked, on a loop every `--interval` seconds (`st
   * **settling** — every claim to post older than its window is settled as
     `POST /api/v1/jobs/{id}/reconcile` would settle it (`settleClaims`): a post whose outcome was
     unknown is not left holding its job until a person looks, which in a `direct` repository
-    nobody may do.
+    nobody may do. There, a review found not to have reached GitHub is posted again — as a
+    comment, as every direct post is — up to `maxDirectPostAttempts` posts of the job in all;
+    then it is left `approved`, with why, for a person.
 
 And it drops the kept diffs no live job needs. On request: fetching a diff (`diffOf`, cached per
 commit) and posting an approved review (`postJob`), which a person asks for, or the agent's
@@ -83,6 +85,10 @@ structure Limits where
       timeout of the one request made under the claim, the post itself: nothing else is done
       while it is held. -/
   postClaimSeconds : Nat := 3 * GitHub.requestTimeout
+  /-- The most times the platform posts a `direct` repository's review on its own — the post on
+      submission and the ones after a settled claim found it had not reached GitHub. Past it a
+      person has to post. -/
+  maxDirectPostAttempts : Nat := 3
 
 structure Services where
   github    : Option GitHub.Client
@@ -390,7 +396,8 @@ could not be read to tell ({e.message})" true
         throw (.conflict s!"job {id} is {j.statusRaw}; only an approved review is posted")
       unless j.version == job.version && j.postStartedAt == job.postStartedAt do
         throw (.conflict s!"job {id} changed while it was being posted; reload it")
-      return { j with postStartedAt := some (isoOfEpoch now) }
+      return { j with postStartedAt := some (isoOfEpoch now)
+                      postAttempts := j.postAttempts + 1 }
     if let .error e := claim then
       return .error (match e with
         | .notFound => .notFound
@@ -647,8 +654,25 @@ def settleClaims (s : Services) : IO Unit := do
     | .ok j =>
       if j.status? == some .posted then
         s.log s!"settled {what}: it reached GitHub, {j.postedUrl.getD "?"}; the job is posted"
-      else
-        s.log s!"settled {what}: it did not reach GitHub; the job is approved and free again"
+        continue
+      s.log s!"settled {what}: it did not reach GitHub; the job is approved and free again"
+      let direct := (← Platform.findRepo j.owner j.name).any (·.mode == .direct)
+      unless direct do continue
+      let most := s.limits.maxDirectPostAttempts
+      if j.postAttempts ≥ most then
+        let why := s!"posted {j.postAttempts} times without the review reaching GitHub, the most \
+the platform tries on its own; post it (POST /api/v1/jobs/{j.id}/post) to try again"
+        recordError j.id .approved why
+        s.logOnce s!"settle-gave-up-{j.id}" s!"job {j.id} of direct repository \
+{j.owner}/{j.name}: {why}"
+        continue
+      match ← postJob s j.id (some j.version) (direct := true) with
+      | .ok p =>
+        s.log s!"posted job {j.id} again (attempt {p.postAttempts} of {most}): it is {p.statusRaw}"
+      | .error (.github why p) =>
+        s.log s!"posting job {j.id} again (attempt {p.postAttempts} of {most}): {why}"
+      | .error (.conflict why) => s.log s!"posting job {j.id} again: {why}"
+      | .error .notFound | .error .unavailable => pure ()
     | .error (.github why _) => s.logOnce s!"settle-{job.id}-{why}" s!"settling {what}: {why}"
     -- Moved meanwhile, or being posted right now: nothing to settle on this pass.
     | .error _ => pure ()

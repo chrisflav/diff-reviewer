@@ -313,6 +313,101 @@ def claimsSettleThemselves : Test := withTempDb do
     ++ checkEq said.size 2 "both logged"
     ++ checkEq (← gh.posted.get).size 1 "and nothing posted by settling"
 
+/-- A document keeps the fields this build does not know — on itself, a type and a category —
+    through a write and a read, including the write of a client that sends back what it read; the
+    answer's own fields (`version`, `owner`, …) are not kept as the document's. -/
+def rubricsKeepUnknownFields : Test := withTempDb do
+  let st ← State.new cfg
+  putRepo st "{}"
+  -- As a newer build would have written it.
+  let newer := "{\"defaultRubric\": \"d\", \"tone\": \"terse\", \"prTypes\": [{\"name\": \
+\"feature\", \"weight\": 2, \"categories\": [{\"name\": \"style\", \"color\": \"red\"}]}]}"
+  Store.run <| HasModel.save
+    ({ owner := "acme", name := "widgets", version := 1, document := newer
+     , created_at := "2026-01-01T00:00:00Z" } : Store.RubricRow)
+  let read ← route st (req .get "/api/v1/repos/acme/widgets/rubrics")
+  -- An older client: changes the default rubric, sends back the rest as it read it.
+  let back := (bodyJson read).setObjVal! "defaultRubric" "d, revised"
+  let written ← route st (req .put "/api/v1/repos/acme/widgets/rubrics" back.compress)
+  let some stored ← Platform.currentRubric "acme" "widgets" | return #["no rubric"]
+  let doc := (Json.parse stored.documentRaw).toOption.getD .null
+  let ty := (((doc.getObjVal? "prTypes").bind (·.getArr?)).toOption.bind (·[0]?)).getD .null
+  let cat := (((ty.getObjVal? "categories").bind (·.getArr?)).toOption.bind (·[0]?)).getD .null
+  return checkEq (field read "tone") (some "terse") "the document's unknown field, read"
+    ++ checkStatus written 200 "writing it back"
+    ++ checkEq (versionOf written) 2 "as the next version"
+    ++ checkEq (strOf doc "defaultRubric") (some "d, revised") "the change"
+    ++ checkEq (strOf doc "tone") (some "terse") "the document's unknown field, kept"
+    ++ checkEq ((ty.getObjValAs? Nat "weight").toOption) (some 2) "a type's, kept"
+    ++ checkEq (strOf cat "color") (some "red") "a category's, kept"
+    ++ check (!(doc.getObjVal? "owner").isOk && !(doc.getObjVal? "version").isOk)
+      "the answer's own fields are not the document's"
+    ++ checkEq (field written "tone") (some "terse") "and the answer shows it"
+
+/-- A `direct` repository with a running job of pull request 7; answers the job's id. -/
+private def directJob (st : State) (svc : Workers.Services) : IO String := do
+  putRepo st "{\"mode\": \"direct\"}"
+  let created ← route st (req .post "/api/v1/jobs"
+    s!"\{\"owner\": \"acme\", \"name\": \"widgets\", \"prNumber\": 7, \"headSha\": \"{headA}\"}")
+  Workers.queuePending svc
+  let _ ← route st (agentReq .get "")
+  return (field created "id").getD ""
+
+private def ageClaim (id : String) : IO Unit := do
+  let _ ← Platform.updateJob id fun j =>
+    if j.postStartedAt.isSome then return { j with postStartedAt := some "2000-01-01T00:00:00Z" }
+    else return j
+
+/-- In a `direct` repository, a review settling finds never reached GitHub is posted again, as a
+    comment, by the loop: here the second post reaches it. -/
+def aDirectPostIsRetried : Test := withTempDb do
+  let gh ← FakeGitHub.new #[pull7]
+  let orch ← FakeOrchestra.new
+  let logs ← IO.mkRef #[]
+  let svc ← services gh orch logs
+  let st ← State.new cfg svc
+  let id ← directJob st svc
+  gh.outcome.set .failedUnposted
+  let submitted ← route st (agentReq .post "/review" (submission headA (review := "{\"decision\": \
+\"request_changes\", \"body\": \"No.\", \"comments\": []}")))
+  let first ← job! id
+  gh.outcome.set .ok
+  ageClaim id
+  Workers.settleClaims svc
+  let after ← job! id
+  let posted ← gh.posted.get
+  return checkEq (field submitted "status") (some "approved") "the first post failed"
+    ++ check first.postStartedAt.isSome "its claim stands"
+    ++ checkEq first.postAttempts 1 "one attempt"
+    ++ checkEq after.statusRaw "posted" "posted again by the loop"
+    ++ checkEq after.postAttempts 2 "the second attempt"
+    ++ checkEq (posted.map (·.2.2.2)) #[some .comment] "as a comment"
+    ++ check ((← logs.get).any (·.startsWith s!"posted job {id} again")) "and logged"
+
+/-- At most `maxDirectPostAttempts` posts of a `direct` job in all; then it is left `approved`,
+    free, with why, and that is logged once. -/
+def aDirectPostIsRetriedAtMostThrice : Test := withTempDb do
+  let gh ← FakeGitHub.new #[pull7]
+  let orch ← FakeOrchestra.new
+  let logs ← IO.mkRef #[]
+  let svc ← services gh orch logs
+  let st ← State.new cfg svc
+  let id ← directJob st svc
+  gh.outcome.set .failedUnposted
+  let _ ← route st (agentReq .post "/review" (submission headA))
+  for _ in [0:5] do
+    ageClaim id
+    Workers.settleClaims svc
+  let after ← job! id
+  let gaveUp := (← logs.get).filter fun m => (m.splitOn "the most the platform tries").length > 1
+  return checkEq after.statusRaw "approved" "left approved"
+    ++ checkEq after.postStartedAt none "without a claim"
+    ++ checkEq after.postAttempts 3 "after three attempts"
+    ++ check (after.error.any fun e => (e.splitOn "3 times").length > 1)
+      s!"saying why: {after.error}"
+    ++ checkEq gaveUp.size 1 "logged once"
+    ++ checkEq (← gh.posted.get).size 0 "nothing reached GitHub"
+
 def all : List (String × Test) :=
   [("commentsKeepTheirIdsAndUnknownFields", commentsKeepTheirIdsAndUnknownFields),
    ("rubricsAreVersioned", rubricsAreVersioned),
@@ -320,6 +415,9 @@ def all : List (String × Test) :=
    ("everyWriteIsARevision", everyWriteIsARevision),
    ("oldReviewsGetIdsWhenWritten", oldReviewsGetIdsWhenWritten),
    ("editsAreCheckedAgainstTheRubric", editsAreCheckedAgainstTheRubric),
-   ("claimsSettleThemselves", claimsSettleThemselves)]
+   ("claimsSettleThemselves", claimsSettleThemselves),
+   ("rubricsKeepUnknownFields", rubricsKeepUnknownFields),
+   ("aDirectPostIsRetried", aDirectPostIsRetried),
+   ("aDirectPostIsRetriedAtMostThrice", aDirectPostIsRetriedAtMostThrice)]
 
 end DiffReviewerTest.Rubrics

@@ -545,7 +545,7 @@ private def putRubric (owner name body : String) : IO Reply := do
   let some version := (j.getObjValAs? Nat "version").toOption
     | return .error "the body must carry the rubric's 'version', as last read (0 for none)"
         .badRequest
-  let doc ← match Rubric.ofJson j with
+  let doc ← match Rubric.ofJson j (ignore := RubricVersion.fields) with
     | .ok d => pure d
     | .error e => return .error e .badRequest
   if let .error e := doc.validate then return .error e .badRequest

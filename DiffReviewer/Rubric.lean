@@ -1,4 +1,5 @@
 import Lean.Data.Json
+import DiffReviewer.Types
 
 open Lean (Json)
 
@@ -16,6 +17,10 @@ type's categories with a severity. Its submission names the type, which must be 
 document's (or `null` when there are none), and the job records the type and the version of the
 document it was checked against.
 
+As reviews do, a document keeps the fields this build does not know — on the document, a type or
+a category — in `extra`, and writes them back: a document a newer build (or a newer front-end)
+wrote passes through this one, a `PUT` included, without losing them.
+
 A document is stored whole and versioned: every change is a new version, and the old ones are
 kept. A job's review is only understood next to the rubric it was written to, and calibration
 (M3, M4) compares reviews across rubric changes; a rubric edited in place would lose both.
@@ -26,6 +31,8 @@ namespace DiffReviewer
 structure Category where
   name        : String
   description : String := ""
+  /-- The fields this build does not know, written back as they were read. -/
+  extra       : List (String × Json) := []
   deriving Repr, BEq
 
 structure PrType where
@@ -35,24 +42,32 @@ structure PrType where
   /-- How to review a pull request of this type, in markdown; on top of the default rubric. -/
   rubric      : String := ""
   categories  : List Category := []
+  extra       : List (String × Json) := []
   deriving Repr, BEq
 
 structure Rubric where
   /-- How to review any pull request of the repository, in markdown. -/
   defaultRubric : String := ""
   prTypes       : List PrType := []
+  extra         : List (String × Json) := []
   deriving Repr, BEq
 
+-- The unknown fields first, so that a known field is never shadowed by one of them.
+
 def Category.toJson (c : Category) : Json :=
-  .mkObj [("name", c.name), ("description", c.description)]
+  let known : List (String × Json) := [("name", c.name), ("description", c.description)]
+  .mkObj (c.extra ++ known)
 
 def PrType.toJson (t : PrType) : Json :=
-  .mkObj [("name", t.name), ("description", t.description), ("rubric", t.rubric),
-          ("categories", .arr (t.categories.map Category.toJson).toArray)]
+  let known : List (String × Json) :=
+    [("name", t.name), ("description", t.description), ("rubric", t.rubric),
+     ("categories", .arr (t.categories.map Category.toJson).toArray)]
+  .mkObj (t.extra ++ known)
 
 def Rubric.toJson (r : Rubric) : Json :=
-  .mkObj [("defaultRubric", r.defaultRubric),
-          ("prTypes", .arr (r.prTypes.map PrType.toJson).toArray)]
+  let known : List (String × Json) :=
+    [("defaultRubric", r.defaultRubric), ("prTypes", .arr (r.prTypes.map PrType.toJson).toArray)]
+  .mkObj (r.extra ++ known)
 
 /-- Field `k` of `j`, a string; absent or `null` is `""`. -/
 private def strField (j : Json) (k : String) (what : String) : Except String String :=
@@ -71,7 +86,8 @@ private def arrField (j : Json) (k : String) (what : String) : Except String (Li
 def Category.ofJson (j : Json) (what : String) : Except String Category := do
   let some name := (j.getObjValAs? String "name").toOption
     | throw s!"{what} must have a 'name'"
-  return { name, description := ← strField j "description" what }
+  return { name, description := ← strField j "description" what
+         , extra := unknownFields j ["name", "description"] }
 
 def PrType.ofJson (j : Json) (what : String) : Except String PrType := do
   let some name := (j.getObjValAs? String "name").toOption
@@ -80,13 +96,17 @@ def PrType.ofJson (j : Json) (what : String) : Except String PrType := do
   let categories ← (← arrField j "categories" what).zipIdx.mapM fun (c, i) =>
     Category.ofJson c s!"{what}, category {i + 1}"
   return { name, description := ← strField j "description" what
-         , rubric := ← strField j "rubric" what, categories }
+         , rubric := ← strField j "rubric" what, categories
+         , extra := unknownFields j ["name", "description", "rubric", "categories"] }
 
-def Rubric.ofJson (j : Json) : Except String Rubric := do
+/-- The document in `j`. `ignore` names fields that are not the document's — the `version` a write
+    carries beside it — and are neither read nor kept. -/
+def Rubric.ofJson (j : Json) (ignore : List String := []) : Except String Rubric := do
   unless j.getObj?.isOk do throw "the rubric document must be an object"
   let prTypes ← (← arrField j "prTypes" "the document").zipIdx.mapM fun (t, i) =>
     PrType.ofJson t s!"pull request type {i + 1}"
-  return { defaultRubric := ← strField j "defaultRubric" "the document", prTypes }
+  return { defaultRubric := ← strField j "defaultRubric" "the document", prTypes
+         , extra := unknownFields j (["defaultRubric", "prTypes"] ++ ignore) }
 
 /-- The most pull request types a document may name, and categories a type may. -/
 def maxPrTypes : Nat := 50

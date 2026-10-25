@@ -188,6 +188,8 @@ structure Job where
   postedReview : Option String := none
   /-- The version of the repository's rubric the review was checked against. -/
   rubricVersion : Option Nat := none
+  /-- How many times posting the review has been attempted: claimed, and GitHub asked. -/
+  postAttempts : Nat := 0
 
 def Job.status? (j : Job) : Option JobStatus := JobStatus.ofString? j.statusRaw
 
@@ -225,7 +227,8 @@ def Job.toJson (j : Job) : Json :=
     ("postStartedAt", optStr j.postStartedAt), ("postedUrl", optStr j.postedUrl),
     ("postNote", optStr j.postNote),
     ("postedReview", (j.postedReview.bind (Json.parse · |>.toOption)).getD .null),
-    ("rubricVersion", (j.rubricVersion.map fun v => (v : Json)).getD .null)]
+    ("rubricVersion", (j.rubricVersion.map fun v => (v : Json)).getD .null),
+    ("postAttempts", j.postAttempts)]
 
 private def Job.ofRow (row : Store.JobRow) : Job :=
   { id := row.id, owner := row.owner, name := row.name, prNumber := row.pr_number.toNat
@@ -235,7 +238,8 @@ private def Job.ofRow (row : Store.JobRow) : Job :=
   , baseSha := row.base_sha, title := row.title, prBody := row.pr_body, error := row.error
   , prType := row.pr_type, attempts := (row.attempts.getD 0).toNat
   , postStartedAt := row.post_started_at, postedUrl := row.posted_url, postNote := row.post_note
-  , postedReview := row.posted_review, rubricVersion := row.rubric_version.map (·.toNat) }
+  , postedReview := row.posted_review, rubricVersion := row.rubric_version.map (·.toNat)
+  , postAttempts := (row.post_attempts.getD 0).toNat }
 
 private def Job.toRow (j : Job) : Store.JobRow :=
   { id := j.id, owner := j.owner, name := j.name, pr_number := j.prNumber
@@ -245,7 +249,8 @@ private def Job.toRow (j : Job) : Store.JobRow :=
   , base_sha := j.baseSha, title := j.title, pr_body := j.prBody, error := j.error
   , pr_type := j.prType, attempts := some j.attempts
   , post_started_at := j.postStartedAt, posted_url := j.postedUrl, post_note := j.postNote
-  , posted_review := j.postedReview, rubric_version := j.rubricVersion.map Int.ofNat }
+  , posted_review := j.postedReview, rubric_version := j.rubricVersion.map Int.ofNat
+  , post_attempts := some j.postAttempts }
 
 /-- The largest pull request number accepted: what fits a 32-bit column with room to spare. -/
 def maxPrNumber : Nat := 2147483647
@@ -274,12 +279,20 @@ def RubricVersion.rubric? (r : RubricVersion) : Except String Rubric :=
 def RubricVersion.toJson (r : RubricVersion) : Json :=
   let fields : List (String × Json) :=
     [("owner", r.owner), ("name", r.name), ("version", r.version), ("createdAt", r.createdAt)]
-  let doc : List (String × Json) := match r.rubric? with
-    | .ok doc =>
-      [("defaultRubric", doc.defaultRubric),
-       ("prTypes", .arr (doc.prTypes.map PrType.toJson).toArray), ("documentError", .null)]
-    | .error e => [("defaultRubric", .null), ("prTypes", .null), ("documentError", e)]
-  .mkObj (fields ++ doc)
+  -- The document's own fields, those this build does not know among them, under the version's.
+  match r.rubric? with
+  | .ok doc =>
+    let known : List (String × Json) := [("defaultRubric", doc.defaultRubric),
+      ("prTypes", .arr (doc.prTypes.map PrType.toJson).toArray), ("documentError", .null)]
+    .mkObj (doc.extra ++ fields ++ known)
+  | .error e =>
+    let known : List (String × Json) :=
+      [("defaultRubric", .null), ("prTypes", .null), ("documentError", e)]
+    .mkObj (fields ++ known)
+
+/-- The fields of a rubric answer that are the version's, not the document's: a client that sends
+    the answer back as its next write sends them too, and they are not kept as the document's. -/
+def RubricVersion.fields : List String := ["version", "owner", "name", "createdAt", "documentError"]
 
 /-- The answer for a repository with no rubric yet: version 0, an empty document. -/
 def RubricVersion.none (owner name : String) : Json :=

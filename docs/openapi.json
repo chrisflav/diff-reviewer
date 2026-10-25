@@ -849,7 +849,7 @@
       ],
       "post": {
         "summary": "Submit the review",
-        "description": "The job must be `running` and `headSha` must be its head (`409` otherwise). The review must be one GitHub would take (`400`, saying what to fix): at most 200 inline comments, a summary unless it approves, and every comment's lines in one hunk of the diff's new side. `prType` must be one of the rubric's pull request types, or null when it names none, and each comment's `category` one of that type's categories (see `InlineComment`) (`400`). Comments without an `id` are given one. The job becomes a `draft`, recording `prType` and the rubric's version, and the review is the first of its revisions. For a repository in `direct` mode the platform then posts it — always as a comment, whatever its decision, which the job keeps; if posting fails the job is left `approved` with the reason in `error`, and the submission still stands.",
+        "description": "The job must be `running` and `headSha` must be its head (`409` otherwise). The review must be one GitHub would take (`400`, saying what to fix): at most 200 inline comments, a summary unless it approves, and every comment's lines in one hunk of the diff's new side. `prType` must be one of the rubric's pull request types, or null when it names none, and each comment's `category` one of that type's categories (see `InlineComment`) (`400`). Comments without an `id` are given one. The job becomes a `draft`, recording `prType` and the rubric's version, and the review is the first of its revisions. For a repository in `direct` mode the platform then posts it — always as a comment, whatever its decision, which the job keeps; if posting fails the job is left `approved` with the reason in `error`, and the submission still stands; when the post's outcome was unknown and it is found not to have reached GitHub, the workers post it again, up to 3 posts in all.",
         "operationId": "agentSubmit",
         "security": [
           {
@@ -947,7 +947,7 @@
       ],
       "post": {
         "summary": "Settle a post whose outcome is unknown, without posting",
-        "description": "For a job whose `postStartedAt` is set — a post that may have reached GitHub. The pull request's reviews by the operator are searched for the job's marker. Found, the job is `posted`, with GitHub's record in `postedReview`. Not found and the claim older than its window (three times the post's timeout), the claim is cleared and the job left `approved`, free to be moved back to `draft`, rejected, posted again or made `stale`. Not found within the window, a `409`: the post may still be under way. Reviews that cannot be read leave the claim as it is: a `502` that carries the job. `409` too for a job that is not `approved`, not at `version`, or has no claim. The workers do the same on every pass for every claim past its window, so a claim is settled without this too.",
+        "description": "For a job whose `postStartedAt` is set — a post that may have reached GitHub. The pull request's reviews by the operator are searched for the job's marker. Found, the job is `posted`, with GitHub's record in `postedReview`. Not found and the claim older than its window (three times the post's timeout), the claim is cleared and the job left `approved`, free to be moved back to `draft`, rejected, posted again or made `stale`. Not found within the window, a `409`: the post may still be under way. Reviews that cannot be read leave the claim as it is: a `502` that carries the job. `409` too for a job that is not `approved`, not at `version`, or has no claim. The workers do the same on every pass for every claim past its window, so a claim is settled without this too. In a `direct` repository the workers then post a review that did not reach GitHub again, as a comment, up to 3 posts of the job in all; past that it is left `approved` with the reason in `error`.",
         "operationId": "reconcileJob",
         "requestBody": {
           "required": true,
@@ -1111,7 +1111,7 @@
       },
       "put": {
         "summary": "Replace a repository's rubric document",
-        "description": "The body is the whole document with the version it replaces, as last read (`409` if that is no longer the current one). It becomes the next version, and the one it replaces stays in the history. A type's `description`, `rubric` and `categories` default to empty. `400` for a type or category without a name or with the name of another, past 50 types or 50 categories a type, or a rubric past 65536 bytes.",
+        "description": "The body is the whole document with the version it replaces, as last read (`409` if that is no longer the current one). It becomes the next version, and the one it replaces stays in the history. A type's `description`, `rubric` and `categories` default to empty. `400` for a type or category without a name or with the name of another, past 50 types or 50 categories a type, or a rubric past 65536 bytes. The answer of a `GET` may be sent back as it is, edited: its `owner`, `name`, `createdAt` and `documentError` are not kept as the document's, and fields this build does not know, on the document, a type or a category, are kept.",
         "operationId": "putRubrics",
         "requestBody": {
           "required": true,
@@ -1341,7 +1341,8 @@
           "postedUrl",
           "postNote",
           "postedReview",
-          "rubricVersion"
+          "rubricVersion",
+          "postAttempts"
         ],
         "properties": {
           "id": {
@@ -1497,6 +1498,11 @@
               "null"
             ],
             "description": "The version of the repository's rubric document the review was checked against: recorded with the agent's submission; null for a job the agent has not reviewed."
+          },
+          "postAttempts": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "How many times posting the review has been attempted (claimed, and GitHub asked). In a `direct` repository the platform posts on its own at most 3 times in all."
           }
         }
       },
@@ -1689,7 +1695,8 @@
           "description": {
             "type": "string"
           }
-        }
+        },
+        "description": "Fields this build does not know are kept as they are and written back, a `PUT` of the document included."
       },
       "PrType": {
         "type": "object",
@@ -1722,7 +1729,8 @@
             },
             "description": "What a comment of a review of this type is filed under. Names are unique within the type."
           }
-        }
+        },
+        "description": "Fields this build does not know are kept as they are and written back, a `PUT` of the document included."
       },
       "RubricDocument": {
         "type": "object",
@@ -1735,7 +1743,7 @@
           "prTypes",
           "documentError"
         ],
-        "description": "One version of a repository's rubric document.",
+        "description": "One version of a repository's rubric document. Fields this build does not know are kept as they are and written back, a `PUT` of the document included.",
         "properties": {
           "owner": {
             "type": "string"

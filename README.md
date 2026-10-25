@@ -45,7 +45,9 @@ It is built in milestones. The first three are here:
   does only that check, without posting: found, the job is `posted`; not found once the claim's
   window has passed, the claim is cleared and the job is free to be edited, rejected or go stale.
   The workers make the same check on every pass, so a claim is settled even when nobody asks — in
-  a `direct` repository nobody may.
+  a `direct` repository nobody may. There, a review found not to have reached GitHub is posted
+  again, as a comment, up to 3 posts of the job in all; after that it is left `approved`, with why
+  in its `error`, for a person to post.
 - **Rubrics** (`/api/v1/repos/{owner}/{name}/rubrics`): per repository, a default rubric and the
   kinds of pull request its reviews tell apart, each with its own rubric and categories, which the
   agent reviews by. See [Rubrics](#rubrics).
@@ -204,6 +206,12 @@ A repository's rubric is one document, `GET`/`PUT /api/v1/repos/{owner}/{name}/r
   (`409`) if that is no longer the current one; it becomes the next version, and every version is
   kept (`GET …/rubrics/history`). A job records the version and the type it was reviewed against
   (`rubricVersion`, `prType`), so a review is always read next to the rubric it was written to.
+  Fields the platform does not know, on the document, a type or a category, are kept through every
+  write, so a newer front-end's additions survive an older platform; and a `GET`'s answer may be
+  sent back as the next `PUT` as it is, edited.
+- **Not on GitHub.** Categories and severities are for the platform — reading, filtering, and
+  calibration later — and are not part of what is posted: a posted review stays in the operator's
+  plain style. (To be revisited with learned review style, M4.)
 
 Every inline comment has an `id`, short and random, unique within its review: the platform gives
 one to each comment written without one, when the review is submitted or edited, and keeps the ones
@@ -220,9 +228,10 @@ The suite covers the review format, the job transitions, that the migrations bui
 schema and bring an old database up to date, the credentials (each reaches only its own routes)
 and the login rate limit per address, a review's whole life over the API, the workers —
 discovery, its cap and cancellations, queueing, following, posting once whatever GitHub answers,
-direct mode, settling claims on their own — against a fake GitHub and a fake orchestra, rubrics and
-their versions, the agent's submission checked against them, comment ids and unknown fields kept
-through every round trip, the history of a review from draft to post, the checks of a review against its diff,
+direct mode, settling claims on their own and posting a direct review again at most three times —
+against a fake GitHub and a fake orchestra, rubrics and their versions, the agent's submission
+checked against them, comment ids and unknown fields kept through every round trip (of reviews and
+rubrics), the history of a review from draft to post, the checks of a review against its diff,
 the agent CLI against the server on loopback, and that `docs/openapi.json` documents exactly the
 routes the server answers. Nothing in it reaches the network.
 

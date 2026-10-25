@@ -105,8 +105,9 @@ def LineRange.ofJson (j : Lean.Json) : Except String LineRange := do
   let endLine   ← (← j.getObjVal? "end_line").getNat?
   return { startLine, endLine }
 
-/-- The fields of object `j` not named in `known`. -/
-private def unknownFields (j : Lean.Json) (known : List String) : List (String × Lean.Json) :=
+/-- The fields of object `j` not named in `known`: what a record keeps in its `extra` and writes
+    back, so that a field this build does not know survives it. -/
+def unknownFields (j : Lean.Json) (known : List String) : List (String × Lean.Json) :=
   match j.getObj? with
   | .ok kvs => kvs.toList.filter (!known.contains ·.1)
   | .error _ => []
