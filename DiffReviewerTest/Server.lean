@@ -142,11 +142,13 @@ def whatThisBuildCannotReadIsKept : Test := do
        , created_at := j.createdAt, updated_at := j.updatedAt } : Store.JobRow)
     let read ← route st (req .get s!"/api/v1/jobs/{id}")
     let write ← route st (req .post s!"/api/v1/jobs/{id}/status" (statusBody "rejected" 1))
+    let edit ← route st (req .put s!"/api/v1/jobs/{id}/review" (reviewBody 1 fine))
     let some after ← Platform.findJob id | return #["the job disappeared"]
     return checkStatus read 200 "reading it"
       ++ checkEq (field read "status") (some "escalated") "the unknown status, as stored"
       ++ check (field read "reviewError" |>.isSome) "the review is reported as unreadable"
       ++ checkStatus write 409 "a write to it"
+      ++ checkStatus edit 409 "an edit of it"
       ++ checkEq after.reviewRaw (some odd) "the stored review, untouched"
       ++ checkEq after.statusRaw "escalated" "the stored status, untouched"
 

@@ -249,6 +249,9 @@ private def putReview (id body : String) : IO Reply := do
     let st ← current job version
     unless st.personCanEdit do
       throw (.conflict s!"job {id} is {st.toString}; its review is not edited now")
+    if let some (.error e) := job.review? then
+      throw (.conflict s!"job {id}'s stored review cannot be read by this build ({e}); it is \
+left as it is")
     return { job.setReview review with statusRaw := JobStatus.draft.toString }
 
 /-- Make a person's decision on a job. The body is `{"status": …, "version": n}`. -/
