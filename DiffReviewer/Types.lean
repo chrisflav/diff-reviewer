@@ -90,10 +90,24 @@ def Review.toJsonString (r : Review) : String :=
 def Review.ofJsonString (s : String) : Except String Review :=
   (Lean.Json.parse s).bind Review.ofJson
 
-/-- Why `r` could not be posted as a GitHub review, or `ok`: every comment names a file and a
-    line range starting at 1 with its end at or after its start, and says something. Checked when
-    a review is written, so a review that GitHub would refuse is refused before it is stored. -/
+/-- The most inline comments a review may carry. Past a few hundred GitHub's review endpoint and
+    any reader give out, and kleis's request-body limits on the agent API are sized for this
+    many. -/
+def maxInlineComments : Nat := 200
+
+/-- Why `r` could not be posted as a GitHub review, or `ok`: a comment or a request for changes
+    says something in its summary (GitHub refuses either with an empty body), and every comment
+    names a file and a line range starting at 1 with its end at or after its start, and says
+    something; and there are at most `maxInlineComments` comments. Checked when a review is
+    written — submitted, edited — and again before it is posted, so a review that GitHub would
+    refuse is refused before it is stored. Whether the comments' lines are in the diff is
+    `Diff.check`. -/
 def Review.validate (r : Review) : Except String Unit := do
+  if r.comments.length > maxInlineComments then
+    throw s!"the review carries {r.comments.length} inline comments; a review may carry at most \
+{maxInlineComments} inline comments, so merge or drop the least important"
+  if r.decision != .approve && r.body.trimAscii.isEmpty then
+    throw "the summary ('body') is empty; GitHub requires one unless the review approves"
   for (c, i) in r.comments.zipIdx do
     let at_ := s!"comment {i + 1}"
     if c.file.trimAscii.isEmpty then throw s!"{at_} names no file"

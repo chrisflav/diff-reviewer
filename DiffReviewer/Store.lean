@@ -27,6 +27,9 @@ structure RepoRow where
   /-- `staged` (a person approves each review before it is posted) or `direct`. -/
   mode : String
   created_at : String
+  /-- Whether the platform finds the repository's pull requests itself (`0002`); a row written
+      before has none, which is `false`. -/
+  auto_review : Option Bool
   deriving Repr
 
 /-- One review of one pull request at one head commit: queued, run, drafted, approved, posted. -/
@@ -47,6 +50,42 @@ structure JobRow where
   version : Int
   created_at : String
   updated_at : String
+  /-- The pull request's base commit, title and description, as GitHub gave them when the job was
+      made or queued (`0002`). -/
+  base_sha : Option String
+  title : Option String
+  pr_body : Option String
+  /-- What the last platform step on the job failed with — queueing, the run, posting — cleared
+      when one succeeds (`0002`). -/
+  error : Option String
+  /-- The kind of pull request the agent said it reviewed (`0002`). -/
+  pr_type : Option String
+  /-- How many times the job has been queued on orchestra (`0002`); none is 0. -/
+  attempts : Option Int
+  /-- When posting the review to GitHub last began: the claim that keeps it from being posted
+      twice, kept until the outcome is known (`0002`). -/
+  post_started_at : Option String
+  /-- The posted review on GitHub (`0002`). -/
+  posted_url : Option String
+  /-- How the review was posted, when that differs from what it says — a decision posted as a
+      comment (`0002`). -/
+  post_note : Option String
+  /-- The review as GitHub holds it, `{"id", "url", "body"}`: what was posted, which after a
+      reconciliation may not be the job's own review (`0002`). -/
+  posted_review : Option String
+  deriving Repr
+
+/-- The diff of a pull request at one head commit, as GitHub gave it. A commit's diff never
+    changes, so it is fetched once and kept: the agent and the front-end both read it, and neither
+    should cost a GitHub request each time (`0002`). -/
+@[model (dbName := "pull_diff") (primaryKey := ["owner", "name", "base_sha", "head_sha"]) reviewdb]
+structure DiffRow where
+  owner : String
+  name : String
+  base_sha : String
+  head_sha : String
+  diff : String
+  fetched_at : String
   deriving Repr
 
 def target : DatabaseRecipe :=
@@ -78,8 +117,36 @@ def migration0001 : Db.Migration.Migration where
            ("updated_at", { type := .text, nullable := false })],
         primaryKey := ["id"] }]
 
+/-- `0002_m1`: what queueing on orchestra and posting to GitHub keep — a repository's
+    `auto_review`, a job's pull request metadata, last error, pull request type, attempts and
+    posting record, and the diff cache. Every new column is nullable, so the rows `0001` wrote are
+    valid as they are. -/
+def migration0002 : Db.Migration.Migration where
+  name := "0002_m1"
+  steps := [
+    .addColumn "repo" "auto_review" { type := .bool, nullable := true },
+    .addColumn "review_job" "base_sha" { type := .text, nullable := true },
+    .addColumn "review_job" "title" { type := .text, nullable := true },
+    .addColumn "review_job" "pr_body" { type := .text, nullable := true },
+    .addColumn "review_job" "error" { type := .text, nullable := true },
+    .addColumn "review_job" "pr_type" { type := .text, nullable := true },
+    .addColumn "review_job" "attempts" { type := .int, nullable := true },
+    .addColumn "review_job" "post_started_at" { type := .text, nullable := true },
+    .addColumn "review_job" "posted_url" { type := .text, nullable := true },
+    .addColumn "review_job" "post_note" { type := .text, nullable := true },
+    .addColumn "review_job" "posted_review" { type := .text, nullable := true },
+    .createTable "pull_diff"
+      { columns := .ofList
+          [("owner", { type := .text, nullable := false }),
+           ("name", { type := .text, nullable := false }),
+           ("base_sha", { type := .text, nullable := false }),
+           ("head_sha", { type := .text, nullable := false }),
+           ("diff", { type := .text, nullable := false }),
+           ("fetched_at", { type := .text, nullable := false })],
+        primaryKey := ["owner", "name", "base_sha", "head_sha"] }]
+
 /-- The migrations, in the order they are applied. Appended to, never edited. -/
-def migrations : List Db.Migration.Migration := [migration0001]
+def migrations : List Db.Migration.Migration := [migration0001, migration0002]
 
 /-- Where the database is. Set once at start-up (`serve --db`), and by the tests. -/
 initialize pathRef : IO.Ref System.FilePath ← IO.mkRef (System.FilePath.mk "diff-reviewer.db")
@@ -119,5 +186,24 @@ def run {α : Type} (x : Sqlite.M α) : IO α := do
       x
   finally
     storeMutex.unlock
+
+/-- `run`, inside one transaction: for a read and the write that depends on it. The lock keeps the
+    threads of this process apart, and the transaction keeps out a second process on the same file
+    — a `serve` started twice by mistake, a repair by hand — which the lock knows nothing of.
+
+    `BEGIN IMMEDIATE` rather than the default deferred `BEGIN`: it takes the write lock before the
+    read, so two processes cannot both read a job and then both try to write it, which in SQLite
+    ends with one of them failing `SQLITE_BUSY` without waiting. -/
+def transact {α : Type} (x : Sqlite.M α) : IO α :=
+  run do
+    let db ← read
+    SQLite.exec db "BEGIN IMMEDIATE"
+    try
+      let a ← x
+      SQLite.exec db "COMMIT"
+      return a
+    catch e =>
+      try SQLite.exec db "ROLLBACK" catch _ => pure ()
+      throw e
 
 end DiffReviewer.Store

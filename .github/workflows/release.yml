@@ -1,0 +1,70 @@
+name: Release
+
+# On a `v*` tag: build the Linux x86_64 binary and attach it, with its sha256, to a GitHub release
+# of that tag. Orchestra's agent image (Debian bookworm) installs it from there, so the build runs
+# on the oldest supported Ubuntu and is checked against bookworm's glibc before it is published.
+#
+# Two jobs, so that the one running the build — and every dependency it fetches — never holds a
+# token that can write to the repository: `build` reads, and hands the binary on as an artifact;
+# `publish` only creates the release. Actions are pinned by commit, not by a tag that can move.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      # Builds the package and runs `lake test`: a release is of a build that passes.
+      - uses: leanprover/lean-action@24581d74d674803a25a81b10b059c5c0cdd344c6 # v1.6.2
+        with:
+          test: true
+      - name: Package
+        run: |
+          name="diff-reviewer-${GITHUB_REF_NAME}-linux-x86_64"
+          mkdir dist
+          cp .lake/build/bin/diff-reviewer "dist/$name"
+          strip "dist/$name"
+          (cd dist && sha256sum "$name" > "$name.sha256")
+          echo "ASSET=$name" >> "$GITHUB_ENV"
+      - name: Check the glibc it needs
+        run: |
+          # Debian bookworm has glibc 2.36; the binary must not ask for more.
+          need=$(objdump -T "dist/$ASSET" | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -1)
+          echo "needs glibc $need"
+          test "$(printf '%s\n2.36\n' "$need" | sort -V | tail -1)" = "2.36"
+      - name: Run it on Debian bookworm
+        run: |
+          docker run --rm -v "$PWD/dist:/dist:ro" debian:bookworm \
+            sh -c "/dist/$ASSET 2>&1 | grep -q USAGE"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release
+          path: dist
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --generate-notes dist/*

@@ -1,3 +1,5 @@
+import DiffReviewer.Store
+
 /-!
 # A minimal test harness
 
@@ -15,6 +17,16 @@ def check (cond : Bool) (msg : String) : Array String :=
 
 def checkEq [BEq α] [Repr α] (a b : α) (what : String) : Array String :=
   check (a == b) s!"{what}: expected {repr b}, got {repr a}"
+
+/-- Run `act` against a fresh database under `.lake/test/`, so a test never touches a real one. -/
+def withTempDb (act : IO α) : IO α := do
+  let dir : System.FilePath := ".lake" / "test"
+  IO.FS.createDirAll dir
+  let path := dir / s!"test-{← IO.monoNanosNow}.db"
+  DiffReviewer.Store.setPath path
+  try act finally
+    for p in [path, ⟨path.toString ++ "-wal"⟩, ⟨path.toString ++ "-shm"⟩] do
+      try IO.FS.removeFile p catch _ => pure ()
 
 /-- Run `tests` and print one line each; answers whether they all passed. -/
 def run (tests : List (String × Test)) : IO Bool := do

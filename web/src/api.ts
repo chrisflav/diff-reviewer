@@ -31,7 +31,8 @@ export type JobStatus =
   | "approved"
   | "posted"
   | "rejected"
-  | "stale";
+  | "stale"
+  | "failed";
 
 export type Decision = "comment" | "approve" | "request_changes";
 
@@ -39,6 +40,8 @@ export interface Repo {
   owner: string;
   name: string;
   mode: PostingMode;
+  /** Whether the platform finds the repository's open pull requests itself. */
+  autoReview: boolean;
   createdAt: string;
 }
 
@@ -72,6 +75,24 @@ export interface Job {
   version: number;
   createdAt: string;
   updatedAt: string;
+  /** The pull request's base commit, title and description, from GitHub, once known. */
+  baseSha: string | null;
+  title: string | null;
+  prBody: string | null;
+  /** What the platform's last step on the job failed with, until one succeeds. */
+  error: string | null;
+  /** The kind of pull request the agent said it reviewed. */
+  prType: string | null;
+  /** How many times the job has been queued on orchestra. */
+  attempts: number;
+  /** When posting last began, while its outcome is not known. */
+  postStartedAt: string | null;
+  /** The posted review on GitHub. */
+  postedUrl: string | null;
+  /** How the review was posted, when that differs from its decision. */
+  postNote: string | null;
+  /** The review as GitHub holds it, once posted. */
+  postedReview: { id: number; url: string; body: string } | null;
 }
 
 /** Thrown when the server could not be reached at all. */
@@ -134,6 +155,9 @@ export const api = {
     request<Job>("PUT", `/api/v1/jobs/${seg(id)}/review`, { version, review }),
   setStatus: (id: string, version: number, status: JobStatus) =>
     request<Job>("POST", `/api/v1/jobs/${seg(id)}/status`, { status, version }),
+  /** Settle a post whose outcome is unknown, without posting (`POST /api/v1/jobs/{id}/reconcile`). */
+  reconcileJob: (id: string, version: number) =>
+    request<Job>("POST", `/api/v1/jobs/${seg(id)}/reconcile`, { version }),
 };
 
 /** One path segment, encoded, so that a `/`, `?` or `#` in it cannot change the path. */
@@ -149,6 +173,8 @@ export function nextStatuses(s: string): JobStatus[] {
     case "approved":
     case "rejected":
       return ["draft"];
+    case "failed":
+      return ["pending"];
     default:
       return [];
   }
