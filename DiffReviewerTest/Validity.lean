@@ -258,7 +258,7 @@ def fromProposalKeepsProvenance : Test := withTempDb do
     ++ checkEq ((notesNow[0]?.map (·.derived.prs)).getD []) ["acme/widgets#7"]
       "record its provenance"
     ++ checkEq (num (bodyJson notes) ["styleNotesVersion"]) (some 1) "as notes version 1"
-    ++ checkStatus unknown 409 "from a proposal that is not one"
+    ++ checkStatus unknown 400 "from a proposal that is not one"
     ++ checkEq (num (bodyJson again) ["styleNotesVersion"]) (some 2)
       "registered again: the notes go on from the last version"
     ++ checkEq ((notesAfter[0]?.map (·.derived.prs)).getD []) ["acme/widgets#7"]

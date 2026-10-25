@@ -468,7 +468,9 @@ private def putRepo (owner name body : String) : IO Reply := do
       { mode, autoReview, trustedReviewers := trusted, styleNotes, evalShare, expected
       , provenance } with
   | .ok (existed, repo) => return .json repo.toJson (if existed then .ok else .created)
-  | .error why => return .error why .conflict
+  | .error (.invalid why) => return .error why .badRequest
+  | .error (.conflict why) => return .error why .conflict
+  | .error .notFound => return .error "not found" .notFound
 
 private def createJob (body : String) : IO Reply := do
   let j ← match parseBody body with

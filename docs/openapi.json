@@ -237,7 +237,7 @@
                   },
                   "fromProposal": {
                     "type": "string",
-                    "description": "The rubric proposal the style notes written were taken from: the new notes version records its provenance, and the proposal is marked accepted. `409` for a rejected proposal or one that is not the repository's."
+                    "description": "The rubric proposal the style notes written were taken from: the new notes version records its provenance, and the proposal is marked accepted. `400` for an id that is not a proposal of the repository, `409` for a rejected proposal."
                   }
                 }
               }

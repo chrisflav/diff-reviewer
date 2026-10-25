@@ -510,6 +510,13 @@ def findRepo (owner name : String) : IO (Option Repo) := do
     select r
   return rows[0]?.map Repo.ofRow
 
+/-- Why an update was not made. -/
+inductive UpdateError where
+  | notFound
+  /-- The job is not in a state, or not at the version, the update was meant for. -/
+  | conflict (why : String)
+  | invalid (why : String)
+
 /-- What a write of a repository's settings changes. A field left `none` keeps the current value
     — or, for a repository not yet registered, the default — so that a client that does not know
     a setting cannot wipe it. -/
@@ -520,8 +527,9 @@ structure RepoUpdate where
   styleNotes       : Option String := none
   evalShare        : Option Nat := none
   /-- Run first in the write's transaction: what the style notes written are derived from (a
-      rubric proposal they came from, which it marks accepted), or why nothing is to be written. -/
-  provenance       : Sqlite.M (Except String Provenance) := pure (.ok {})
+      rubric proposal they came from, which it marks accepted), or why nothing is to be written —
+      `invalid` for a request that names no such proposal, `conflict` for one it may not use. -/
+  provenance       : Sqlite.M (Except UpdateError Provenance) := pure (.ok {})
   /-- The version of the settings the client last read (0 for a repository not yet registered);
       `none` writes whatever is there. -/
   expected         : Option Nat := none
@@ -588,7 +596,7 @@ private def fetchTombstone (owner name : String) : Sqlite.M (Option Store.Tombst
     Answers whether it existed before, and the repository as written. Names are stored in lower
     case, as GitHub compares them, so `Acme/Widgets` and `acme/widgets` are one repository; so are
     the trusted reviewers' logins. -/
-def putRepo (owner name : String) (u : RepoUpdate) : IO (Except String (Bool × Repo)) := do
+def putRepo (owner name : String) (u : RepoUpdate) : IO (Except UpdateError (Bool × Repo)) := do
   let owner := owner.toLower
   let name := name.toLower
   let now ← nowIso
@@ -605,8 +613,8 @@ def putRepo (owner name : String) (u : RepoUpdate) : IO (Except String (Bool × 
     let last := ((← fetchTombstone owner name).map (·.version.toNat)).getD 0
     if let some v := u.expected then
       unless v == current do
-        return .error s!"the settings of {owner}/{name} have changed since they were read \
-(version {v}, now {current}); reload them"
+        return .error <| .conflict s!"the settings of {owner}/{name} have changed since they \
+were read (version {v}, now {current}); reload them"
     let latest ← fetchNotes owner name
     let old : Repo := existing.getD { owner, name, createdAt := now, version := last
                                     , styleNotesVersion := (latest.map (·.version)).getD 0 }
@@ -771,13 +779,6 @@ def cacheDiff (owner name base head diff : String) : IO Unit := do
   let fetched_at ← nowIso
   Store.run <| HasModel.save
     ({ owner, name, base_sha := base, head_sha := head, diff, fetched_at } : Store.DiffRow)
-
-/-- Why an update was not made. -/
-inductive UpdateError where
-  | notFound
-  /-- The job is not in a state, or not at the version, the update was meant for. -/
-  | conflict (why : String)
-  | invalid (why : String)
 
 /-- The most recent revisions of a job's review kept, beside its first draft and what was posted. -/
 def maxRevisions : Nat := 100

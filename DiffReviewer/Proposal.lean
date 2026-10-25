@@ -342,11 +342,11 @@ into the settings")
     some of it records its provenance only by being accepted. One accepted already gives its
     provenance again, keeping the rubric version it records. -/
 def adoptIn (repo : Repo) (id : String) (rubricVersion : Option Nat) (now : String) :
-    Sqlite.M (Except String Provenance) := do
+    Sqlite.M (Except Platform.UpdateError Provenance) := do
   let some p := (← fetchProposals repo.owner repo.name).find? (·.id == id)
-    | return .error s!"'fromProposal': {id} is not a proposal of {repo.slug}"
+    | return .error (.invalid s!"'fromProposal': {id} is not a proposal of {repo.slug}")
   if p.status == "rejected" then
-    return .error s!"'fromProposal': proposal {id} was rejected"
+    return .error (.conflict s!"'fromProposal': proposal {id} was rejected")
   let p := { p with status := "accepted", decidedAt := p.decidedAt <|> some now
                     acceptedVersion := p.acceptedVersion <|> rubricVersion }
   HasModel.save p.toRow
@@ -373,7 +373,7 @@ def saveRubricFrom (repo : Repo) (id : String) (expected : Nat) (doc : Rubric) :
         | .error e => abort e
       match ← adoptIn repo id (some written.version) now with
       | .ok _ => return .ok written
-      | .error why => abort (.conflict why)
+      | .error e => abort e
   catch e =>
     match ← failed.get with
     | some why => return .error why
