@@ -57,13 +57,17 @@ def aReviewIsPostedOnce : Test := withTempDb do
   gh.outcome.set .lostAnswer
   let lost ← post st a va
   let afterLost ← count
-  -- Not posted, a 5xx: left to be posted again, and then posted.
+  -- Not posted, a 5xx: the claim is kept even though nothing is found yet; once it is old, the
+  -- next attempt looks again, finds nothing, and posts.
   let (b, vb) ← approvedJob st
   gh.outcome.set .failedUnposted
   let unposted ← post st b vb
   let jb ← job! b
   gh.outcome.set .ok
-  let again ← post st b jb.version
+  let tooSoonB ← post st b jb.version
+  let _ ← Platform.updateJob b fun j =>
+    return { j with postStartedAt := some "2000-01-01T00:00:00Z" }
+  let again ← post st b (← job! b).version
   let afterB ← count
   -- Posted, the answer lost, and the reviews unreadable: the claim stays, a second attempt soon
   -- after is refused, and a later one finds the review rather than posting it again.
@@ -91,14 +95,18 @@ def aReviewIsPostedOnce : Test := withTempDb do
     ++ checkEq afterLost 1 "reviews on GitHub after the lost answer"
     ++ checkStatus unposted 502 "a 5xx with nothing posted"
     ++ checkEq jb.statusRaw "approved" "the job after it"
-    ++ checkEq jb.postStartedAt none "no claim left once the reviews show nothing posted"
-    ++ checkStatus again 200 "posting it again"
+    ++ check jb.postStartedAt.isSome "the claim kept after a 5xx, though nothing is found yet"
+    ++ checkStatus tooSoonB 409 "another attempt within the claim's window"
+    ++ checkStatus again 200 "posting it again once the claim is old"
     ++ checkEq afterB 2 "reviews on GitHub after the second job"
     ++ checkStatus unknown 502 "an outcome that could not be checked"
     ++ check jc.postStartedAt.isSome "the claim is kept"
     ++ checkStatus tooSoon 409 "another attempt while the claim is recent"
     ++ checkStatus later 200 "a later attempt"
     ++ checkEq afterC 3 "reviews on GitHub: the third job's, once"
+    ++ check (((bodyJson later).getObjVal? "postedReview").toOption.bind
+        (·.getObjValAs? String "body" |>.toOption) |>.any fun b => (b.splitOn c).length > 1)
+      "GitHub's record of the review, kept"
     ++ checkStatus refused 502 "a 422"
     ++ checkEq jd.postStartedAt none "no claim after a definite refusal"
     ++ check (jd.error.any (·.startsWith "posting failed")) "the refusal, recorded"
@@ -172,18 +180,34 @@ def loginsAreLimitedPerAddress : Test := do
       let _ ← loginFrom st "10.0.0.1" "wrong" (forwarded := some "5.5.5.5, 9.9.9.9")
     let proxiedLocked ← loginFrom st "10.0.0.1" password (forwarded := some "9.9.9.9")
     let proxiedOther ← loginFrom st "10.0.0.1" password (forwarded := some "8.8.8.8")
-    -- The ceiling over all addresses.
-    let st2 ← State.new cfg (clock := now.get)
+    -- The ceiling over all addresses slows every attempt, refusing none.
+    let slept ← IO.mkRef (#[] : Array Nat)
+    let st2 ← State.new cfg (clock := now.get) (sleep := fun ms => slept.modify (·.push ms))
     for i in [0:loginGlobalLimit] do
       let _ ← loginFrom st2 s!"6.6.{i / 256}.{i % 256}" "wrong"
+    let sleptBefore := (← slept.get).size
     let ceiling ← loginFrom st2 "4.4.4.4" password
+    let sleptAfter ← slept.get
+    -- IPv6: one /64 is one client.
+    let st3 ← State.new cfg (clock := now.get)
+    for i in [0:5] do
+      let _ ← loginFrom st3 s!"2001:db8:1:2::{i + 1}" "wrong"
+    let sameNet ← loginFrom st3 "2001:db8:1:2:ffff::9" password
+    let otherNet ← loginFrom st3 "2001:db8:1:3::1" password
     return checkStatus lockedOut 429 "the address that failed"
       ++ checkStatus other 200 "another address"
       ++ checkStatus spoofed 429 "an untrusted peer claiming another address"
       ++ checkStatus proxiedLocked 429 "the client the proxy names"
       ++ checkStatus proxiedOther 200 "another client behind the proxy"
-      ++ checkStatus ceiling 429 "past the ceiling, everyone"
+      ++ checkEq sleptBefore 0 "no delay below the ceiling"
+      ++ checkStatus ceiling 200 "past the ceiling, the right password still works"
+      ++ checkEq sleptAfter #[loginGlobalDelayMs] "but only after a delay"
       ++ check (loginGlobalLimit ≥ 10 * loginFailureLimit) "the ceiling is much higher"
+      ++ checkStatus sameNet 429 "another address of the same /64"
+      ++ checkStatus otherNet 200 "another /64"
+      ++ checkEq (addressKey "2001:0DB8:0:0::1") "2001:db8:0:0::/64" "an IPv6 key"
+      ++ checkEq (addressKey "::ffff:192.0.2.7") "192.0.2.7" "an IPv4-mapped address"
+      ++ checkEq (addressKey "192.0.2.7") "192.0.2.7" "an IPv4 address"
 
 /-- Nothing is spent on a head the pull request has moved on from: pending jobs of it are stale,
     queued and running ones cancelled and stale, and queueing checks again. -/
@@ -310,7 +334,9 @@ def diffsAreBounded : Test := withTempDb do
 /-- Comments must be on the diff's new side, and a comment or a request for changes must say
     something: what GitHub would otherwise refuse with a `422`. -/
 def reviewsAreCheckedAgainstTheDiff : Test := withTempDb do
-  let diff := "diff --git a/A.lean b/A.lean\n--- a/A.lean\n+++ b/A.lean\n@@ -1,3 +5,10 @@\n x\n\
+  let added := "\n".intercalate (List.replicate 10 "+a")
+  let diff := s!"diff --git a/A.lean b/A.lean\n--- a/A.lean\n+++ b/A.lean\n@@ -1,0 +5,10 @@\n\
+{added}\n\
 @@ -40 +50 @@\n y\ndiff --git a/Old.lean b/Old.lean\n--- a/Old.lean\n+++ /dev/null\n\
 @@ -1,2 +0,0 @@\n"
   let at_ (file : String) (a b : Nat) : Review :=
@@ -319,8 +345,17 @@ def reviewsAreCheckedAgainstTheDiff : Test := withTempDb do
                    , suggestion := none }] }
   let oneComment : InlineComment :=
     { file := "A.lean", range := { startLine := 5, endLine := 5 }, body := "y", suggestion := none }
+  -- Inside a hunk a line is content, whatever it starts with; and git quotes some paths.
+  let tricky := "diff --git a/A.lean b/A.lean\n--- a/A.lean\n+++ b/A.lean\n@@ -1,2 +1,3 @@\n\
+--- not a header\n+++ not a header either\n+++ b/C.lean\n x\n\\ No newline at end of file\n\
+diff --git \"a/sp ace/\\303\\251t\\303\\251.lean\" \"b/sp ace/\\303\\251t\\303\\251.lean\"\n\
+--- \"a/sp ace/\\303\\251t\\303\\251.lean\"\n+++ \"b/sp ace/\\303\\251t\\303\\251.lean\"\n\
+@@ -0,0 +7 @@\n+y\n"
   let pure := checkEq (Diff.rightHunks diff) [("A.lean", [(5, 14), (50, 50)]), ("/dev/null", [])]
       "the hunks"
+    ++ checkEq (Diff.rightHunks tricky) [("A.lean", [(1, 3)]), ("sp ace/été.lean", [(7, 7)])]
+      "lines like headers inside a hunk, and a quoted path"
+    ++ checkEq (Diff.unquote "\"a\\tb\\\"c\"") "a\tb\"c" "C escapes"
     ++ check (Diff.check (at_ "A.lean" 5 14) diff matches .ok ()) "a comment in a hunk"
     ++ check (Diff.check (at_ "A.lean" 50 50) diff matches .ok ()) "a one-line hunk"
     ++ check (Diff.check (at_ "A.lean" 14 15) diff matches .error _) "past the hunk"
@@ -356,6 +391,66 @@ def reviewsAreCheckedAgainstTheDiff : Test := withTempDb do
     ++ checkStatus off 400 "a comment off the diff"
     ++ check ((msg.splitOn "hunk").length > 1) s!"the error names the hunks: {msg}"
     ++ checkStatus on 200 "a comment on it"
+
+/-- While a post may have reached GitHub, the job keeps what it says: it cannot leave
+    `approved`, be edited or be made stale, and posting it again settles it. -/
+def anUnsettledPostHoldsTheJob : Test := withTempDb do
+  let gh ← FakeGitHub.new #[pull7 jobHead]
+  let logs ← IO.mkRef #[]
+  let svc ← servicesWith gh none logs
+  let st ← State.new cfg svc
+  putRepo st "{\"autoReview\": true}"
+  let (id, v) ← approvedJob st
+  gh.outcome.set .lostAnswer
+  gh.listFails.set true
+  let _ ← post st id v
+  let held ← job! id
+  let moved ← route st (req .post s!"/api/v1/jobs/{id}/status" (statusBody "draft" held.version))
+  let edited ← route st (req .put s!"/api/v1/jobs/{id}/review" (reviewBody held.version fine))
+  gh.pulls.set #[pull7 headB]
+  Workers.discover svc
+  let afterDiscovery ← job! id
+  gh.listFails.set false
+  let _ ← Platform.updateJob id fun j =>
+    return { j with postStartedAt := some "2000-01-01T00:00:00Z" }
+  let settled ← post st id (← job! id).version
+  return checkStatus moved 409 "moving it off approved"
+    ++ check (((bodyJson moved).getObjValAs? String "error").toOption.any fun e =>
+        (e.splitOn "may have reached GitHub").length > 1) "saying why"
+    ++ checkStatus edited 409 "editing its review"
+    ++ checkEq afterDiscovery.statusRaw "approved" "discovery leaves it alone"
+    ++ checkStatus settled 200 "posting it again"
+    ++ checkEq (field settled "status") (some "posted") "settled: it was posted"
+    ++ checkEq (← gh.posted.get).size 1 "and only once"
+
+/-- With the operator's login known, a review by anyone else carrying a job's marker is not taken
+    for the platform's; without it, that is said. -/
+def aForgedMarkerIsIgnored : Test := withTempDb do
+  let gh ← FakeGitHub.new #[pull7 jobHead]
+  let logs ← IO.mkRef #[]
+  let st ← State.new cfg (← servicesWith gh none logs { githubLogin := some "ChrisFlav" })
+  let (id, v) ← approvedJob st
+  gh.foreign.set
+    #[{ id := 99, body := s!"lgtm {Workers.marker id}", url := "x", author := "mallory" }]
+  gh.outcome.set .failedUnposted
+  let _ ← post st id v
+  let _ ← Platform.updateJob id fun j =>
+    return { j with postStartedAt := some "2000-01-01T00:00:00Z" }
+  gh.outcome.set .ok
+  let posted ← post st id (← job! id).version
+  let postedCount := (← gh.posted.get).size
+  -- Without the login, looking for a marker says, once, that a forgery cannot be ruled out.
+  let logs2 ← IO.mkRef #[]
+  let st2 ← State.new cfg (← servicesWith gh none logs2)
+  gh.outcome.set .lostAnswer
+  for _ in [0:2] do
+    let (i, v) ← approvedJob st2
+    let _ ← post st2 i v
+  let warned := (← logs2.get).filter fun m => (m.splitOn "DIFF_REVIEWER_GITHUB_LOGIN").length > 1
+  return checkStatus posted 200 "posted despite the forged marker"
+    ++ checkEq postedCount 1 "the platform's own review was posted"
+    ++ check ((field posted "postedUrl").any (· != "x")) "not the forged one"
+    ++ checkEq warned.size 1 "the warning, once"
 
 /-- A step that throws does not stop the others, nor the loop. -/
 def aThrowingStepStopsNothing : Test := withTempDb do
@@ -397,6 +492,8 @@ def all : List (String × Test) :=
    ("diffsAreBounded", diffsAreBounded),
    ("reviewsAreCheckedAgainstTheDiff", reviewsAreCheckedAgainstTheDiff),
    ("aThrowingStepStopsNothing", aThrowingStepStopsNothing),
+   ("anUnsettledPostHoldsTheJob", anUnsettledPostHoldsTheJob),
+   ("aForgedMarkerIsIgnored", aForgedMarkerIsIgnored),
    ("transactionsTakeTheWriteLock", transactionsTakeTheWriteLock)]
 
 end DiffReviewerTest.Safety

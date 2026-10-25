@@ -37,6 +37,10 @@ structure FakeGitHub where
   /-- Whether listing the reviews fails. -/
   listFails : IO.Ref Bool
   diffText  : IO.Ref String
+  /-- The login the fake's own posts are by. -/
+  reviewer  : IO.Ref String
+  /-- Reviews by others on the pull requests, listed after the platform's. -/
+  foreign   : IO.Ref (Array GitHub.PostedReview)
 
 /-- A diff whose new side of `A.lean` is lines 1 to 20. -/
 def sampleDiff : String :=
@@ -45,7 +49,8 @@ def sampleDiff : String :=
 def FakeGitHub.new (pulls : Array GitHub.Pull := #[]) : IO FakeGitHub := do
   return { pulls := ← IO.mkRef pulls, posted := ← IO.mkRef #[], diffCalls := ← IO.mkRef 0
          , outcome := ← IO.mkRef .ok, listFails := ← IO.mkRef false
-         , diffText := ← IO.mkRef sampleDiff }
+         , diffText := ← IO.mkRef sampleDiff, reviewer := ← IO.mkRef "chrisflav"
+         , foreign := ← IO.mkRef #[] }
 
 def FakeGitHub.client (f : FakeGitHub) : GitHub.Client where
   listOpenPulls _ _ := return .ok (← f.pulls.get)
@@ -58,8 +63,10 @@ def FakeGitHub.client (f : FakeGitHub) : GitHub.Client where
     return .ok (← f.diffText.get)
   listReviews _ _ n := do
     if ← f.listFails.get then return .error (.indefinite "GitHub answered 503")
-    return .ok (((← f.posted.get).filter (·.1 == n)).mapIdx fun i (_, r, _, _) =>
-      { id := i, body := r.body, url := s!"https://github.example/review/{i}" })
+    let author ← f.reviewer.get
+    let own := ((← f.posted.get).filter (·.1 == n)).mapIdx fun i (_, r, _, _) =>
+      { id := i, body := r.body, url := s!"https://github.example/review/{i}", author }
+    return .ok (own ++ (← f.foreign.get))
   postReview _ _ n review commit event := do
     let record := do
       f.posted.modify (·.push (n, review, commit, event))

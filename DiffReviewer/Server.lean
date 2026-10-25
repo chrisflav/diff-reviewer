@@ -138,14 +138,17 @@ structure State where
   loginGlobal : IO.Ref Lockout
   /-- The current epoch second; replaced in the suite. -/
   clock : IO Int := nowEpoch
+  /-- Sleep this many milliseconds; replaced in the suite. -/
+  sleep : Nat → IO Unit := fun ms => IO.sleep ms.toUInt32
 
 def State.new (cfg : Config) (services : Option Workers.Services := none)
-    (clock : IO Int := nowEpoch) : IO State := do
+    (clock : IO Int := nowEpoch) (sleep : Nat → IO Unit := fun ms => IO.sleep ms.toUInt32) :
+    IO State := do
   let services ← match services with
     | some s => pure s
     | none => Workers.Services.new
   return { cfg, sessions := ← IO.mkRef #[], services, loginByAddress := ← IO.mkRef #[]
-         , loginGlobal := ← IO.mkRef {}, clock }
+         , loginGlobal := ← IO.mkRef {}, clock, sleep }
 
 def sessionCookieName : String := "diff_reviewer_session"
 
@@ -208,9 +211,13 @@ def agentAuthenticated (st : State) (r : Req) : Bool :=
     refused. -/
 def loginFailureLimit : Nat := 5
 
-/-- Failed logins allowed from all addresses together: a ceiling for a guess spread over many
-    addresses, high enough that one address cannot lock the operator out by itself. -/
+/-- Failed logins from all addresses together within the window past which every attempt is slowed
+    by `loginGlobalDelayMs`: a guess spread over many addresses is slowed down, and the operator,
+    from an address of their own, is slowed too but never refused. -/
 def loginGlobalLimit : Nat := 100
+
+/-- The delay every login attempt takes while past `loginGlobalLimit`, in milliseconds. -/
+def loginGlobalDelayMs : Nat := 2000
 
 def loginWindowSeconds : Int := 900
 
@@ -235,12 +242,41 @@ def Lockout.fail (l : Lockout) (now : Int) (limit : Nat) : Lockout :=
 private def Lockout.expired (l : Lockout) (now : Int) : Bool :=
   l.lockedUntil ≤ now && l.failures.all (· ≤ now - loginWindowSeconds)
 
+/-- The groups of an IPv6 address, all eight, or `none` if it is not one. -/
+def ipv6Groups (a : String) : Option (List String) := do
+  let parts := a.splitOn "::"
+  let split (s : String) : List String := if s.isEmpty then [] else s.splitOn ":"
+  let groups ← match parts with
+    | [whole] => pure (split whole)
+    | [h, t] =>
+      let (h, t) := (split h, split t)
+      guard (h.length + t.length < 8)
+      pure (h ++ List.replicate (8 - h.length - t.length) "0" ++ t)
+    | _ => none
+  guard (groups.length == 8 && groups.all fun g =>
+    !g.isEmpty && g.length ≤ 4 &&
+      g.all (fun c => c.isDigit || ('a' ≤ c.toLower && c.toLower ≤ 'f')))
+  return groups.map fun g =>
+    let g := (g.toLower.dropWhile (· == '0')).toString
+    if g.isEmpty then "0" else g
+
+/-- The key failed logins are counted under for `addr`: an IPv4 address as it is (an IPv4-mapped
+    IPv6 one as its IPv4 address), an IPv6 address as its /64 — what one subscriber holds, and can
+    pick any address of for each guess. -/
+def addressKey (addr : String) : String :=
+  let last := (addr.splitOn ":").getLast!
+  if addr.contains ':' && last.contains '.' then last
+  else match ipv6Groups addr with
+    | some gs => ":".intercalate (gs.take 4) ++ "::/64"
+    | none => addr
+
 /-- The client a request is from: the last address of `X-Forwarded-For` when the request comes
     from the trusted proxy — the one that proxy added — and otherwise the socket's peer. A header
-    from anyone else is ignored, or any client could claim a fresh address for every guess. -/
+    from anyone else is ignored, or any client could claim a fresh address for every guess. The
+    answer is the address's `addressKey`. -/
 def clientAddress (st : State) (r : Req) : String :=
   let peer := r.peer.getD "unknown"
-  if st.cfg.trustedProxy == some peer then
+  addressKey <| if st.cfg.trustedProxy == some peer then
     match (r.header "x-forwarded-for").bind fun h =>
         ((h.splitOn ",").map (·.trimAscii.toString)).filter (!·.isEmpty) |>.getLast? with
     | some a => a
@@ -251,12 +287,20 @@ def clientAddress (st : State) (r : Req) : String :=
 private def loginWait (st : State) (addr : String) : IO (Option Int) := do
   let now ← st.clock
   let mine := ((← st.loginByAddress.get).find? (·.1 == addr)).map (·.2)
-  let waits := [mine.bind (·.wait now), (← st.loginGlobal.get).wait now].filterMap id
-  return waits.max?
+  return mine.bind (·.wait now)
+
+/-- Slow the attempt down while all addresses together are past `loginGlobalLimit`. -/
+private def loginThrottle (st : State) : IO Unit := do
+  let now ← st.clock
+  let recent := (← st.loginGlobal.get).failures.filter (· > now - loginWindowSeconds)
+  if recent.size ≥ loginGlobalLimit then st.sleep loginGlobalDelayMs
 
 private def loginFailed (st : State) (addr : String) : IO Unit := do
   let now ← st.clock
-  st.loginGlobal.modify (·.fail now loginGlobalLimit)
+  -- Only whether the window holds `loginGlobalLimit` failures matters, so no more are kept.
+  st.loginGlobal.modify fun l =>
+    let l := l.fail now loginGlobalLimit
+    { l with failures := l.failures.extract (l.failures.size - loginGlobalLimit) l.failures.size }
   st.loginByAddress.modify fun t =>
     let mine := ((t.find? (·.1 == addr)).map (·.2)).getD {}
     let rest := (t.filter fun (a, l) => a != addr && !l.expired now)
@@ -387,6 +431,7 @@ private def putReview (id body : String) : IO Reply := do
   if let .error e := review.validate then return .error s!"'review': {e}" .badRequest
   updateReply <$> Platform.updateJob id fun job => do
     let st ← current job version
+    if let some why := job.claimBlocks then throw (.conflict why)
     unless st.personCanEdit do
       throw (.conflict s!"job {id} is {st.toString}; its review is not edited now")
     if let some (.error e) := job.review? then
@@ -406,6 +451,7 @@ private def setStatus (id body : String) : IO Reply := do
     | return .error "'status' must be approved, rejected, stale, draft or pending" .badRequest
   updateReply <$> Platform.updateJob id fun job => do
     let st ← current job version
+    if let some why := job.claimBlocks then throw (.conflict why)
     unless st.personCanMove to do
       throw (.conflict s!"job {id} is {st.toString} and cannot be made {to.toString} from here")
     if to == .approved then
@@ -671,6 +717,7 @@ def route (st : State) (r : Req) : IO Reply := do
     let some p := supplied
       | return .error "expected a JSON body of the form {\"password\": \"…\"}" .badRequest
     let addr := clientAddress st r
+    loginThrottle st
     if let some wait ← loginWait st addr then
       return { Reply.error s!"too many failed logins; try again in {wait} seconds"
                  .tooManyRequests with

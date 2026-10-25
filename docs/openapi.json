@@ -50,7 +50,7 @@
             "$ref": "#/components/responses/Error"
           }
         },
-        "description": "Failed attempts are counted per client address — the socket's peer, or, for a request from the proxy `--trusted-proxy` names, the last address of its `X-Forwarded-For`. After 5 failures from one address within 15 minutes every attempt from it, right or wrong, is a `429` for a delay that starts at 15 seconds and doubles with each further failure (at most 15 minutes); after 100 from all addresses together, every attempt is. `Retry-After` says how long. A success clears its address's count."
+        "description": "Failed attempts are counted per client address — an IPv6 client per /64 — the socket's peer, or, for a request from the proxy `--trusted-proxy` names, the last address of its `X-Forwarded-For`. After 5 failures from one address within 15 minutes every attempt from it, right or wrong, is a `429` for a delay that starts at 15 seconds and doubles with each further failure (at most 15 minutes); `Retry-After` says how long. After 100 failures from all addresses together every attempt is delayed by 2 seconds, and none is refused for it. A success clears its address's count."
       }
     },
     "/api/logout": {
@@ -376,7 +376,7 @@
       ],
       "put": {
         "summary": "Replace a job's review",
-        "description": "The body is `{\"version\": n, \"review\": {...}}`. Allowed while the job is `pending`, `draft`, `approved` or `rejected` (`409` otherwise: the agent may still be writing it, or it is history), and makes it a `draft`: an approval was of the review as it was. Each comment must name a file and lines `1 ≤ start_line ≤ end_line`, and say something.",
+        "description": "The body is `{\"version\": n, \"review\": {...}}`. Allowed while the job is `pending`, `draft`, `approved` or `rejected` (`409` otherwise: the agent may still be writing it, or it is history), and makes it a `draft`: an approval was of the review as it was. Each comment must name a file and lines `1 ≤ start_line ≤ end_line`, and say something. `409` while a post of the job may have reached GitHub (`postStartedAt` is set).",
         "operationId": "putReview",
         "requestBody": {
           "required": true,
@@ -442,7 +442,7 @@
       ],
       "post": {
         "summary": "Make a person's decision on a job",
-        "description": "A person's moves only: `draft → approved | rejected | stale`, `approved → draft`, `rejected → draft`, and `failed → pending` to run the review again (which clears `queueEntry` and `error`; the next attempt is queued under a new orchestra `external_id`). Queueing, running, the agent's draft and posting are the platform's own, and no request makes them — posting is asked for with `POST /api/v1/jobs/{id}/post`. Any other move is a `409`, and so is approving a job without a readable review.",
+        "description": "A person's moves only: `draft → approved | rejected | stale`, `approved → draft`, `rejected → draft`, and `failed → pending` to run the review again (which clears `queueEntry` and `error`; the next attempt is queued under a new orchestra `external_id`). Queueing, running, the agent's draft and posting are the platform's own, and no request makes them — posting is asked for with `POST /api/v1/jobs/{id}/post`. Any other move is a `409`, and so is approving a job without a readable review. `409` while a post of the job may have reached GitHub (`postStartedAt` is set).",
         "operationId": "setJobStatus",
         "requestBody": {
           "required": true,
@@ -515,7 +515,7 @@
       ],
       "post": {
         "summary": "Post an approved review to GitHub",
-        "description": "Posts the job's review to its pull request — submitted, pinned to `headSha` with every comment on the right-hand side, its body ending in the marker `<!-- diff-reviewer job <id> -->` — and then marks the job `posted`. The event is the review's decision, except on a pull request the operator (`DIFF_REVIEWER_GITHUB_LOGIN`) wrote, where an approval or a request for changes is posted as a comment and `postNote` says so. The job must be `approved` and at the `version` named, its review valid and its comments on the diff (`409` otherwise). Posting is claimed first (`postStartedAt`); a claim less than two minutes old is a `409`, as a post that may still be under way. When the outcome is unknown — a claim an earlier attempt left, no answer from GitHub, a `5xx` — the pull request's reviews are searched for the marker, and a review found is recorded rather than posted again. If GitHub refuses, or nothing was posted, the job stays `approved` with the reason in its `error` (a `502` that carries the job), so it can be posted again. `503` when the platform has no GitHub token.",
+        "description": "Posts the job's review to its pull request — submitted, pinned to `headSha` with every comment on the right-hand side, its body ending in the marker `<!-- diff-reviewer job <id> -->` — and then marks the job `posted`, recording GitHub's id, URL and body of the review in `postedReview`. The event is the review's decision, except on a pull request the operator (`DIFF_REVIEWER_GITHUB_LOGIN`) wrote, where an approval or a request for changes is posted as a comment and `postNote` says so. The job must be `approved` and at the `version` named, its review valid and its comments on the diff (`409` otherwise). Posting is claimed (`postStartedAt`) immediately before the request to GitHub; a claim less than three times that request's timeout old is a `409`, as a post that may still be under way. An older claim is settled first: the pull request's reviews by the operator are searched for the marker, and a review found is recorded rather than posted again. A `4xx` from GitHub clears the claim and leaves the job `approved` with the reason in `error` (a `502` that carries the job). No answer or a `5xx` keeps the claim, even when the review is not found yet, so the next attempt looks again before posting. `503` when the platform has no GitHub token.",
         "operationId": "postJob",
         "requestBody": {
           "required": true,
@@ -1032,7 +1032,8 @@
           "attempts",
           "postStartedAt",
           "postedUrl",
-          "postNote"
+          "postNote",
+          "postedReview"
         ],
         "properties": {
           "id": {
@@ -1143,7 +1144,7 @@
               "null"
             ],
             "format": "date-time",
-            "description": "When posting last began, while its outcome is not known: the claim that keeps the review from being posted twice."
+            "description": "When posting last began, while its outcome is not known: the claim that keeps the review from being posted twice. While it is set the job cannot leave `approved`, have its review edited or be made `stale` (`409`); posting it again settles it."
           },
           "postedUrl": {
             "type": [
@@ -1158,6 +1159,29 @@
               "null"
             ],
             "description": "How the review was posted when that differs from its decision: in `direct` mode, or on a pull request the operator wrote, an approval or request for changes is posted as a comment."
+          },
+          "postedReview": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "The review as GitHub holds it, once posted: what was posted, which after a post whose outcome was unknown is GitHub's record rather than the job's own review.",
+            "required": [
+              "id",
+              "url",
+              "body"
+            ],
+            "properties": {
+              "id": {
+                "type": "integer"
+              },
+              "url": {
+                "type": "string"
+              },
+              "body": {
+                "type": "string"
+              }
+            }
           }
         }
       },

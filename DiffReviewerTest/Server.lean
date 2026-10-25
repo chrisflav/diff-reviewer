@@ -214,7 +214,8 @@ def whatThisBuildCannotReadIsKept : Test := do
        , status := "escalated", queue_entry := none, review := some odd, version := 1
        , created_at := j.createdAt, updated_at := j.updatedAt, base_sha := none, title := none
        , pr_body := none, error := none, pr_type := none, attempts := none
-       , post_started_at := none, posted_url := none, post_note := none } : Store.JobRow)
+       , post_started_at := none, posted_url := none, post_note := none, posted_review := none }
+       : Store.JobRow)
     let read ← route st (req .get s!"/api/v1/jobs/{id}")
     let write ← route st (req .post s!"/api/v1/jobs/{id}/status" (statusBody "rejected" 1))
     let edit ← route st (req .put s!"/api/v1/jobs/{id}/review" (reviewBody 1 fine))

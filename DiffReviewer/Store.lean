@@ -70,6 +70,9 @@ structure JobRow where
   /-- How the review was posted, when that differs from what it says — a decision posted as a
       comment (`0002`). -/
   post_note : Option String
+  /-- The review as GitHub holds it, `{"id", "url", "body"}`: what was posted, which after a
+      reconciliation may not be the job's own review (`0002`). -/
+  posted_review : Option String
   deriving Repr
 
 /-- The diff of a pull request at one head commit, as GitHub gave it. A commit's diff never
@@ -131,6 +134,7 @@ def migration0002 : Db.Migration.Migration where
     .addColumn "review_job" "post_started_at" { type := .text, nullable := true },
     .addColumn "review_job" "posted_url" { type := .text, nullable := true },
     .addColumn "review_job" "post_note" { type := .text, nullable := true },
+    .addColumn "review_job" "posted_review" { type := .text, nullable := true },
     .createTable "pull_diff"
       { columns := .ofList
           [("owner", { type := .text, nullable := false }),

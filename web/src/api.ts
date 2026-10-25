@@ -91,6 +91,8 @@ export interface Job {
   postedUrl: string | null;
   /** How the review was posted, when that differs from its decision. */
   postNote: string | null;
+  /** The review as GitHub holds it, once posted. */
+  postedReview: { id: number; url: string; body: string } | null;
 }
 
 /** Thrown when the server could not be reached at all. */

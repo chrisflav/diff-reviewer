@@ -50,16 +50,25 @@ def Pull.ofJson (j : Json) : Except String Pull := do
 
 /-- A review on a pull request, as the platform looks for its own among them. -/
 structure PostedReview where
-  id   : Nat
-  body : String
-  url  : String
+  id     : Nat
+  body   : String
+  url    : String
+  /-- The login of the review's author. -/
+  author : String := ""
   deriving Repr, BEq
 
 def PostedReview.ofJson (j : Json) : Except String PostedReview := do
   let id ← j.getObjValAs? Nat "id"
   let body := (j.getObjValAs? String "body").toOption.getD ""
   let url := (j.getObjValAs? String "html_url").toOption.getD ""
-  return { id, body, url }
+  let author := ((j.getObjVal? "user").bind (·.getObjValAs? String "login")).toOption.getD ""
+  return { id, body, url, author }
+
+def PostedReview.toJson (r : PostedReview) : Json :=
+  .mkObj [("id", r.id), ("url", r.url), ("body", r.body)]
+
+/-- Seconds before a request to GitHub is given up. -/
+def requestTimeout : Nat := 60
 
 /-- Why a GitHub request did not do what it was for. The difference between the first two is what
     posting turns on: after a `definite` failure nothing was posted, after an `indefinite` one
@@ -161,7 +170,7 @@ def Client.curl (token : String) (api : String) (maxDiffBytes : Nat := defaultMa
                     ("X-GitHub-Api-Version", "2022-11-28"), ("User-Agent", "diff-reviewer")] ++
       (if body.isSome then [("Content-Type", "application/json")] else [])
     match ← Http.send { method, url := api ++ path, headers, body := body.map (·.compress)
-                      , maxBytes } with
+                      , maxBytes, timeout := requestTimeout } with
     | .error (.refused why) => return .error (.definite why)
     -- 63: curl's "maximum file size exceeded".
     | .error (.noAnswer _ 63) => return .error (.tooLarge maxDiffBytes)

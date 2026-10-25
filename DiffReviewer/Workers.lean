@@ -31,12 +31,23 @@ submission does for a `direct` repository.
 ## Posting once
 
 A review posted twice under the operator's name cannot be taken back, and a request can time out
-after GitHub has acted on it. So posting is claimed in the database first (`post_started_at`, set
-only on an `approved` job without a recent claim), the posted body carries the marker
-`<!-- diff-reviewer job <id> -->`, and whenever the outcome is unknown — a claim left by an
-earlier attempt, no answer, a `5xx` — the pull request's reviews are searched for the marker
-before anything is posted again. Only a definite refusal (a `4xx`) leaves the job plainly to be
-posted again.
+after GitHub has acted on it. So:
+
+  * posting is claimed in the database (`post_started_at`) immediately before the one request
+    made under the claim, the post. The claim is taken in a `BEGIN IMMEDIATE` transaction that
+    requires the job still `approved`, at the version read and with the claim read, so of any
+    number of processes on one database that read the same job, at most one claims it.
+  * a claim younger than `postClaimSeconds` — three times the post's timeout — is never taken
+    over, so a claim is taken over only once the request made under it has certainly ended.
+  * the posted body carries the marker `<!-- diff-reviewer job <id> -->`, and an older claim is
+    settled before anything is posted again: the pull request's reviews by the operator
+    (`DIFF_REVIEWER_GITHUB_LOGIN`) are searched for the marker, and a review found is recorded
+    as posted — GitHub's id, URL and body.
+  * only a definite refusal (a `4xx`) clears the claim. No answer, or a `5xx`, keeps it, even when
+    the review is not to be found yet.
+  * while a claim stands, the job cannot leave `approved`, have its review edited or be made
+    `stale` (`Job.claimBlocks`): what it says is what may have been posted. Posting it again
+    settles the claim.
 
 Only a person's `POST /api/v1/jobs/{id}/post` posts an approval or a request for changes. A
 `direct` repository's review is always posted as a comment, and so is any review of a pull request
@@ -64,9 +75,10 @@ structure Limits where
   /-- Days a fetched diff is kept at most. -/
   diffRetentionDays : Nat := 30
   /-- How long a claim to post is taken to be a post still in flight, perhaps from another
-      process; past it, the claim is an attempt whose outcome must be checked. More than curl's
-      timeout. -/
-  postClaimSeconds : Nat := 120
+      process; past it, the claim is an attempt whose outcome must be checked. Three times the
+      timeout of the one request made under the claim, the post itself: nothing else is done
+      while it is held. -/
+  postClaimSeconds : Nat := 3 * GitHub.requestTimeout
 
 structure Services where
   github    : Option GitHub.Client
@@ -225,11 +237,19 @@ def marker (id : String) : String := s!"<!-- diff-reviewer job {id} -->"
 def withMarker (id : String) (r : Review) : Review :=
   { r with body := if r.body.isEmpty then marker id else r.body ++ "\n\n" ++ marker id }
 
-/-- The review of job `id` already on the pull request, if there is one. -/
-private def findPosted (gh : GitHub.Client) (job : Job) :
+/-- The review of job `id` already on the pull request, if there is one: one carrying its marker,
+    by the operator. Anyone may write the marker into a review of their own; with
+    `DIFF_REVIEWER_GITHUB_LOGIN` unset there is no telling theirs from the platform's, which is
+    said once. -/
+private def findPosted (s : Services) (gh : GitHub.Client) (job : Job) :
     IO (Except GitHub.Error (Option GitHub.PostedReview)) := do
+  if s.limits.githubLogin.isNone then
+    s.logOnce "forged-markers" "DIFF_REVIEWER_GITHUB_LOGIN is not set: a review somebody else \
+wrote with a job's marker in it cannot be told from the platform's own"
+  let byOperator (r : GitHub.PostedReview) : Bool :=
+    s.limits.githubLogin.all (·.toLower == r.author.toLower)
   return (← gh.listReviews job.owner job.name job.prNumber).map fun rs =>
-    rs.find? fun r => (r.body.splitOn (marker job.id)).length > 1
+    rs.find? fun r => byOperator r && (r.body.splitOn (marker job.id)).length > 1
 
 /-- What a review is posted as, and why, when that is not its own decision. -/
 def postedEvent (direct : Bool) (decision : Decision) (author login : Option String) :
@@ -248,11 +268,11 @@ does not let its author approve it or request changes")
     its comments are checked against the diff first. `direct` posts it as a comment, whatever its
     decision.
 
-    See "Posting once" above: the claim is written before GitHub is asked, the body carries the
-    marker, and an unknown outcome is settled by looking for the marker. If GitHub refuses, the job
-    stays `approved` with the reason in its `error`, so that it can be posted again. Once GitHub
-    has the review the job is `posted` whatever happened to it meanwhile — that is now what
-    happened — with the review that was posted. -/
+    See "Posting once" above: an earlier claim is settled first, the claim is written just before
+    GitHub is asked, the body carries the marker, and an unknown outcome is settled by looking for
+    the marker. If GitHub refuses, the job stays `approved` with the reason in its `error`, so that
+    it can be posted again. Once GitHub has the review the job is `posted`, with GitHub's record of
+    what was posted. -/
 def postJob (s : Services) (id : String) (version : Option Nat := none) (direct := false) :
     IO (Except PostError Job) := do
   let claimed ← s.posting.modifyGet fun ids =>
@@ -276,59 +296,68 @@ def postJob (s : Services) (id : String) (version : Option Nat := none) (direct 
     if let .ok (_, d) ← diffOf s job then
       if let .error e := Diff.check review d then
         return .error (.conflict s!"job {id}'s review would be refused by GitHub: {e}")
-    -- A claim an earlier attempt left: it may have posted.
-    let earlier := job.postStartedAt.isSome
-    -- The claim, in the same transaction as the check that the job is still what was read.
-    let now ← nowEpoch
-    let recent := isoOfEpoch (now - s.limits.postClaimSeconds)
-    let claim ← Platform.updateJob id fun j => do
-      unless j.status? == some .approved do
-        throw (.conflict s!"job {id} is {j.statusRaw}; only an approved review is posted")
-      if let some v := version then
-        unless j.version == v do throw (.conflict s!"job {id} has changed since it was read")
-      if let some t := j.postStartedAt then
-        if t > recent then
-          throw (.conflict s!"posting job {id} began at {t} and may still be under way; try \
-again in a few minutes")
-      return { j with postStartedAt := some (isoOfEpoch now) }
-    let job ← match claim with
-      | .ok j => pure j
-      | .error .notFound => return .error .notFound
-      | .error (.conflict why) | .error (.invalid why) => return .error (.conflict why)
-    let author ← if s.limits.githubLogin.isNone || direct then pure none else
-      pure ((← gh.getPull job.owner job.name job.prNumber).toOption.map (·.author))
-    let (event, note) := postedEvent direct review.decision author s.limits.githubLogin
-    let markPosted (r : GitHub.PostedReview) : IO (Except PostError Job) := do
+    let markPosted (r : GitHub.PostedReview) (note : Option String) :
+        IO (Except PostError Job) := do
       s.log s!"posted the review of {job.owner}/{job.name}#{job.prNumber} (job {id}): {r.url}"
+      -- What GitHub holds is the record; the job's review is left as it is, which the claim kept
+      -- from being edited meanwhile.
       match ← Platform.updateJob id fun j =>
-          return { j.setReview review with statusRaw := JobStatus.posted.toString, error := none
-                                           postStartedAt := none, postedUrl := some r.url
-                                           postNote := note }
+          return { j with statusRaw := JobStatus.posted.toString, error := none
+                          postStartedAt := none, postedUrl := some r.url
+                          postedReview := some r.toJson.compress, postNote := note }
       with
       | .ok j => return .ok j
       | .error _ => return .error .notFound
     -- Leave the job to be posted again, with why; `keepClaim` while whether it was posted is
-    -- still unknown, so that the next attempt looks before it posts.
+    -- still unknown, so that the next attempt waits out the claim and looks before it posts.
     let failed (why : String) (keepClaim : Bool) : IO (Except PostError Job) := do
       let recorded ← Platform.updateJob id fun j =>
         return { j with error := some why
                         postStartedAt := if keepClaim then j.postStartedAt else none }
       return .error (.github why (match recorded with | .ok j => j | .error _ => job))
-    if earlier then
-      match ← findPosted gh job with
-      | .ok (some r) => return ← markPosted r
+    -- A claim an earlier attempt left. Recent, it may be a post still under way; older, its
+    -- outcome is settled before anything else is done.
+    if let some t := job.postStartedAt then
+      let recent := isoOfEpoch ((← nowEpoch) - s.limits.postClaimSeconds)
+      if t > recent then
+        return .error (.conflict s!"posting job {id} began at {t} and may still be under way; \
+try again in a few minutes")
+      match ← findPosted s gh job with
+      | .ok (some r) =>
+        return ← markPosted r (some "found on GitHub after an attempt whose outcome was unknown")
       | .ok none => pure ()
       | .error e =>
         return ← failed s!"an earlier attempt to post may have succeeded, and GitHub's reviews \
 could not be read to tell ({e.message})" true
+    let author ← if s.limits.githubLogin.isNone || direct then pure none else
+      pure ((← gh.getPull job.owner job.name job.prNumber).toOption.map (·.author))
+    let (event, note) := postedEvent direct review.decision author s.limits.githubLogin
+    -- The claim, taken last, so that the post is the only thing done under it: in one
+    -- transaction with the checks that the job is still approved, at the version read, and its
+    -- claim the one read — so of two processes that read the same job, one claims it.
+    let now ← nowEpoch
+    let claim ← Platform.updateJob id fun j => do
+      unless j.status? == some .approved do
+        throw (.conflict s!"job {id} is {j.statusRaw}; only an approved review is posted")
+      unless j.version == job.version && j.postStartedAt == job.postStartedAt do
+        throw (.conflict s!"job {id} changed while it was being posted; reload it")
+      return { j with postStartedAt := some (isoOfEpoch now) }
+    if let .error e := claim then
+      return .error (match e with
+        | .notFound => .notFound
+        | .conflict why | .invalid why => .conflict why)
     match ← gh.postReview job.owner job.name job.prNumber (withMarker id review) (some head)
         (some event) with
-    | .ok r => markPosted r
+    | .ok r => markPosted r note
     | .error (.definite why) => failed s!"posting failed: {why}" false
     | .error e =>
-      match ← findPosted gh job with
-      | .ok (some r) => markPosted r
-      | .ok none => failed s!"posting failed: {e.message}" false
+      -- No answer, or a 5xx: the review may yet appear. The claim is kept either way, until it is
+      -- found or a later attempt, past the claim's window, has looked and not found it.
+      match ← findPosted s gh job with
+      | .ok (some r) => markPosted r note
+      | .ok none =>
+        failed s!"posting may have failed ({e.message}); it is looked for again before the next \
+attempt" true
       | .error e2 =>
         failed s!"posting may have failed ({e.message}); GitHub's reviews could not be read to \
 tell ({e2.message}), and are looked at before the next attempt" true
@@ -369,6 +398,7 @@ def retire (s : Services) (job : Job) (to : JobStatus) (why : String) : IO Unit 
         s.log s!"cancelling entry {entry} of job {job.id}: {e}"
   let _ ← Platform.updateJob job.id fun j => do
     unless j.statusRaw == job.statusRaw do throw (.conflict "moved on")
+    if let some why := j.claimBlocks then throw (.conflict why)
     return { j with statusRaw := to.toString, error := some why }
   s.log s!"job {job.id} is {to.toString}: {why}"
 
@@ -406,6 +436,8 @@ heads wait"
           let some sha := old.headSha | continue
           if sha == p.headSha then continue
           unless old.status?.any (supersedable.contains ·) do continue
+          -- A post of it may have reached GitHub: left until that is settled.
+          if old.claimBlocks.isSome then continue
           retire s old .stale s!"the pull request moved on to {p.headSha}"
 
 /-- Orchestra's id for attempt `attempts` at job `id`: the id itself for the first, so that it is

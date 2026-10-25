@@ -177,12 +177,21 @@ structure Job where
   postedUrl  : Option String := none
   /-- How the review was posted, when that differs from what it says. -/
   postNote   : Option String := none
+  /-- The review as GitHub holds it, `{"id", "url", "body"}`, once posted. -/
+  postedReview : Option String := none
 
 def Job.status? (j : Job) : Option JobStatus := JobStatus.ofString? j.statusRaw
 
 /-- The review, `none` when there is none, and an error when the stored one does not parse. -/
 def Job.review? (j : Job) : Option (Except String Review) :=
   j.reviewRaw.map Review.ofJsonString
+
+/-- Why job `j` may not leave `approved`, have its review replaced or be made `stale` now: a post
+    of it may have reached GitHub, and until that is known, what it says is what was posted. -/
+def Job.claimBlocks (j : Job) : Option String :=
+  j.postStartedAt.map fun t =>
+    s!"a post of job {j.id} (begun {t}) may have reached GitHub; it is being checked — post it \
+again (POST /api/v1/jobs/{j.id}/post) to settle it"
 
 def Job.setReview (j : Job) (r : Review) : Job :=
   { j with reviewRaw := some r.toJson.compress }
@@ -204,7 +213,8 @@ def Job.toJson (j : Job) : Json :=
     ("baseSha", optStr j.baseSha), ("title", optStr j.title), ("prBody", optStr j.prBody),
     ("error", optStr j.error), ("prType", optStr j.prType), ("attempts", j.attempts),
     ("postStartedAt", optStr j.postStartedAt), ("postedUrl", optStr j.postedUrl),
-    ("postNote", optStr j.postNote)]
+    ("postNote", optStr j.postNote),
+    ("postedReview", (j.postedReview.bind (Json.parse · |>.toOption)).getD .null)]
 
 private def Job.ofRow (row : Store.JobRow) : Job :=
   { id := row.id, owner := row.owner, name := row.name, prNumber := row.pr_number.toNat
@@ -213,7 +223,8 @@ private def Job.ofRow (row : Store.JobRow) : Job :=
   , createdAt := row.created_at, updatedAt := row.updated_at
   , baseSha := row.base_sha, title := row.title, prBody := row.pr_body, error := row.error
   , prType := row.pr_type, attempts := (row.attempts.getD 0).toNat
-  , postStartedAt := row.post_started_at, postedUrl := row.posted_url, postNote := row.post_note }
+  , postStartedAt := row.post_started_at, postedUrl := row.posted_url, postNote := row.post_note
+  , postedReview := row.posted_review }
 
 private def Job.toRow (j : Job) : Store.JobRow :=
   { id := j.id, owner := j.owner, name := j.name, pr_number := j.prNumber
@@ -222,7 +233,8 @@ private def Job.toRow (j : Job) : Store.JobRow :=
   , created_at := j.createdAt, updated_at := j.updatedAt
   , base_sha := j.baseSha, title := j.title, pr_body := j.prBody, error := j.error
   , pr_type := j.prType, attempts := some j.attempts
-  , post_started_at := j.postStartedAt, posted_url := j.postedUrl, post_note := j.postNote }
+  , post_started_at := j.postStartedAt, posted_url := j.postedUrl, post_note := j.postNote
+  , posted_review := j.postedReview }
 
 /-- The largest pull request number accepted: what fits a 32-bit column with room to spare. -/
 def maxPrNumber : Nat := 2147483647

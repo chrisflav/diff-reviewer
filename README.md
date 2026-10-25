@@ -29,10 +29,14 @@ It is built in milestones. The first two are here:
   as a comment.
 - **Posting** (`POST /api/v1/jobs/{id}/post`): an approved review is posted to the pull request
   under the operator's GitHub account, pinned to the job's head commit, as its decision. Only this
-  route, a person's, ever approves or requests changes. A review is posted once: the attempt is
-  claimed in the database first, the posted body carries a marker
-  (`<!-- diff-reviewer job <id> -->`), and when GitHub's answer is lost the pull request's
-  reviews are searched for it before anything is posted again.
+  route, a person's, ever approves or requests changes. A review is posted once, even with several
+  processes on one database: the attempt is claimed in the database just before the post (in a
+  `BEGIN IMMEDIATE` transaction, so one process claims it), a claim is never taken over within
+  three times the post's timeout, and the posted body carries a marker
+  (`<!-- diff-reviewer job <id> -->`). When GitHub's answer is lost or is a `5xx`, the claim
+  stands — the job cannot leave `approved`, be edited or go stale — until a later attempt has
+  searched the pull request's reviews by the operator for the marker; a review found is recorded
+  as GitHub holds it (`postedReview`) rather than posted again.
 - **A web front-end** (`web/`): sign in, register repositories, request a review, read a review,
   edit it, approve or reject it. Every write names the version of the job it was made on, so a
   stale page is refused rather than overwriting.
@@ -58,8 +62,8 @@ DIFF_REVIEWER_ORCHESTRA_TOKEN_FILE=/etc/diff-reviewer/orchestra-token \
 It listens on `127.0.0.1:8090` (`--host`, `--port`) and runs the workers every 60 seconds
 (`--interval`). The server is plain HTTP: put TLS in front of anything wider than loopback, pass
 `--secure-cookie`, and name the reverse proxy with `--trusted-proxy <ip>`: failed logins are
-counted per client address, which is the socket's peer unless the request comes from that proxy,
-when it is the last address of `X-Forwarded-For`. `--max-jobs-per-day` (default 50) bounds the
+counted per client address — an IPv6 client per /64 — which is the socket's peer unless the
+request comes from that proxy, when it is the last address of `X-Forwarded-For`. `--max-jobs-per-day` (default 50) bounds the
 jobs discovery makes per repository, and `--max-diff-bytes` (default 5242880) the diff reviewed.
 
 Releases (`v*` tags) attach a Linux x86_64 binary and its sha256 to the GitHub release; it runs on
@@ -74,11 +78,11 @@ ignored.
 
 | Variable | |
 | --- | --- |
-| `DIFF_REVIEWER_PASSWORD` | Required. What you sign in with, at least 12 characters. Accepted only by `POST /api/login`, which is rate-limited: after 5 failures from one address within 15 minutes every attempt from it is refused (`429`) for 15 seconds, doubling with each further failure; after 100 from all addresses together, every attempt is. |
+| `DIFF_REVIEWER_PASSWORD` | Required. What you sign in with, at least 12 characters. Accepted only by `POST /api/login`, which is rate-limited: after 5 failures from one address (an IPv6 /64) within 15 minutes every attempt from it is refused (`429`) for 15 seconds, doubling with each further failure; after 100 from all addresses together, every attempt is delayed by 2 seconds, and none refused. |
 | `DIFF_REVIEWER_API_TOKEN_FILE` | The bearer scripts send to `/api/v1/` (`Authorization: Bearer …`). Unset, only a signed-in browser reaches the API. |
 | `DIFF_REVIEWER_AGENT_TOKEN_FILE` | The bearer of `/api/agent/v1/`, and good for nothing else. Unset, the agent API refuses everything. kleis holds it, never the agent. |
 | `DIFF_REVIEWER_GITHUB_TOKEN_FILE` | The token for api.github.com: listing pull requests, reading one and its diff, posting reviews. Unset, there is no discovery, no diff and no posting. In production this is the placeholder `kleis` (see below). Also used by `diff-reviewer github`, which otherwise falls back to `gh auth token`. |
-| `DIFF_REVIEWER_GITHUB_LOGIN` | The GitHub login reviews are posted as. On a pull request it wrote, GitHub refuses an approval or a request for changes, so such a review is posted as a comment and the job's `postNote` says so. |
+| `DIFF_REVIEWER_GITHUB_LOGIN` | The GitHub login reviews are posted as. **Set it in production.** When a post's outcome is unknown, only reviews by this login count as the platform's: without it, anyone who writes a job's marker into a review of their own could make the platform record that job as posted (it logs this once). And on a pull request this login wrote, GitHub refuses an approval or a request for changes, so such a review is posted as a comment and the job's `postNote` says so. |
 | `DIFF_REVIEWER_GITHUB_API` | GitHub's API root, `https://api.github.com` by default. |
 | `DIFF_REVIEWER_ORCHESTRA_URL`, `DIFF_REVIEWER_ORCHESTRA_TOKEN_FILE` | Orchestra, and the platform's API client token on it. Without both, jobs stay `pending` (and the log says so once). Orchestra is always reached directly, never through `HTTPS_PROXY` (its host is curl's `noproxy`): the proxy is kleis, there for GitHub, and the orchestra token is not one kleis should see. Add the host to `NO_PROXY` too, for anything else in the environment. |
 | `HTTPS_PROXY`, `NO_PROXY`, `CURL_CA_BUNDLE`, `SSL_CERT_FILE` | Every outgoing request is made with `curl`, which reads these as usual (and no `~/.curlrc`: it runs with `-q`). Only `https` is used, or `http` to loopback. |
