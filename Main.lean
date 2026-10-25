@@ -7,8 +7,8 @@ private def usage : String :=
 
 USAGE:
   diff-reviewer github   <owner/repo> <pr-number> <review.json> [--submit]
-      Submit the review to a GitHub pull request via the gh CLI.
-      Requires gh to be authenticated (gh auth login).
+      Post the review to a GitHub pull request. The token is read from
+      $DIFF_REVIEWER_GITHUB_TOKEN_FILE, or else from `gh auth token`.
       By default the review is saved as a pending (draft) review.
       Pass --submit to publish it immediately.
 
@@ -17,10 +17,20 @@ USAGE:
       Review JSON to stdout.
 
   diff-reviewer serve [--db <path>] [--host <ip>] [--port <n>] [--site <dir>]
-                      [--secure-cookie]
-      Run the review platform: the HTTP API, and the front-end built into
-      <dir> (web/dist). The password is $DIFF_REVIEWER_PASSWORD. Defaults:
-      --db diff-reviewer.db, --host 127.0.0.1, --port 8090.
+                      [--secure-cookie] [--interval <seconds>]
+      Run the review platform: the HTTP API, the front-end built into <dir>
+      (web/dist), and the workers that find pull requests, queue reviews on
+      orchestra and follow them, every --interval seconds. Configured by the
+      environment; see the README. Defaults: --db diff-reviewer.db,
+      --host 127.0.0.1, --port 8090, --interval 60.
+
+  diff-reviewer agent show   <owner/repo> <pr-number>
+  diff-reviewer agent diff   <owner/repo> <pr-number>
+  diff-reviewer agent submit <owner/repo> <pr-number> <submission.json | ->
+      What a reviewing agent runs: the review it is to write, the diff under
+      review, and submitting the review. The platform's URL and token are in
+      ~/.config/diff-reviewer/agent.json ({\"url\": …, \"token\": …}), and
+      $DIFF_REVIEWER_URL and $DIFF_REVIEWER_TOKEN override them.
 "
 
 private def cmdGitHub (repo : String) (prStr : String) (jsonPath : String)
@@ -35,9 +45,23 @@ private def cmdGitHub (repo : String) (prStr : String) (jsonPath : String)
     IO.eprintln s!"error: could not parse review from {jsonPath}: {e}"
     IO.Process.exit 1
   | .ok review =>
-    match ← submitReview repo prNumber review pending with
-    | .ok ()   =>
+    let some (owner, name) := Agent.splitSlug repo
+      | IO.eprintln s!"error: '{repo}' is not owner/repo"
+        IO.Process.exit 1
+    let gh ← match ← GitHub.Client.fromEnv with
+      | some c => pure c
+      | none =>
+        -- Without a token file, the token `gh` is signed in with, as before there was a client.
+        let out ← try IO.Process.output { cmd := "gh", args := #["auth", "token"] }
+          catch _ => pure { exitCode := 1, stdout := "", stderr := "" }
+        if out.exitCode != 0 || out.stdout.trimAscii.isEmpty then
+          IO.eprintln "error: set DIFF_REVIEWER_GITHUB_TOKEN_FILE, or sign in with `gh auth login`"
+          IO.Process.exit 1
+        pure (GitHub.Client.curl out.stdout.trimAscii.toString (← GitHub.defaultApi))
+    match ← gh.postReview owner name prNumber review none pending with
+    | .ok url =>
       IO.println (if pending then "Review saved as pending." else "Review submitted successfully.")
+      unless url.isEmpty do IO.println url
     | .error e =>
       IO.eprintln s!"error: {e}"
       IO.Process.exit 1
@@ -69,25 +93,55 @@ private def serveFlags : List String → Except String (Server.Config → Server
   | "--secure-cookie" :: rest => do
     let f ← serveFlags rest
     return fun c => f { c with secureCookie := true }
+  | "--interval" :: v :: rest => do
+    let some n := v.toNat? | .error s!"--interval: '{v}' is not a number of seconds"
+    unless n ≥ 1 do .error "--interval must be at least 1 second"
+    let f ← serveFlags rest
+    return fun c => f { c with interval := n }
   | flag :: _ => .error s!"unknown flag '{flag}'"
+
+/-- The token in the file `var` names, if it is set. -/
+private def tokenFromEnv (var : String) : IO (Option String) := do
+  let some path ← IO.getEnv var | return none
+  let tok ← try Http.readTokenFile path
+    catch e =>
+      IO.eprintln s!"error: {var}: {e}"
+      IO.Process.exit 1
+  if tok.isEmpty then
+    IO.eprintln s!"error: {var}: {path} is empty"
+    IO.Process.exit 1
+  return some tok
 
 private def cmdServe (flags : List String) : IO Unit := do
   let some password ← IO.getEnv "DIFF_REVIEWER_PASSWORD"
     | IO.eprintln "error: set DIFF_REVIEWER_PASSWORD to the password the platform is to require"
       IO.Process.exit 1
-  if password.length < 12 then
-    IO.eprintln "error: DIFF_REVIEWER_PASSWORD is shorter than 12 characters"
-    IO.Process.exit 1
+  let apiToken ← tokenFromEnv "DIFF_REVIEWER_API_TOKEN_FILE"
+  let agentToken ← tokenFromEnv "DIFF_REVIEWER_AGENT_TOKEN_FILE"
   let cfg ← match serveFlags flags with
-    | .ok f => pure (f { password })
+    | .ok f => pure (f { password, apiToken, agentToken })
     | .error e =>
       IO.eprintln s!"error: {e}"
       IO.Process.exit 1
+  if let .error e := cfg.check then
+    IO.eprintln s!"error: {e}"
+    IO.Process.exit 1
+  let log (m : String) : IO Unit := IO.eprintln s!"diff-reviewer: {m}"
+  if apiToken.isNone then
+    log "no DIFF_REVIEWER_API_TOKEN_FILE: only a signed-in browser reaches /api/v1"
+  if agentToken.isNone then
+    log "no DIFF_REVIEWER_AGENT_TOKEN_FILE: the agent API refuses every request"
+  let github ← GitHub.Client.fromEnv
+  if github.isNone then
+    log "no DIFF_REVIEWER_GITHUB_TOKEN_FILE: no discovery, no diffs, no posting"
+  let services ← Workers.Services.new github (← Orchestra.Client.fromEnv) log
   Store.setPath cfg.dbPath
   -- Open (and migrate) the database before listening, so a bad path fails at start-up.
   let _ ← Platform.listRepos
-  let (port, _) ← Server.serve cfg
+  let (port, _) ← Server.serve cfg services
   IO.println s!"diff-reviewer: serving on http://{cfg.host}:{port} (database {cfg.dbPath})"
+  (← IO.getStdout).flush
+  Workers.start services cfg.interval
   -- The server runs on its own threads; this one only has to stay alive.
   repeat IO.sleep 3600000
 
@@ -97,6 +151,9 @@ def main (args : List String) : IO Unit := do
   | ["github", repo, prNumber, jsonPath, "--submit"] => cmdGitHub repo prNumber jsonPath false
   | ["from-git", range]                  => cmdFromGit range
   | "serve" :: flags                     => cmdServe flags
+  | ["agent", "show", repo, pr]          => IO.Process.exit (← Agent.showPull repo pr).toUInt8
+  | ["agent", "diff", repo, pr]          => IO.Process.exit (← Agent.printDiff repo pr).toUInt8
+  | ["agent", "submit", repo, pr, path]  => IO.Process.exit (← Agent.submit repo pr path).toUInt8
   | _ =>
     IO.print usage
     IO.Process.exit 1

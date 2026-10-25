@@ -2,8 +2,8 @@
   "openapi": "3.1.0",
   "info": {
     "title": "diff-reviewer platform API",
-    "version": "0.1.0",
-    "description": "The review platform: the repositories whose pull requests it reviews, and one review job per review. A job moves `pending → queued → running → draft → approved → posted`; `rejected` is a discarded draft and `stale` a draft whose pull request has moved on.\n\nEvery route under `/api/v1/` needs the platform's secret, as `Authorization: Bearer <secret>` or the session cookie `POST /api/login` sets. Every write under `/api/v1/` must be `application/json` (`415` otherwise). Every write to a job names the job's `version` as last read, and is a `409` if the job has changed since. A request the server fails on is a `500` whose reason goes to the server log; a method a route does not answer is a `405`. Collections answer `{\"items\": [...]}`. Instants are RFC 3339 in UTC; an absent value is `null`."
+    "version": "0.2.0",
+    "description": "The review platform: the repositories whose pull requests it reviews, and one review job per review. A job moves `pending → queued → running → draft → approved → posted`; `rejected` is a discarded draft, `stale` a draft whose pull request has moved on, and `failed` a run that ended without a review.\n\nThree credentials, none standing in for another. The password (`$DIFF_REVIEWER_PASSWORD`) is accepted only by `POST /api/login`, which sets the session cookie; failed logins are rate-limited (`429` with `Retry-After`). Every route under `/api/v1/` needs the session cookie or the API token (`$DIFF_REVIEWER_API_TOKEN_FILE`) as `Authorization: Bearer <token>`. Every route under `/api/agent/v1/` needs the agent token (`$DIFF_REVIEWER_AGENT_TOKEN_FILE`) as a bearer, and nothing else reaches it; an agent's requests go through kleis, which supplies it.\n\nEvery write must be `application/json` (`415` otherwise). Every write to a job under `/api/v1/` names the job's `version` as last read, and is a `409` if the job has changed since. A request the server fails on is a `500` whose reason goes to the server log; a method a route does not answer is a `405`. Collections answer `{\"items\": [...]}`. Instants are RFC 3339 in UTC; an absent value is `null`."
   },
   "security": [
     {
@@ -16,7 +16,7 @@
   "paths": {
     "/api/login": {
       "post": {
-        "summary": "Exchange the secret for a session cookie",
+        "summary": "Exchange the password for a session cookie",
         "security": [],
         "requestBody": {
           "required": true,
@@ -45,8 +45,12 @@
           },
           "401": {
             "$ref": "#/components/responses/Error"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error"
           }
-        }
+        },
+        "description": "After 5 failed attempts within 15 minutes every attempt, right or wrong, is a `429` for a delay that starts at 15 seconds and doubles with each further failure (at most 15 minutes); `Retry-After` says how long. A success clears the count."
       }
     },
     "/api/logout": {
@@ -165,6 +169,10 @@
                       "direct"
                     ],
                     "description": "`staged` (default): a person approves each review before it is posted. `direct`: posted as soon as the agent submits it."
+                  },
+                  "autoReview": {
+                    "type": "boolean",
+                    "description": "Default `false`: only the jobs asked for are reviewed."
                   }
                 }
               }
@@ -202,7 +210,7 @@
             "$ref": "#/components/responses/Error"
           }
         },
-        "description": "Names are stored in lower case, as GitHub compares them."
+        "description": "Names are stored in lower case, as GitHub compares them. The body replaces the repository's settings: a field it omits takes its default."
       },
       "delete": {
         "summary": "Unregister a repository",
@@ -434,7 +442,7 @@
       ],
       "post": {
         "summary": "Make a person's decision on a job",
-        "description": "A person's moves only: `draft → approved | rejected | stale`, `approved → draft`, `rejected → draft`. Queueing, running, the agent's draft and posting are the platform's own, and no request makes them. Any other move is a `409`, and so is approving a job without a readable review.",
+        "description": "A person's moves only: `draft → approved | rejected | stale`, `approved → draft`, `rejected → draft`, and `failed → pending` to run the review again (which clears `queueEntry` and `error`; the next attempt is queued under a new orchestra `external_id`). Queueing, running, the agent's draft and posting are the platform's own, and no request makes them — posting is asked for with `POST /api/v1/jobs/{id}/post`. Any other move is a `409`, and so is approving a job without a readable review.",
         "operationId": "setJobStatus",
         "requestBody": {
           "required": true,
@@ -453,7 +461,8 @@
                       "approved",
                       "rejected",
                       "stale",
-                      "draft"
+                      "draft",
+                      "pending"
                     ]
                   },
                   "version": {
@@ -492,6 +501,386 @@
           }
         }
       }
+    },
+    "/api/v1/jobs/{id}/post": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "post": {
+        "summary": "Post an approved review to GitHub",
+        "description": "Posts the job's review to its pull request — submitted, with the job's decision as the event, pinned to `headSha` with every comment on the right-hand side — and then marks the job `posted`. The job must be `approved` and at the `version` named. If GitHub refuses, the job stays `approved` with the reason in its `error` (a `502` that carries the job), so it can be posted again. `503` when the platform has no GitHub token.",
+        "operationId": "postJob",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "version"
+                ],
+                "properties": {
+                  "version": {
+                    "type": "integer"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The job, now `posted`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Job"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "415": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "description": "GitHub refused the review or could not be reached.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "error",
+                    "job"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "job": {
+                      "$ref": "#/components/schemas/Job"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/v1/jobs/{id}/diff": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "get": {
+        "summary": "The diff under review",
+        "description": "The unified diff of the pull request at the job's head commit, from its merge base with the base commit — what GitHub shows as the pull request's diff. Fetched from GitHub once per base and head and then kept. `409` for a job that names no head commit yet; `502` when GitHub cannot be read; `503` when the platform has no GitHub token.",
+        "operationId": "getJobDiff",
+        "responses": {
+          "200": {
+            "description": "The diff.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "headSha",
+                    "diff"
+                  ],
+                  "properties": {
+                    "headSha": {
+                      "type": "string"
+                    },
+                    "diff": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/agent/v1/repos/{owner}/{name}/pulls/{pr}": {
+      "parameters": [
+        {
+          "name": "owner",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "name",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "pr",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "integer",
+            "minimum": 1
+          }
+        }
+      ],
+      "get": {
+        "summary": "The review the agent is running",
+        "description": "The newest job of the pull request that is `queued` or `running`; reading a `queued` one moves it to `running`. `404` when no review of the pull request is being run.",
+        "operationId": "agentShow",
+        "security": [
+          {
+            "agentBearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The job, as the agent needs it.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentJob"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/agent/v1/repos/{owner}/{name}/pulls/{pr}/diff": {
+      "parameters": [
+        {
+          "name": "owner",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "name",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "pr",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "integer",
+            "minimum": 1
+          }
+        }
+      ],
+      "get": {
+        "summary": "The diff under review",
+        "description": "The running job's diff, as `GET /api/v1/jobs/{id}/diff` gives it, as plain text.",
+        "operationId": "agentDiff",
+        "security": [
+          {
+            "agentBearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The unified diff.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/agent/v1/repos/{owner}/{name}/pulls/{pr}/review": {
+      "parameters": [
+        {
+          "name": "owner",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "name",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "pr",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "integer",
+            "minimum": 1
+          }
+        }
+      ],
+      "post": {
+        "summary": "Submit the review",
+        "description": "The job must be `running` and `headSha` must be its head (`409` otherwise); the review must be one GitHub would take (`400`). The job becomes a `draft`. For a repository in `direct` mode the platform then approves and posts it; if posting fails the job is left `approved` with the reason in `error`, and the submission still stands.",
+        "operationId": "agentSubmit",
+        "security": [
+          {
+            "agentBearer": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "headSha",
+                  "review"
+                ],
+                "properties": {
+                  "headSha": {
+                    "type": "string"
+                  },
+                  "prType": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "review": {
+                    "$ref": "#/components/schemas/Review"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Accepted.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "jobId",
+                    "status",
+                    "error"
+                  ],
+                  "properties": {
+                    "jobId": {
+                      "type": "string"
+                    },
+                    "status": {
+                      "type": "string",
+                      "description": "`draft`, or `posted` (or `approved`, if posting failed) in `direct` mode."
+                    },
+                    "error": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "415": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -499,13 +888,18 @@
       "bearerAuth": {
         "type": "http",
         "scheme": "bearer",
-        "description": "The platform's secret ($DIFF_REVIEWER_PASSWORD)."
+        "description": "The API token ($DIFF_REVIEWER_API_TOKEN_FILE). The password is not accepted here."
       },
       "sessionCookie": {
         "type": "apiKey",
         "in": "cookie",
         "name": "diff_reviewer_session",
         "description": "Set by `POST /api/login`; `HttpOnly`, `SameSite=Strict`."
+      },
+      "agentBearer": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "The agent token ($DIFF_REVIEWER_AGENT_TOKEN_FILE), which kleis injects into an agent's requests. Reaches `/api/agent/v1/` only."
       }
     },
     "responses": {
@@ -538,6 +932,7 @@
           "owner",
           "name",
           "mode",
+          "autoReview",
           "createdAt"
         ],
         "properties": {
@@ -553,6 +948,10 @@
               "staged",
               "direct"
             ]
+          },
+          "autoReview": {
+            "type": "boolean",
+            "description": "Whether the platform lists the repository's open pull requests itself and makes a job for each new head commit (GitHub draft pull requests excepted)."
           },
           "createdAt": {
             "type": "string",
@@ -570,7 +969,8 @@
           "approved",
           "posted",
           "rejected",
-          "stale"
+          "stale",
+          "failed"
         ]
       },
       "Job": {
@@ -587,7 +987,13 @@
           "createdAt",
           "updatedAt",
           "reviewError",
-          "version"
+          "version",
+          "baseSha",
+          "title",
+          "prBody",
+          "error",
+          "prType",
+          "attempts"
         ],
         "properties": {
           "id": {
@@ -620,7 +1026,7 @@
               "string",
               "null"
             ],
-            "description": "The orchestra queue entry running the review, once queued."
+            "description": "The orchestra queue entry running the review, once queued: the latest, after following `continuedBy`."
           },
           "review": {
             "oneOf": [
@@ -651,6 +1057,46 @@
             "type": "integer",
             "minimum": 1,
             "description": "Incremented by every write; sent back with the next one."
+          },
+          "baseSha": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The pull request's base commit, from GitHub, once known."
+          },
+          "title": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The pull request's title, from GitHub, once known."
+          },
+          "prBody": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The pull request's description, from GitHub, once known."
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "What the platform's last step on the job failed with — queueing, the run, posting — until one succeeds."
+          },
+          "prType": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The kind of pull request the agent said it reviewed."
+          },
+          "attempts": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "How many times the job has been queued on orchestra."
           }
         }
       },
@@ -708,6 +1154,103 @@
           "suggestion": {
             "type": "string",
             "description": "Replacement text for the lines, posted as a GitHub suggestion."
+          }
+        }
+      },
+      "AgentJob": {
+        "type": "object",
+        "required": [
+          "jobId",
+          "owner",
+          "name",
+          "prNumber",
+          "headSha",
+          "baseSha",
+          "title",
+          "body",
+          "status",
+          "instructions",
+          "prTypes",
+          "examples"
+        ],
+        "properties": {
+          "jobId": {
+            "type": "string"
+          },
+          "owner": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "prNumber": {
+            "type": "integer"
+          },
+          "headSha": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The commit to review, and the one a submission must name."
+          },
+          "baseSha": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "title": {
+            "type": "string"
+          },
+          "body": {
+            "type": "string",
+            "description": "The pull request's description."
+          },
+          "status": {
+            "type": "string",
+            "description": "`running`, once read."
+          },
+          "instructions": {
+            "type": "string",
+            "description": "How to review, in markdown."
+          },
+          "prTypes": {
+            "type": "array",
+            "description": "The kinds of pull request the repository's rubrics tell apart; empty for now.",
+            "items": {
+              "type": "object",
+              "required": [
+                "name",
+                "description"
+              ],
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "description": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "examples": {
+            "type": "array",
+            "description": "Past reviews to calibrate against; empty for now.",
+            "items": {
+              "type": "object",
+              "required": [
+                "file",
+                "body"
+              ],
+              "properties": {
+                "file": {
+                  "type": "string"
+                },
+                "body": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       }

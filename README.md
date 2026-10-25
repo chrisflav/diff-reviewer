@@ -4,42 +4,117 @@ A platform for agentic reviews of GitHub pull requests (taxis #588), grown out o
 tool. Agents draft reviews; you read and edit them against the diff, approve them, and they are
 posted to the pull request under your name.
 
-It is built in milestones. This is the first, the skeleton:
+It is built in milestones. The first two are here:
 
 - **A review format** (`DiffReviewer/Types.lean`): a decision (comment, approve, request changes),
   a summary, and inline comments on file line ranges with optional suggestions.
 - **The platform server** (`diff-reviewer serve`): a REST API over a SQLite database, holding the
-  repositories it reviews and one *job* per review of a pull request. A job moves
-  `pending → queued → running → draft → approved → posted`; `rejected` is a discarded draft,
-  `stale` a draft whose pull request has moved on. `docs/openapi.json` describes the API and is
-  served at `/api/openapi.json`.
+  repositories it reviews and one *job* per review of a pull request at one head commit. A job
+  moves `pending → queued → running → draft → approved → posted`; `rejected` is a discarded draft,
+  `stale` a draft whose pull request has moved on, `failed` a run that ended without a review.
+  `docs/openapi.json` describes the API and is served at `/api/openapi.json`.
+- **Background workers** inside `serve` (`DiffReviewer/Workers.lean`), every `--interval` seconds:
+  *discovery* makes a job for every new head of an open pull request of a repository with
+  `autoReview` (GitHub draft pull requests wait until they are ready), and marks the drafts and
+  approvals of older heads `stale`; *queueing* puts each `pending` job on
+  [orchestra](https://github.com/chrisflav/orchestra) as an API client; *following* reads the
+  queue entry and moves the job to `running`, or to `failed` when the run ends without a review.
+- **The agent API** (`/api/agent/v1/repos/{owner}/{name}/pulls/{pr}…`) and **the agent CLI**
+  (`diff-reviewer agent show|diff|submit`): what the reviewing agent reads and how it submits.
+  A submission becomes a `draft`; in a `direct` repository it is posted at once.
+- **Posting** (`POST /api/v1/jobs/{id}/post`): an approved review is posted to the pull request
+  under the operator's GitHub account, pinned to the job's head commit.
 - **A web front-end** (`web/`): sign in, register repositories, request a review, read a review,
   edit it, approve or reject it. Every write names the version of the job it was made on, so a
-  stale page is refused rather than overwriting; queueing, running and posting are the platform's
-  own moves, which no request makes.
+  stale page is refused rather than overwriting.
 - **The command-line tools** it started as: `diff-reviewer github` posts a review JSON to a pull
-  request with `gh`, and `diff-reviewer from-git` turns a commit range into one.
+  request, and `diff-reviewer from-git` turns a commit range into one.
 
-Next: queueing reviews on orchestra and showing them against the diff (M1), then rubrics,
-calibration from past human reviews, and learned review style.
+Next: rubrics (M2), calibration from past human reviews, and learned review style.
 
 ## Running it
 
 ```sh
 lake build
 cd web && npm ci && npm run build && cd ..
-DIFF_REVIEWER_PASSWORD='…' .lake/build/bin/diff-reviewer serve --db reviews.db --site web/dist
+DIFF_REVIEWER_PASSWORD='…' \
+DIFF_REVIEWER_API_TOKEN_FILE=/etc/diff-reviewer/api-token \
+DIFF_REVIEWER_AGENT_TOKEN_FILE=/etc/diff-reviewer/agent-token \
+DIFF_REVIEWER_GITHUB_TOKEN_FILE=/etc/diff-reviewer/github-token \
+DIFF_REVIEWER_ORCHESTRA_URL=https://orchestra.example \
+DIFF_REVIEWER_ORCHESTRA_TOKEN_FILE=/etc/diff-reviewer/orchestra-token \
+  .lake/build/bin/diff-reviewer serve --db reviews.db --site web/dist
 ```
 
-It listens on `127.0.0.1:8090` (`--host`, `--port`). The password is the one you sign in with,
-and what scripts send as `Authorization: Bearer <password>`. The server is plain HTTP: put TLS in
-front of anything wider than loopback, and pass `--secure-cookie`.
+It listens on `127.0.0.1:8090` (`--host`, `--port`) and runs the workers every 60 seconds
+(`--interval`). The server is plain HTTP: put TLS in front of anything wider than loopback, and
+pass `--secure-cookie`. Releases (`v*` tags) attach a Linux x86_64 binary and its sha256 to the
+GitHub release; it runs on Debian bookworm and newer.
 
-Known limits of this milestone: `/api/login` is not rate-limited, and the password is also the
-bearer token for scripts. Both change before the platform posts anything under your name.
+### Configuration
 
-During front-end work, `cd web && npm run dev` serves the app with hot reload and proxies `/api`
-to the server on 8090 (`DIFF_REVIEWER_URL` to point it elsewhere).
+Everything but the flags comes from the environment. A token is always read from a file, so that
+it never appears in a process listing or a shell history; the file's surrounding whitespace is
+ignored.
+
+| Variable | |
+| --- | --- |
+| `DIFF_REVIEWER_PASSWORD` | Required. What you sign in with, at least 12 characters. Accepted only by `POST /api/login`, which is rate-limited: after 5 failures within 15 minutes every attempt is refused (`429`) for 15 seconds, doubling with each further failure. |
+| `DIFF_REVIEWER_API_TOKEN_FILE` | The bearer scripts send to `/api/v1/` (`Authorization: Bearer …`). Unset, only a signed-in browser reaches the API. |
+| `DIFF_REVIEWER_AGENT_TOKEN_FILE` | The bearer of `/api/agent/v1/`, and good for nothing else. Unset, the agent API refuses everything. kleis holds it, never the agent. |
+| `DIFF_REVIEWER_GITHUB_TOKEN_FILE` | The token for api.github.com: listing pull requests, reading one and its diff, posting reviews. Unset, there is no discovery, no diff and no posting. In production this is the placeholder `kleis` (see below). Also used by `diff-reviewer github`, which otherwise falls back to `gh auth token`. |
+| `DIFF_REVIEWER_GITHUB_API` | GitHub's API root, `https://api.github.com` by default. |
+| `DIFF_REVIEWER_ORCHESTRA_URL`, `DIFF_REVIEWER_ORCHESTRA_TOKEN_FILE` | Orchestra, and the platform's API client token on it. Without both, jobs stay `pending` (and the log says so once). |
+| `HTTPS_PROXY`, `CURL_CA_BUNDLE`, `SSL_CERT_FILE` | Every outgoing request is made with `curl`, which reads these as usual. |
+
+The three secrets must differ, and each token must be at least 32 characters
+(`openssl rand -hex 32`): `serve` refuses to start otherwise.
+
+The agent CLI reads `~/.config/diff-reviewer/agent.json`, `{"url": "https://reviews.example",
+"token": "kleis"}`, and `DIFF_REVIEWER_URL` and `DIFF_REVIEWER_TOKEN` override either field.
+(`DIFF_REVIEWER_URL` is also where `npm run dev` proxies `/api` to.)
+
+### On orchestra
+
+The platform queues reviews as an orchestra API client. Create
+`<config>/clients/diff-reviewer.json` on orchestra:
+
+```json
+{
+  "token": "{{diff_reviewer_token}}",
+  "backend": "claude",
+  "read_only": true,
+  "kleis_spec": "reviewer",
+  "queue_policy": {
+    "repos": ["acme/widgets"],
+    "max_budget": 3.0
+  },
+  "max_active": 10
+}
+```
+
+with `diff_reviewer_token` in orchestra's `secrets.json` and the same value in the platform's
+`DIFF_REVIEWER_ORCHESTRA_TOKEN_FILE`. `queue_policy.repos` must list every repository registered
+on the platform: orchestra refuses (`400`) a repository it does not list, and the job stays
+`pending` with that reason in its `error`. Each request names the prompt, a goal, the upstream,
+the pull request (`issue_number`) and the job id as `external_id` — `<id>.2`, `<id>.3`, … for a
+retry, since orchestra answers an `external_id` it has seen with the entry it already made. The
+agent image needs `curl` and the `diff-reviewer` binary from a release on its `PATH`.
+
+### Behind kleis
+
+The platform holds no real credential of GitHub, and agents hold none of the platform's:
+
+- **The agent's side.** kleis's `diff-reviewer` extension injects the agent token
+  (`Authorization: Bearer`) into an agent's requests to `/api/agent/v1/` and nothing else, and
+  its `reviewer` spec allows them only for the task's own repository and pull request
+  (`task_upstream`, `task_issue`). GitHub is read-only to the agent, so an agent can never post
+  anything itself. The extension's setup writes `~/.config/diff-reviewer/agent.json` with the
+  platform's URL and the placeholder token `kleis`, which kleis strips and replaces.
+- **The platform's side.** Run `serve` with `HTTPS_PROXY` pointing at kleis (and kleis's CA in
+  `CURL_CA_BUNDLE`), and `DIFF_REVIEWER_GITHUB_TOKEN_FILE` holding `kleis`. kleis's
+  `diff-reviewer-poster` grant injects the operator's PAT for reading pull requests and posting
+  reviews on the repositories it lists, so approved reviews appear under your own name.
 
 ## Tests
 
@@ -48,10 +123,17 @@ lake test
 ```
 
 The suite covers the review format, the job transitions, that the migrations build the declared
-schema, the API's authentication and a review's whole life over it, and that `docs/openapi.json`
-documents exactly the routes the server answers. `docs/openapi.json` is embedded in the binary:
-after editing it, touch `DiffReviewer/Server.lean` in a way that changes it, or delete that
-module's build output, so that it is embedded again.
+schema and bring an old database up to date, the credentials (each reaches only its own routes)
+and the login rate limit, a review's whole life over the API, the workers — discovery, queueing,
+following, posting, direct mode — against a fake GitHub and a fake orchestra, the agent CLI
+against the server on loopback, and that `docs/openapi.json` documents exactly the routes the
+server answers. Nothing in it reaches the network.
+
+`docs/openapi.json` is embedded in the binary with `include_str`, and Lake rebuilds a module when
+its own source changes, not when a file it includes does: after editing the spec, touch
+`DiffReviewer/Server.lean` in a way that changes it, or delete its build output
+(`rm .lake/build/lib/lean/DiffReviewer/Server.* .lake/build/ir/DiffReviewer/Server.*`), so that
+it is embedded again.
 
 ## License
 

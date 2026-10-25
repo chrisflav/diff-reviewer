@@ -9,9 +9,10 @@ open Lean (Json)
 
 What the review platform keeps: the repositories it reviews, and one **job** per review of a pull
 request. A job moves through `pending → queued → running → draft → approved → posted`; `rejected`
-is a draft somebody discarded and `stale` a draft whose pull request has moved on since. Only the
-transitions a person or the agent makes are here; queueing on orchestra and posting to GitHub are
-the milestones after this one.
+is a draft somebody discarded, `stale` a draft whose pull request has moved on since, and `failed`
+a run that ended without a review. The moves a person may make are here (`personCanMove`); the
+platform's own — queueing, following the run, the agent's submission, posting — are made by
+`DiffReviewer.Workers` and the agent API, each with the check of the state it expects.
 -/
 
 namespace DiffReviewer
@@ -69,21 +70,25 @@ def PostingMode.ofString? : String → Option PostingMode
   | _        => none
 
 structure Repo where
-  owner     : String
-  name      : String
-  mode      : PostingMode := .staged
-  createdAt : String
+  owner      : String
+  name       : String
+  mode       : PostingMode := .staged
+  /-- Whether the platform finds the open pull requests itself and makes a job for each new head,
+      rather than reviewing only what it is asked to. -/
+  autoReview : Bool := false
+  createdAt  : String
   deriving Repr
 
 def Repo.slug (r : Repo) : String := s!"{r.owner}/{r.name}"
 
 def Repo.toJson (r : Repo) : Json :=
   .mkObj [("owner", r.owner), ("name", r.name), ("mode", r.mode.toString),
-          ("createdAt", r.createdAt)]
+          ("autoReview", r.autoReview), ("createdAt", r.createdAt)]
 
 private def Repo.ofRow (row : Store.RepoRow) : Repo :=
   { owner := row.owner, name := row.name, createdAt := row.created_at
-  , mode := (PostingMode.ofString? row.mode).getD .staged }
+  , mode := (PostingMode.ofString? row.mode).getD .staged
+  , autoReview := row.auto_review.getD false }
 
 /-- Whether `s` can be one half of a GitHub `owner/name`: letters, digits, `-`, `_` and `.`, not
     starting with a dot. Checked because both halves end up in URLs and, later, clone paths. -/
@@ -94,11 +99,11 @@ def validSlugPart (s : String) : Bool :=
 /-! ## Jobs -/
 
 inductive JobStatus where
-  | pending | queued | running | draft | approved | posted | rejected | stale
+  | pending | queued | running | draft | approved | posted | rejected | stale | failed
   deriving Repr, BEq, DecidableEq
 
 def JobStatus.all : List JobStatus :=
-  [.pending, .queued, .running, .draft, .approved, .posted, .rejected, .stale]
+  [.pending, .queued, .running, .draft, .approved, .posted, .rejected, .stale, .failed]
 
 def JobStatus.toString : JobStatus → String
   | .pending  => "pending"
@@ -109,18 +114,23 @@ def JobStatus.toString : JobStatus → String
   | .posted   => "posted"
   | .rejected => "rejected"
   | .stale    => "stale"
+  | .failed   => "failed"
 
 def JobStatus.ofString? (s : String) : Option JobStatus :=
   JobStatus.all.find? (·.toString == s)
 
 /-- The moves a person makes on a job from the platform. Everything else — queueing, running, the
-    agent's draft, posting to GitHub — is the platform's own doing, and no request can claim it. -/
+    agent's draft, posting to GitHub — is the platform's own doing, and no request can claim it.
+    Posting is asked for with its own action (`POST /api/v1/jobs/{id}/post`), which makes the
+    `approved → posted` move only once GitHub has the review; `failed → pending` asks for another
+    run. -/
 def JobStatus.personCanMove : JobStatus → JobStatus → Bool
   | .draft,    .approved => true
   | .draft,    .rejected => true
   | .draft,    .stale    => true
   | .approved, .draft    => true
   | .rejected, .draft    => true
+  | .failed,   .pending  => true
   | _,         _         => false
 
 /-- Whether a person may replace the review of a job in this state. Not while the agent may still
@@ -151,6 +161,16 @@ structure Job where
   version    : Nat := 1
   createdAt  : String
   updatedAt  : String
+  /-- The pull request's base commit, title and description, from GitHub. -/
+  baseSha    : Option String := none
+  title      : Option String := none
+  prBody     : Option String := none
+  /-- What the last platform step on the job failed with, until one succeeds. -/
+  error      : Option String := none
+  /-- The kind of pull request the agent said it reviewed. -/
+  prType     : Option String := none
+  /-- How many times the job has been queued on orchestra. -/
+  attempts   : Nat := 0
 
 def Job.status? (j : Job) : Option JobStatus := JobStatus.ofString? j.statusRaw
 
@@ -174,19 +194,25 @@ def Job.toJson (j : Job) : Json :=
     ("id", j.id), ("owner", j.owner), ("name", j.name), ("prNumber", j.prNumber),
     ("headSha", optStr j.headSha), ("status", j.statusRaw),
     ("queueEntry", optStr j.queueEntry), ("review", review), ("reviewError", reviewError),
-    ("version", j.version), ("createdAt", j.createdAt), ("updatedAt", j.updatedAt)]
+    ("version", j.version), ("createdAt", j.createdAt), ("updatedAt", j.updatedAt),
+    ("baseSha", optStr j.baseSha), ("title", optStr j.title), ("prBody", optStr j.prBody),
+    ("error", optStr j.error), ("prType", optStr j.prType), ("attempts", j.attempts)]
 
 private def Job.ofRow (row : Store.JobRow) : Job :=
   { id := row.id, owner := row.owner, name := row.name, prNumber := row.pr_number.toNat
   , headSha := row.head_sha, statusRaw := row.status, queueEntry := row.queue_entry
   , reviewRaw := row.review, version := row.version.toNat
-  , createdAt := row.created_at, updatedAt := row.updated_at }
+  , createdAt := row.created_at, updatedAt := row.updated_at
+  , baseSha := row.base_sha, title := row.title, prBody := row.pr_body, error := row.error
+  , prType := row.pr_type, attempts := (row.attempts.getD 0).toNat }
 
 private def Job.toRow (j : Job) : Store.JobRow :=
   { id := j.id, owner := j.owner, name := j.name, pr_number := j.prNumber
   , head_sha := j.headSha, status := j.statusRaw, queue_entry := j.queueEntry
   , review := j.reviewRaw, version := j.version
-  , created_at := j.createdAt, updated_at := j.updatedAt }
+  , created_at := j.createdAt, updated_at := j.updatedAt
+  , base_sha := j.baseSha, title := j.title, pr_body := j.prBody, error := j.error
+  , pr_type := j.prType, attempts := some j.attempts }
 
 /-- The largest pull request number accepted: what fits a 32-bit column with room to spare. -/
 def maxPrNumber : Nat := 2147483647
@@ -219,7 +245,7 @@ def findRepo (owner name : String) : IO (Option Repo) := do
 
 /-- Create or replace a repository. Answers whether it existed before. Names are stored in lower
     case, as GitHub compares them, so `Acme/Widgets` and `acme/widgets` are one repository. -/
-def putRepo (owner name : String) (mode : PostingMode) : IO Bool := do
+def putRepo (owner name : String) (mode : PostingMode) (autoReview : Bool := false) : IO Bool := do
   let owner := owner.toLower
   let name := name.toLower
   let existing ← findRepo owner name
@@ -227,7 +253,8 @@ def putRepo (owner name : String) (mode : PostingMode) : IO Bool := do
     | some r => pure r.createdAt
     | none   => nowIso
   Store.run <| HasModel.save
-    ({ owner, name, mode := mode.toString, created_at := createdAt } : Store.RepoRow)
+    ({ owner, name, mode := mode.toString, created_at := createdAt
+     , auto_review := some autoReview } : Store.RepoRow)
   return existing.isSome
 
 /-- Delete a repository. Its jobs are kept: they are the record of reviews that happened. -/
@@ -264,6 +291,60 @@ def createJob (repo : Repo) (prNumber : Nat) (headSha : Option String) : IO Job 
   Store.run <| HasModel.save job.toRow
   return job
 
+/-- The jobs of one pull request, newest first. -/
+def jobsOfPull (owner name : String) (prNumber : Nat) : IO (Array Job) := do
+  let rows ← Store.run <| HasModel.fetch <| query% do
+    let j ← from Store.JobRow
+    guard j.owner = owner
+    guard j.name = name
+    guard j.pr_number = (prNumber : Int)
+    select j
+    order_by_desc j.created_at
+    order_by_desc j.id
+  return rows.map Job.ofRow
+
+/-- The jobs in one of `statuses`, oldest first: the order the workers take them in. -/
+def jobsWithStatus (statuses : List JobStatus) : IO (Array Job) := do
+  let names := statuses.map (·.toString)
+  return ((← listJobs).filter (names.contains ·.statusRaw)).reverse
+
+/-- A new job for a pull request at head `headSha`, unless one already exists for that head: one
+    review per commit. The check and the write are one transaction, so discovery running twice
+    over the same head makes one job. Answers the job made, if one was. -/
+def createJobForHead (repo : Repo) (prNumber : Nat) (headSha : String)
+    (baseSha title body : Option String) : IO (Option Job) := do
+  let now ← nowIso
+  let job : Job :=
+    { id := ← randomHex 8, owner := repo.owner, name := repo.name, prNumber
+    , headSha := some headSha, baseSha, title, prBody := body
+    , createdAt := now, updatedAt := now }
+  Store.transact do
+    let rows ← HasModel.fetch <| query% do
+      let j ← from Store.JobRow
+      guard j.owner = repo.owner
+      guard j.name = repo.name
+      guard j.pr_number = (prNumber : Int)
+      select j
+    if rows.any (·.head_sha == some headSha) then return none
+    HasModel.save job.toRow
+    return some job
+
+/-- The diff kept for a pull request with base `base` at head `head`. -/
+def cachedDiff (owner name base head : String) : IO (Option String) := do
+  let rows ← Store.run <| HasModel.fetch <| query% do
+    let d ← from Store.DiffRow
+    guard d.owner = owner
+    guard d.name = name
+    guard d.base_sha = base
+    guard d.head_sha = head
+    select d
+  return rows[0]?.map (·.diff)
+
+def cacheDiff (owner name base head diff : String) : IO Unit := do
+  let fetched_at ← nowIso
+  Store.run <| HasModel.save
+    ({ owner, name, base_sha := base, head_sha := head, diff, fetched_at } : Store.DiffRow)
+
 /-- Why an update was not made. -/
 inductive UpdateError where
   | notFound
@@ -271,12 +352,12 @@ inductive UpdateError where
   | conflict (why : String)
   | invalid (why : String)
 
-/-- Change job `id` with `f`, reading and writing it under one hold of the store's lock, so no
-    other write can land between the check `f` makes and the write that follows it. Bumps the
-    version and the time on every write. -/
+/-- Change job `id` with `f`, reading and writing it under one hold of the store's lock and in one
+    transaction, so no other write — from this process or another — can land between the check `f`
+    makes and the write that follows it. Bumps the version and the time on every write. -/
 def updateJob (id : String) (f : Job → Except UpdateError Job) : IO (Except UpdateError Job) := do
   let now ← nowIso
-  Store.run do
+  Store.transact do
     let some job ← fetchJob id | return .error .notFound
     match f job with
     | .error e => return .error e

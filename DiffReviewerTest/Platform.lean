@@ -34,6 +34,10 @@ def transitionsAreTheOnesAPersonMakes : Test := do
     ++ check (!JobStatus.pending.personCanMove .approved) "nothing to approve before a draft"
     ++ check (!JobStatus.running.personCanEdit) "not while the agent writes"
     ++ check (!JobStatus.posted.personCanEdit) "a posted review is history"
+    ++ check (JobStatus.failed.personCanMove .pending) "a failed run is retried"
+    ++ check (!JobStatus.running.personCanMove .failed) "failing a run is the platform's"
+    ++ check (!JobStatus.failed.personCanMove .draft) "a failed run has no draft"
+    ++ checkEq (JobStatus.ofString? "failed") (some .failed) "the new status reads back"
 
 /-- A model change without a migration fails here rather than on a deployment. -/
 def theMigrationsBuildTheDeclaredSchema : Test := do
@@ -43,11 +47,32 @@ def theMigrationsBuildTheDeclaredSchema : Test := do
   | .ok steps => return #[s!"the declared schema is {steps.length} step(s) ahead of the \
 migrations; add a migration to `DiffReviewer.Store.migrations`"]
 
+/-- A database `0001` built, with a row in it, is brought up to date on first use and its rows
+    read as they were, with the new columns' defaults. -/
+def anOldDatabaseIsMigrated : Test := withTempDb do
+  let path ← Store.pathRef.get
+  Sqlite.runDB path do
+    let _ ← Db.Migration.migrate [Store.migration0001] 0
+    let db ← read
+    SQLite.exec db "INSERT INTO repo (owner, name, mode, created_at) VALUES \
+('acme', 'widgets', 'direct', '2026-01-01T00:00:00Z')"
+    SQLite.exec db "INSERT INTO review_job (id, owner, name, pr_number, head_sha, status, \
+queue_entry, review, version, created_at, updated_at) VALUES ('j1', 'acme', 'widgets', 7, NULL, \
+'draft', NULL, NULL, 3, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')"
+  let repos ← Platform.listRepos
+  let some job ← Platform.findJob "j1" | return #["the old job is gone"]
+  return checkEq (repos.map (·.slug)) #["acme/widgets"] "the old repository"
+    ++ check (repos.all (!·.autoReview)) "autoReview is off for an old row"
+    ++ check (repos.all (·.mode == .direct)) "the old mode"
+    ++ checkEq job.version 3 "the old job's version"
+    ++ checkEq job.attempts 0 "no attempts for an old job"
+
 def all : List (String × Test) :=
   [("reviewRoundTrips", reviewRoundTrips),
    ("isoOfEpochIsUtc", isoOfEpochIsUtc),
    ("slugPartsAreChecked", slugPartsAreChecked),
    ("transitionsAreTheOnesAPersonMakes", transitionsAreTheOnesAPersonMakes),
-   ("theMigrationsBuildTheDeclaredSchema", theMigrationsBuildTheDeclaredSchema)]
+   ("theMigrationsBuildTheDeclaredSchema", theMigrationsBuildTheDeclaredSchema),
+   ("anOldDatabaseIsMigrated", anOldDatabaseIsMigrated)]
 
 end DiffReviewerTest.Platform

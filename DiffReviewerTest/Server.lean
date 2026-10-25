@@ -7,45 +7,111 @@ open DiffReviewer.Server
 
 namespace DiffReviewerTest.Server
 
-private def password : String := "correct-horse-battery"
+def password : String := "correct-horse-battery"
 
-/-- A fresh database under `.lake/test/`, so a test never touches a real one. -/
-private def withTempDb (act : IO α) : IO α := do
-  let dir : System.FilePath := ".lake" / "test"
-  IO.FS.createDirAll dir
-  let path := dir / s!"server-{← IO.monoNanosNow}.db"
-  Store.setPath path
-  try act finally
-    try IO.FS.removeFile path catch _ => pure ()
+def apiToken : String := "api-0123456789abcdef0123456789abcdef"
 
-private def req (method : Std.Http.Method) (path : String) (body : String := "")
-    (auth : Bool := true) (json : Bool := true) : Req :=
+def agentToken : String := "agent-0123456789abcdef0123456789abcdef"
+
+def cfg : Config := { password, apiToken := some apiToken, agentToken := some agentToken }
+
+/-- A request with `token` as its bearer, the API token unless said otherwise. -/
+def req (method : Std.Http.Method) (path : String) (body : String := "")
+    (auth : Bool := true) (json : Bool := true) (token : String := apiToken) : Req :=
   { method, path, body
   , header := fun n =>
-      if n == "authorization" && auth then some s!"Bearer {password}"
+      if n == "authorization" && auth then some s!"Bearer {token}"
       else if n == "content-type" && json then some "application/json"
       else none }
 
-private def bodyJson (r : Reply) : Json :=
+def bodyJson (r : Reply) : Json :=
   (Json.parse (String.fromUTF8! r.body)).toOption.getD .null
 
-private def checkStatus (r : Reply) (code : Nat) (what : String) : Array String :=
+def checkStatus (r : Reply) (code : Nat) (what : String) : Array String :=
   check (r.status.toCode.toNat == code)
     s!"{what}: expected {code}, got {r.status.toCode} {String.fromUTF8! r.body}"
 
+private def loginBody (p : String) : String := s!"\{\"password\": \"{p}\"}"
+
+/-- The session cookie a login reply sets. -/
+private def cookieOf (r : Reply) : Option String :=
+  (r.headers.lookup "Set-Cookie").bind fun c => ((c.splitOn ";").head?)
+
+private def withCookie (r : Req) (cookie : String) : Req :=
+  { r with header := fun n => if n == "cookie" then some cookie else r.header n }
+
+/-- Three credentials, none standing in for another: the password only logs in, the API token
+    reaches `/api/v1/` and nothing else, the agent token `/api/agent/v1/` and nothing else. -/
 def theApiNeedsTheSecret : Test := do
-  let st ← State.new { password }
+  let st ← State.new cfg
   withTempDb do
     let anon ← route st (req .get "/api/v1/repos" (auth := false))
-    let wrong ← route st { req .get "/api/v1/repos" (auth := false) with
-                           header := fun n => if n == "authorization" then some "Bearer nope"
-                                              else none }
+    let wrong ← route st (req .get "/api/v1/repos" (token := "nope"))
+    let byToken ← route st (req .get "/api/v1/repos")
+    let byPassword ← route st (req .get "/api/v1/repos" (token := password))
+    let byAgent ← route st (req .get "/api/v1/repos" (token := agentToken))
+    let agentPath := "/api/agent/v1/repos/acme/widgets/pulls/7"
+    let agentByApi ← route st (req .get agentPath)
+    let agentByPassword ← route st (req .get agentPath (token := password))
+    let agentByAgent ← route st (req .get agentPath (token := agentToken))
+    let login ← route st (req .post "/api/login" (loginBody password) (auth := false))
+    let cookie := (cookieOf login).getD ""
+    let bySession ← route st (withCookie (req .get "/api/v1/repos" (auth := false)) cookie)
+    let agentBySession ← route st (withCookie (req .get agentPath (auth := false)) cookie)
     let session ← route st (req .get "/api/session" (auth := false))
     let spec ← route st (req .get "/api/openapi.json" (auth := false))
+    let noAgent ← State.new { cfg with agentToken := none }
+    let agentUnset ← route noAgent (req .get agentPath (token := agentToken))
     return checkStatus anon 401 "no credential"
       ++ checkStatus wrong 401 "a wrong secret"
+      ++ checkStatus byToken 200 "the API token"
+      ++ checkStatus byPassword 401 "the password as a bearer"
+      ++ checkStatus byAgent 401 "the agent token on /api/v1"
+      ++ checkStatus agentByApi 401 "the API token on the agent API"
+      ++ checkStatus agentByPassword 401 "the password on the agent API"
+      ++ checkStatus agentByAgent 404 "the agent token, for a pull request with no review running"
+      ++ checkStatus login 200 "logging in"
+      ++ checkStatus bySession 200 "the session"
+      ++ checkStatus agentBySession 401 "the session on the agent API"
       ++ checkStatus session 200 "the session check is public"
       ++ checkStatus spec 200 "the spec is public"
+      ++ checkStatus agentUnset 401 "the agent API, with no agent token configured"
+
+/-- Past five failures in the window every attempt is refused, the right password too, until the
+    delay has passed; the delay doubles with each further failure. -/
+def loginsAreRateLimited : Test := do
+  let now ← IO.mkRef (1000000 : Int)
+  let st ← State.new cfg (clock := now.get)
+  withTempDb do
+    let mut failures := #[]
+    for i in [0:5] do
+      let r ← route st (req .post "/api/login" (loginBody "wrong") (auth := false))
+      failures := failures ++ checkStatus r 401 s!"wrong password {i + 1}"
+    let locked ← route st (req .post "/api/login" (loginBody password) (auth := false))
+    now.modify (· + loginBackoff 5 + 1)
+    let wrongAgain ← route st (req .post "/api/login" (loginBody "wrong") (auth := false))
+    let lockedLonger ← route st (req .post "/api/login" (loginBody password) (auth := false))
+    now.modify (· + loginBackoff 6 + 1)
+    let ok ← route st (req .post "/api/login" (loginBody password) (auth := false))
+    let afterOk ← route st (req .post "/api/login" (loginBody "wrong") (auth := false))
+    return failures
+      ++ checkStatus locked 429 "the right password while refused"
+      ++ check (locked.headers.lookup "Retry-After" |>.isSome) "a Retry-After"
+      ++ checkStatus wrongAgain 401 "a sixth wrong password, after the delay"
+      ++ checkStatus lockedLonger 429 "refused again, for longer"
+      ++ check (loginBackoff 6 == 2 * loginBackoff 5) "the delay doubles"
+      ++ checkStatus ok 200 "the right password after the delay"
+      ++ checkStatus afterOk 401 "a success clears the count"
+
+def credentialsAreChecked : Test := do
+  return check (cfg.check matches .ok ()) "the suite's own configuration"
+    ++ check (({ cfg with password := "short" } : Config).check matches .error _) "a short password"
+    ++ check (({ cfg with apiToken := some "short" } : Config).check matches .error _)
+      "a short token"
+    ++ check (({ cfg with agentToken := some apiToken } : Config).check matches .error _)
+      "one token for both"
+    ++ check (({ cfg with password := apiToken } : Config).check matches .error _)
+      "the password as a token"
 
 def pathsNameOnlyThemselves : Test := do
   return checkEq (apiSegments "/api/v1/repos/acme/widgets") (some ["repos", "acme", "widgets"])
@@ -56,28 +122,28 @@ def pathsNameOnlyThemselves : Test := do
     ++ checkEq (staticCandidate "site" "/assets/a.js") (some ("site" / "assets" / "a.js"))
       "a static file"
 
-private def field (r : Reply) (k : String) : Option String :=
+def field (r : Reply) (k : String) : Option String :=
   ((bodyJson r).getObjValAs? String k).toOption
 
-private def versionOf (r : Reply) : Nat :=
+def versionOf (r : Reply) : Nat :=
   ((bodyJson r).getObjValAs? Nat "version").toOption.getD 0
 
-private def reviewBody (version : Nat) (review : String) : String :=
+def reviewBody (version : Nat) (review : String) : String :=
   s!"\{\"version\": {version}, \"review\": {review}}"
 
-private def fine : String := "{\"decision\": \"comment\", \"body\": \"Fine.\", \"comments\": []}"
+def fine : String := "{\"decision\": \"comment\", \"body\": \"Fine.\", \"comments\": []}"
 
-private def statusBody (status : String) (version : Nat) : String :=
+def statusBody (status : String) (version : Nat) : String :=
   s!"\{\"status\": \"{status}\", \"version\": {version}}"
 
 /-- A registered repository and a new job on it; answers the job reply. -/
-private def newJob (st : State) : IO Reply := do
+def newJob (st : State) : IO Reply := do
   let _ ← route st (req .put "/api/v1/repos/Acme/Widgets" "{\"mode\": \"staged\"}")
   route st (req .post "/api/v1/jobs"
     "{\"owner\": \"acme\", \"name\": \"widgets\", \"prNumber\": 7, \"headSha\": \"ABCDEF1\"}")
 
 def aReviewIsDraftedAndApproved : Test := do
-  let st ← State.new { password }
+  let st ← State.new cfg
   withTempDb do
     let job ← newJob st
     let again ← route st (req .put "/api/v1/repos/acme/widgets" "{}")
@@ -105,7 +171,7 @@ def aReviewIsDraftedAndApproved : Test := do
       ++ checkStatus form 415 "a form post"
 
 def inputsAreChecked : Test := do
-  let st ← State.new { password }
+  let st ← State.new cfg
   withTempDb do
     let job ← newJob st
     let id := (field job "id").getD ""
@@ -130,7 +196,7 @@ def inputsAreChecked : Test := do
 /-- A stored status or review this build does not understand is left exactly as it is: shown,
     refused for writes, never replaced by a default. -/
 def whatThisBuildCannotReadIsKept : Test := do
-  let st ← State.new { password }
+  let st ← State.new cfg
   withTempDb do
     let job ← newJob st
     let id := (field job "id").getD ""
@@ -139,7 +205,8 @@ def whatThisBuildCannotReadIsKept : Test := do
     Store.run <| HasModel.save
       ({ id, owner := j.owner, name := j.name, pr_number := j.prNumber, head_sha := j.headSha
        , status := "escalated", queue_entry := none, review := some odd, version := 1
-       , created_at := j.createdAt, updated_at := j.updatedAt } : Store.JobRow)
+       , created_at := j.createdAt, updated_at := j.updatedAt, base_sha := none, title := none
+       , pr_body := none, error := none, pr_type := none, attempts := none } : Store.JobRow)
     let read ← route st (req .get s!"/api/v1/jobs/{id}")
     let write ← route st (req .post s!"/api/v1/jobs/{id}/status" (statusBody "rejected" 1))
     let edit ← route st (req .put s!"/api/v1/jobs/{id}/review" (reviewBody 1 fine))
@@ -153,7 +220,7 @@ def whatThisBuildCannotReadIsKept : Test := do
       ++ checkEq after.statusRaw "escalated" "the stored status, untouched"
 
 def editsFollowTheState : Test := do
-  let st ← State.new { password }
+  let st ← State.new cfg
   withTempDb do
     let job ← newJob st
     let id := (field job "id").getD ""
@@ -164,15 +231,16 @@ def editsFollowTheState : Test := do
     return checkStatus stale 200 "marking the draft stale"
       ++ checkStatus edit 409 "editing a stale review"
 
-/-- Every route `apiRoutes` names is in `docs/openapi.json` with exactly its methods, and the spec
-    documents no route that is not served. -/
+/-- Every route `apiRoutes` and `agentRoutes` name is in `docs/openapi.json` with exactly its
+    methods, and the spec documents no route under either prefix that is not served. -/
 def theSpecDescribesTheRoutes : Test := do
   let some paths := (Json.parse openApiSpec).toOption.bind (·.getObjVal? "paths" |>.toOption)
     | return #["docs/openapi.json has no 'paths'"]
   let some documented := paths.getObj?.toOption | return #["'paths' is not an object"]
   let mut failures := #[]
-  for (kind, methods) in apiRoutes do
-    let key := s!"/api/v1/{kind}"
+  let served := apiRoutes.map (fun (k, ms) => (s!"/api/v1/{k}", ms)) ++
+    agentRoutes.map (fun (k, ms) => (s!"/api/agent/v1/{k}", ms))
+  for (key, methods) in served do
     match paths.getObjVal? key with
     | .error _ => failures := failures.push s!"{key} is served but not documented"
     | .ok entry =>
@@ -184,13 +252,15 @@ def theSpecDescribesTheRoutes : Test := do
         unless methods.contains m || m == "parameters" do
           failures := failures.push s!"the spec documents {m} {key}, which is not served"
   for (key, _) in documented.toList do
-    if key.startsWith "/api/v1/" then
-      unless apiRoutes.any (fun (k, _) => s!"/api/v1/{k}" == key) do
+    if key.startsWith "/api/v1/" || key.startsWith "/api/agent/v1/" then
+      unless served.any (·.1 == key) do
         failures := failures.push s!"the spec documents {key}, which is not served"
   return failures
 
 def all : List (String × Test) :=
   [("theApiNeedsTheSecret", theApiNeedsTheSecret),
+   ("loginsAreRateLimited", loginsAreRateLimited),
+   ("credentialsAreChecked", credentialsAreChecked),
    ("pathsNameOnlyThemselves", pathsNameOnlyThemselves),
    ("aReviewIsDraftedAndApproved", aReviewIsDraftedAndApproved),
    ("inputsAreChecked", inputsAreChecked),
