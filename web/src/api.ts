@@ -55,6 +55,8 @@ export interface Repo {
   /** Incremented by every write of the settings; sent back to have a stale write refused (409). */
   version: number;
   createdAt: string;
+  /** Settings a newer build knows: sent back as they were read. */
+  [field: string]: unknown;
 }
 
 /**
@@ -67,6 +69,7 @@ export interface RepoSettings {
   autoReview?: boolean;
   trustedReviewers?: string[];
   version?: number;
+  [field: string]: unknown;
 }
 
 /**
@@ -444,12 +447,10 @@ export const api = {
 
   repos: () => request<{ items: Repo[] }>("GET", "/api/v1/repos").then((r) => r.items),
   /**
-   * Replaces the mode and autoReview: both are sent, since an omitted one would fall back to its
-   * default. The trusted reviewers are kept.
+   * Write the settings named; see `RepoSettings` for what an omitted one does. Callers send the
+   * `version` they read (0 to register), so that a write over a newer one is a 409; `putBody` in
+   * `repoSettings.ts` makes the body from what was read.
    */
-  putRepo: (owner: string, name: string, mode: PostingMode, autoReview: boolean) =>
-    request<Repo>("PUT", `/api/v1/repos/${seg(owner)}/${seg(name)}`, { mode, autoReview }),
-  /** Write the settings named; see `RepoSettings` for what an omitted one does. */
   putRepoSettings: (owner: string, name: string, settings: RepoSettings) =>
     request<Repo>("PUT", `/api/v1/repos/${seg(owner)}/${seg(name)}`, settings),
   deleteRepo: (owner: string, name: string) =>
@@ -560,17 +561,23 @@ export const api = {
     which: { samples: string[] } | { count: number },
   ) => request<CalibrationRun>("POST", `${calibration(owner, name)}/runs`, which),
   /** One page of the runs, newest first, each with its aggregate. */
-  calibrationRuns: (owner: string, name: string, limit = 50, offset = 0) =>
+  calibrationRuns: (owner: string, name: string, limit = 50, offset = 0, stale = false) =>
     request<Page<CalibrationRun>>(
       "GET",
-      `${calibration(owner, name)}/runs?${pageQuery(limit, offset)}`,
+      `${calibration(owner, name)}/runs?${pageQuery(limit, offset)}${staleQuery(stale, "&")}`,
     ),
-  /** One run, with each sample's result. */
-  calibrationRun: (owner: string, name: string, id: string) =>
-    request<CalibrationRun>("GET", `${calibration(owner, name)}/runs/${seg(id)}`),
-  /** The aggregate over every run, and by rubric version. */
-  calibrationSummary: (owner: string, name: string) =>
-    request<CalibrationSummary>("GET", `${calibration(owner, name)}/summary`),
+  /** One run, with each sample's result; `stale` counts stale scores in its aggregate. */
+  calibrationRun: (owner: string, name: string, id: string, stale = false) =>
+    request<CalibrationRun>(
+      "GET",
+      `${calibration(owner, name)}/runs/${seg(id)}${staleQuery(stale, "?")}`,
+    ),
+  /** The aggregate over every run, and by rubric version; `stale` counts stale scores too. */
+  calibrationSummary: (owner: string, name: string, stale = false) =>
+    request<CalibrationSummary>(
+      "GET",
+      `${calibration(owner, name)}/summary${staleQuery(stale, "?")}`,
+    ),
 };
 
 function calibration(owner: string, name: string): string {
@@ -581,6 +588,11 @@ function calibration(owner: string, name: string): string {
 export interface Page<T> {
   items: T[];
   nextOffset: number | null;
+}
+
+/** `?stale=include` (or `&…`) when stale scores are to be counted. */
+function staleQuery(stale: boolean, sep: "?" | "&"): string {
+  return stale ? `${sep}stale=include` : "";
 }
 
 function pageQuery(limit: number, offset: number): string {
@@ -605,6 +617,23 @@ export function nextStatuses(s: string): JobStatus[] {
     default:
       return [];
   }
+}
+
+/**
+ * Whether the job is a review to post: of the kind `review` (or from a server older than kinds).
+ * A calibration job, or one of a kind a newer build wrote, is never approved, edited or posted.
+ */
+export function isReviewJob(j: Pick<Job, "kind">): boolean {
+  return j.kind === undefined || j.kind === "review";
+}
+
+/**
+ * The moves a person makes from the job's page: a review's as `nextStatuses`; a calibration job
+ * only runs again once failed; a kind this build does not know, none.
+ */
+export function jobMoves(j: Pick<Job, "kind" | "status">): JobStatus[] {
+  if (isReviewJob(j)) return nextStatuses(j.status);
+  return j.kind === "calibration" && j.status === "failed" ? ["pending"] : [];
 }
 
 /** Whether a GitHub URL the server recorded may be shown as a link: GitHub's own pages only. */

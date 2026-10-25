@@ -6,7 +6,8 @@ import {
   canEdit,
   canPost,
   githubLink,
-  nextStatuses,
+  isReviewJob,
+  jobMoves,
   UnauthorizedError,
   type Decision,
   type InlineComment,
@@ -304,7 +305,10 @@ function JobView({ id, onUnauthorized }: { id: string; onUnauthorized: () => voi
   // A post that may have reached GitHub: until it is settled, what the review says is what may
   // have been posted, and the server refuses edits and moves (409). The page does not offer them.
   const claimed = job.postStartedAt !== null;
-  const editable = canEdit(job.status) && job.reviewError === null && offer === null && !claimed;
+  // A calibration job's review is what the agent submitted, scored as it was: never edited.
+  const reviewJob = isReviewJob(job);
+  const editable =
+    reviewJob && canEdit(job.status) && job.reviewError === null && offer === null && !claimed;
   const atCap = current.comments.length >= MAX_COMMENTS;
 
   const fail = (err: unknown) => {
@@ -454,7 +458,8 @@ function JobView({ id, onUnauthorized }: { id: string; onUnauthorized: () => voi
 
   const checkGitHub = () => run(api.reconcileJob(job.id, job.version));
 
-  const moves = nextStatuses(job.status);
+  const moves = jobMoves(job);
+  const postable = reviewJob && canPost(job.status);
   const blockers = postBlockers(job, dirty, diff, diffError, placement);
   const posted = githubLink(job.postedUrl);
   const splitCount = placement.split.size;
@@ -462,7 +467,11 @@ function JobView({ id, onUnauthorized }: { id: string; onUnauthorized: () => voi
   return (
     <FormsContext.Provider value={reportForm}>
       <p className="crumbs">
-        <Link to="/">Reviews</Link>
+        {reviewJob ? (
+          <Link to="/">Reviews</Link>
+        ) : (
+          <Link to="/?kind=calibration">Calibration jobs</Link>
+        )}
       </p>
       <h1>
         {job.owner}/{job.name}#{job.prNumber}{" "}
@@ -514,6 +523,7 @@ function JobView({ id, onUnauthorized }: { id: string; onUnauthorized: () => voi
         <dd className="data">{job.updatedAt}</dd>
       </dl>
 
+      {!reviewJob && <CalibrationNotice job={job} />}
       {offer !== null && (
         <div className="notice warn-notice" role="alert">
           <p>
@@ -623,7 +633,7 @@ function JobView({ id, onUnauthorized }: { id: string; onUnauthorized: () => voi
       )}
       {rebased !== null && edits !== null && <ConflictNotice rebased={rebased} onPick={pick} />}
 
-      {(moves.length > 0 || canPost(job.status)) && (
+      {(moves.length > 0 || postable) && (
         <div className="actions">
           {moves.map((s) => (
             <button
@@ -636,7 +646,7 @@ function JobView({ id, onUnauthorized }: { id: string; onUnauthorized: () => voi
               {actionLabel[s] ?? s}
             </button>
           ))}
-          {canPost(job.status) && (
+          {postable && (
             <button
               type="button"
               disabled={busy || blockers.length > 0 || confirmPost}
@@ -651,14 +661,14 @@ function JobView({ id, onUnauthorized }: { id: string; onUnauthorized: () => voi
           )}
         </div>
       )}
-      {canPost(job.status) && blockers.length > 0 && (
+      {postable && blockers.length > 0 && (
         <ul id="post-blockers" className="mute small-text blockers">
           {blockers.map((b) => (
             <li key={b}>Not postable yet: {b}</li>
           ))}
         </ul>
       )}
-      {confirmPost && canPost(job.status) && blockers.length === 0 && (
+      {confirmPost && postable && blockers.length === 0 && (
         <PostDialog
           job={job}
           busy={busy}
@@ -746,6 +756,40 @@ function JobView({ id, onUnauthorized }: { id: string; onUnauthorized: () => voi
         </div>
       )}
     </FormsContext.Provider>
+  );
+}
+
+/** What a job that is not a review is: never posted, and for a calibration job, what it is of. */
+function CalibrationNotice({ job }: { job: Job }) {
+  const base = `/repos/${encodeURIComponent(job.owner)}/${encodeURIComponent(job.name)}/calibration`;
+  if (job.kind !== "calibration")
+    return (
+      <p className="notice warn-notice">
+        A <span className="data">{String(job.kind)}</span> job, of a kind this version does not
+        know: it is never posted, and shown read-only.
+      </p>
+    );
+  return (
+    <div className="notice calibration-notice">
+      <p>
+        <strong>A calibration job: never posted.</strong> The agent reviewed a past commit a trusted
+        reviewer has reviewed, and its draft is scored against that review. It cannot be approved,
+        edited or posted, in a direct repository too.
+      </p>
+      <p>
+        {job.sampleId !== null && job.sampleId !== undefined && (
+          <>
+            <Link to={`${base}/samples/${encodeURIComponent(job.sampleId)}`}>Its sample</Link>
+            {" · "}
+          </>
+        )}
+        {job.runId !== null && job.runId !== undefined && (
+          <Link to={`${base}/runs/${encodeURIComponent(job.runId)}`}>its run and score</Link>
+        )}
+        {job.status === "failed" &&
+          " · Running it again is charged to the repository's daily cap of calibration jobs."}
+      </p>
+    </div>
   );
 }
 

@@ -1,11 +1,13 @@
 import { useCallback, useState, type FormEvent } from "react";
-import { Link } from "react-router-dom";
-import { api, UnauthorizedError, type Job, type Repo } from "../api";
+import { Link, useSearchParams } from "react-router-dom";
+import { api, UnauthorizedError, type Job, type JobKind, type Repo } from "../api";
 import { countSeverity } from "../review";
 import { useLoad } from "../useLoad";
 
 export function JobsPage({ onUnauthorized }: { onUnauthorized: () => void }) {
-  const fetchAll = useCallback(() => Promise.all([api.jobs(), api.repos()]), []);
+  const [params, setParams] = useSearchParams();
+  const kind = kindOf(params.get("kind"));
+  const fetchAll = useCallback(() => Promise.all([api.jobs(kind), api.repos()]), [kind]);
   const { data, error, reload, setError } = useLoad(fetchAll, onUnauthorized);
   const [repo, setRepo] = useState("");
   const [pr, setPr] = useState("");
@@ -74,16 +76,44 @@ export function JobsPage({ onUnauthorized }: { onUnauthorized: () => void }) {
         </p>
       )}
 
+      <fieldset className="kind-filter">
+        <legend>Show</legend>
+        {kinds.map((k) => (
+          <label key={k.value} className="check">
+            <input
+              type="radio"
+              name="kind"
+              checked={kind === k.value}
+              onChange={() =>
+                setParams(
+                  (p) => {
+                    const n = new URLSearchParams(p);
+                    if (k.value === "review") n.delete("kind");
+                    else n.set("kind", k.value);
+                    return n;
+                  },
+                  { replace: true },
+                )
+              }
+            />
+            {k.label}
+          </label>
+        ))}
+      </fieldset>
+
       {data === null ? (
         <p className="mute">Loading…</p>
       ) : jobs.length === 0 ? (
-        <p className="mute">No reviews yet.</p>
+        <p className="mute">
+          {kind === "calibration" ? "No calibration jobs yet." : "No reviews yet."}
+        </p>
       ) : (
         <div className="table-scroll">
           <table>
             <thead>
               <tr>
                 <th>Pull request</th>
+                {kind !== "review" && <th>Kind</th>}
                 <th>Status</th>
                 <th>Type</th>
                 <th>Comments</th>
@@ -101,6 +131,11 @@ export function JobsPage({ onUnauthorized }: { onUnauthorized: () => void }) {
                       {j.owner}/{j.name}#{j.prNumber}
                     </Link>
                   </td>
+                  {kind !== "review" && (
+                    <td>
+                      <span className={`tag kind-${j.kind ?? "review"}`}>{j.kind ?? "review"}</span>
+                    </td>
+                  )}
                   <td>
                     <span className={`status s-${j.status}`}>{j.status}</span>
                   </td>
@@ -125,6 +160,17 @@ export function JobsPage({ onUnauthorized }: { onUnauthorized: () => void }) {
       )}
     </>
   );
+}
+
+const kinds: { value: JobKind | "all"; label: string }[] = [
+  { value: "review", label: "Reviews" },
+  { value: "calibration", label: "Calibration jobs (never posted)" },
+  { value: "all", label: "All" },
+];
+
+/** The kind of jobs `?kind=` asks for: reviews unless it names another. */
+function kindOf(k: string | null): JobKind | "all" {
+  return k === "calibration" || k === "all" ? k : "review";
 }
 
 /** How many blockers and majors a review carries, said in words as well as numbers. */
