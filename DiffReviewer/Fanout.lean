@@ -121,8 +121,14 @@ def SubRun.toRow (s : SubRun) : Store.SubRunRow :=
 
 def SubRun.isFinal (s : SubRun) : Bool := finalStatuses.contains s.status
 
-/-- The id an agent names the sub-run by (`--job`), `<job>.<key>`. -/
-def SubRun.agentId (s : SubRun) : String := s!"{s.jobId}.{s.key}"
+/-- The id an agent names the sub-run by (`--job`): `<job>.<key>` for its first run, and
+    `<job>.<key>.<n>` for its `n`th, so that the platform can tell a run it gave up on — which
+    may still submit — from the one that replaced it. -/
+def SubRun.agentIdFor (s : SubRun) (attempt : Nat) : String :=
+  if attempt ≤ 1 then s!"{s.jobId}.{s.key}" else s!"{s.jobId}.{s.key}.{attempt}"
+
+/-- The id the agent of its latest run names it by. -/
+def SubRun.agentId (s : SubRun) : String := s.agentIdFor s.attempts
 
 /-- Orchestra's id for the sub-run's current attempt: `<base>.<key>` for the first, and
     `<base>.<key>.<n>` for the `n`th, since orchestra answers an id it has seen with the entry it
@@ -229,8 +235,11 @@ def dedupe (cs : List InlineComment) : List InlineComment × Nat := Id.run do
     match kept.findIdx? (duplicate · c) with
     | some i =>
       merged := merged + 1
+      -- The more severe replaces the other whole — its body, category, severity, suggestion and
+      -- id together — so that no comment says one thing filed under another's category.
       if let some k := kept[i]? then
-        if severityRank c.severity > severityRank k.severity then kept := kept.set! i c
+        if severityRank c.severity > severityRank k.severity then
+          kept := kept.set! i c
     | none => kept := kept.push c
   return (kept.toList, merged)
 
@@ -309,43 +318,30 @@ def fetchAll (jobId : String) : Sqlite.M (Array SubRun) := do
   let subs := rows.map SubRun.ofRow
   return subs.qsort fun a b => a.round < b.round || (a.round == b.round && a.position < b.position)
 
-/-- The current sub-runs of job `jobId`: those of its latest round, in merge order; none for a
-    job that is not fanned out. -/
+/-- The current sub-runs of job `jobId`: those of the round its current attempt fanned out to
+    (`Job.fanoutRound`), in merge order; none for a job run as one run — a job fanned out once and
+    run again as one run has only history. -/
 def fetchCurrent (jobId : String) : Sqlite.M (Array SubRun) := do
-  let all ← fetchAll jobId
-  let some last := all.back? | return #[]
-  return all.filter (·.round == last.round)
+  let some job ← Platform.fetchJob jobId | return #[]
+  let some round := job.fanoutRound | return #[]
+  return (← fetchAll jobId).filter (·.round == round)
 
 def current (jobId : String) : IO (Array SubRun) := Store.run (fetchCurrent jobId)
 
-/-- The current sub-runs of every job of `owner/name` that has any, by job; or of every
-    repository with `none`. -/
-def currentByJob (repo : Option (String × String) := none) :
-    IO (List (String × Array SubRun)) := do
+/-- The current sub-runs of each of `jobs` that is fanned out, by job id (`fetchCurrent`). -/
+def currentByJob (jobs : Array Job) : IO (List (String × Array SubRun)) := do
   let rows ← Store.run <| HasModel.fetch <| query% do
     let s ← from Store.SubRunRow
     select s
-  let subs := (rows.map SubRun.ofRow).filter fun s =>
-    repo.all fun (o, n) => s.owner == o && s.name == n
-  let jobs := (subs.map (·.jobId)).toList.eraseDups
-  return jobs.map fun j =>
-    let mine := subs.filter (·.jobId == j)
-    let last := mine.foldl (fun r s => max r s.round) 0
-    (j, (mine.filter (·.round == last)).qsort (·.position < ·.position))
-
-/-- How many sub-runs of `owner/name` were made at or after `since`, and the jobs that ever had
-    any: with the jobs that never did, what a repository has spent of a day's cap. -/
-def madeSinceIn (owner name since : String) : Sqlite.M (Nat × List String) := do
-  let rows ← HasModel.fetch <| query% do
-    let s ← from Store.SubRunRow
-    guard s.owner = owner
-    guard s.name = name
-    select s
-  return ((rows.filter (·.created_at ≥ since)).size, (rows.map (·.job_id)).toList.eraseDups)
+  let subs := rows.map SubRun.ofRow
+  return (jobs.toList.filterMap fun j => j.fanoutRound.map fun r =>
+    (j.id, (subs.filter fun s => s.jobId == j.id && s.round == r).qsort
+      (·.position < ·.position)))
 
 /-- What `owner/name` has spent of its daily cap of review jobs since `since`: one for each review
-    job made since that was never fanned out, and one for each sub-run of a review job made
-    since. -/
+    job made since whose current attempt is one run — a job fanned out before and run again as
+    one run counts for that run too — and, for each sub-run of a review job made since, one for
+    each of its runs (a sub-run run again costs twice). -/
 def reviewSpendIn (owner name since : String) : Sqlite.M Nat := do
   let rows ← HasModel.fetch <| query% do
     let j ← from Store.JobRow
@@ -359,26 +355,34 @@ def reviewSpendIn (owner name since : String) : Sqlite.M Nat := do
     guard s.owner = owner
     guard s.name = name
     select s
-  let fanned := (subs.map (·.job_id)).toList.eraseDups
-  let single := jobs.filter fun j => j.isReview && j.createdAt ≥ since && !fanned.contains j.id
+  let single := jobs.filter fun j => j.isReview && j.createdAt ≥ since && j.fanoutRound.isNone
   let subsSince := subs.filter fun s => s.created_at ≥ since && reviews.contains s.job_id
-  return single.size + subsSince.size
+  return single.size + subsSince.foldl (fun n s => n + max 1 s.attempts.toNat) 0
 
 def reviewSpend (owner name since : String) : IO Nat := Store.run (reviewSpendIn owner name since)
 
 /-- The check of `owner/name`'s daily cap of review jobs for review job `job` fanned out to `size`
     sub-runs, inside the transaction that makes them: its sub-runs count in place of the job, which
-    counted for one if it was made since `since` and never fanned out. Why not, when they would
-    pass `cap`. -/
+    counted for one if it was made since `since` (it is pending, so not fanned out now). Why not,
+    when they would pass `cap`. -/
 def reviewChargeIn (job : Job) (size cap : Nat) (since : String) :
     Sqlite.M (Except String Unit) := do
   let spent ← reviewSpendIn job.owner job.name since
-  let (_, fanned) ← madeSinceIn job.owner job.name since
-  let self := if job.createdAt ≥ since && !fanned.contains job.id then 1 else 0
+  let self := if job.createdAt ≥ since && job.fanoutRound.isNone then 1 else 0
   if spent - self + size > cap then
     return .error s!"{job.owner}/{job.name} has spent {spent} of its {cap} review jobs in the last \
 24 hours (--max-jobs-per-day), each sub-run of a fan-out counting as one; this review's {size} \
 sub-runs would pass it, and wait"
+  return .ok ()
+
+/-- The check of `owner/name`'s daily cap of review jobs for running a sub-run of review job `job`
+    again, which costs one more: why not, when it would pass `cap`. -/
+def reviewRetryChargeIn (job : Job) (cap : Nat) (since : String) :
+    Sqlite.M (Except String Unit) := do
+  let spent ← reviewSpendIn job.owner job.name since
+  if spent + 1 > cap then
+    return .error s!"{job.owner}/{job.name} has spent {spent} of its {cap} review jobs in the last \
+24 hours (--max-jobs-per-day); the sub-run is not run again"
   return .ok ()
 
 /-- Why a fan-out was not begun. -/
@@ -413,6 +417,7 @@ def begin (job : Job) (learnt : Job → Job) (plan : FanoutPlan) (rubricVersion 
     let next := { learnt j with
       statusRaw := JobStatus.queued.toString, queueEntry := none, attempts := j.attempts + 1
       error := none, prType := plan.prType, rubricVersion := some rubricVersion
+      fanoutRound := some j.attempts
       version := j.version + 1, updatedAt := now }
     HasModel.save next.toRow
     return .ok (next, subs)

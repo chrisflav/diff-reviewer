@@ -170,11 +170,13 @@ structure Scope where
   category : Option Category
   /-- The categories the other sub-runs review. -/
   others   : List String
+  /-- What its agent names it by: `<job>.<key>`, and `<job>.<key>.<n>` for its `n`th run. -/
+  ref      : String
 
-/-- The id the agent names its job by: the job's, or `<job>.<key>` for a sub-run. -/
+/-- The id the agent names its job by: the job's, or the sub-run's (`Scope.ref`). -/
 def agentRef (job : Job) (scope : Option Scope) : String :=
   match scope with
-  | some sc => sc.sub.agentId
+  | some sc => sc.ref
   | none => job.id
 
 /-- The step of `prompt` that has the agent check out the commit under review. A calibration
@@ -406,8 +408,8 @@ def categoryOf (doc : Rubric) (prType : Option String) (name : String) : Option 
   | none => (doc.prTypes.flatMap (·.categories)).find? (·.name == name)
 
 /-- The scope of each of `subs`, the sub-runs of `job`, under the rubric version the job fanned
-    out by. -/
-def scopesOf (job : Job) (subs : Array Fanout.SubRun) : IO (Array Scope) := do
+    out by; named for the run about to be queued (`next`), or for the latest. -/
+def scopesOf (job : Job) (subs : Array Fanout.SubRun) (next := true) : IO (Array Scope) := do
   let doc ← match job.rubricVersion with
     | some v => pure ((← Platform.rubricAt job.owner job.name v).bind (·.rubric?.toOption))
     | none => pure none
@@ -417,7 +419,8 @@ def scopesOf (job : Job) (subs : Array Fanout.SubRun) : IO (Array Scope) := do
       ((doc.bind (categoryOf · job.prType name)).getD { name })
     { sub, category, others := match sub.category with
         | some c => cats.filter (· != c)
-        | none => cats }
+        | none => cats
+      ref := if next then sub.agentIdFor (sub.attempts + 1) else sub.agentId }
 
 /-! ## Pull request metadata and diffs -/
 
@@ -839,8 +842,15 @@ def queueSubRuns (s : Services) (job : Job) : IO Unit := do
         return { cur with status := "queued", queueEntry := some entry.id
                           attempts := cur.attempts + 1, error := none }
       match r with
-      | .ok _ => s.log s!"queued sub-run {sub.agentId} as orchestra entry {entry.id}"
-      | .error _ => s.log s!"sub-run {sub.agentId} changed while it was queued as entry {entry.id}"
+      | .ok _ => s.log s!"queued sub-run {scope.ref} as orchestra entry {entry.id}"
+      | .error _ =>
+        -- Retired, or submitted by a run given up on, meanwhile: the run is not wanted — unless
+        -- another process recorded this very entry.
+        let now := (← Fanout.current job.id).find? (·.id == sub.id)
+        unless now.any (·.queueEntry == some entry.id) do
+          if let .error e ← orch.cancel entry.id then
+            s.log s!"cancelling entry {entry.id} of sub-run {scope.ref}: {e}"
+        s.log s!"sub-run {scope.ref} changed while it was queued as entry {entry.id}"
 
 /-- Queueing: every `pending` job of a registered repository whose head is still its pull
     request's, onto orchestra, once its diff has been fetched and found small enough. A calibration
@@ -936,10 +946,17 @@ default and {plan.categories.length} categories), more than {repo.slug}'s maxFan
         unless j.status? == some .pending do throw (.conflict "moved on")
         return { j with headSha := job.headSha, baseSha := job.baseSha, title := job.title
                         prBody := job.prBody, statusRaw := JobStatus.queued.toString
-                        queueEntry := some entry.id, attempts := j.attempts + 1, error := none }
+                        queueEntry := some entry.id, attempts := j.attempts + 1, error := none
+                        fanoutRound := none }
       match r with
       | .ok _ => s.log s!"queued job {job.id} as orchestra entry {entry.id}"
-      | .error _ => s.log s!"job {job.id} changed while it was queued as entry {entry.id}"
+      | .error _ =>
+        -- Retired meanwhile: the run is not wanted — unless another process recorded this entry.
+        let now ← Platform.findJob job.id
+        unless now.any (·.queueEntry == some entry.id) do
+          if let .error e ← orch.cancel entry.id then
+            s.log s!"cancelling entry {entry.id} of job {job.id}: {e}"
+        s.log s!"job {job.id} changed while it was queued as entry {entry.id}"
 
 /-- The sub-runs still to queue of the fan-out jobs under way: one queueing failed, or a run ended
     without a submission and is run again. -/
@@ -996,6 +1013,14 @@ private def markRunning (id : String) : IO Unit := do
     unless j.status? == some .queued do throw (.conflict "moved on")
     return { j with statusRaw := JobStatus.running.toString }
 
+/-- The charge for running a sub-run of `job` again, against its day's cap: why not, past it. -/
+private def chargeRetry (s : Services) (job : Job) : IO (Except String Unit) := do
+  let since := isoOfEpoch ((← nowEpoch) - 86400)
+  Store.transact do
+    if job.kind? == some .calibration then
+      Calibration.chargeRetryIn job s.limits.maxCalibrationJobsPerDay
+    else Fanout.reviewRetryChargeIn job s.limits.maxJobsPerDay since
+
 /-- Following the sub-runs of every fan-out job under way, as `follow` follows a job: `running`
     when its run starts; when it ends without a submission, `pending` to run again while it has
     had fewer than `Fanout.maxAttempts` runs, and `failed` after. Then each job is settled: merged
@@ -1014,13 +1039,20 @@ def followSubRuns (s : Services) : IO Unit := do
           let ended := Orchestra.terminal e.status
           let starts := e.status == "running" && sub.status == "queued"
           if !ended && !starts && e.id == entryId then continue
+          -- Running it again costs a run more, charged like the first: past the cap it fails.
+          let charged ← if ended && sub.attempts < Fanout.maxAttempts then
+              chargeRetry s job else pure (.ok ())
           let r ← Fanout.update sub.id fun _ cur => do
             unless cur.status == "queued" || cur.status == "running" do throw "moved on"
             let cur := { cur with queueEntry := some e.id }
             if ended then
               let why := s!"the run ended ({e.status}) without submitting a review"
               if cur.attempts < Fanout.maxAttempts then
-                return { cur with status := "pending", error := some s!"{why}; it is run again" }
+                match charged with
+                | .ok () =>
+                  return { cur with status := "pending", error := some s!"{why}; it is run again" }
+                | .error capped =>
+                  return { cur with status := "failed", error := some s!"{why}; {capped}" }
               return { cur with status := "failed", error := some why }
             if starts then return { cur with status := "running" }
             return cur

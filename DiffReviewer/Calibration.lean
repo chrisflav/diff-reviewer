@@ -832,6 +832,17 @@ def chargeFanoutIn (job : Job) (size cap : Nat) : Sqlite.M (Except String Unit) 
   for _ in [0:more] do charge job.owner job.name job.id now
   return .ok ()
 
+/-- The charge for running a sub-run of calibration job `job` again, inside a transaction: why
+    not when it would pass `cap`. -/
+def chargeRetryIn (job : Job) (cap : Nat) : Sqlite.M (Except String Unit) := do
+  let now ← nowIso
+  let made ← chargesSince job.owner job.name (isoOfEpoch ((← nowEpoch) - 86400))
+  if made + 1 > cap then
+    let why := capMessage s!"{job.owner}/{job.name}" made 1 cap
+    return .error s!"{why}; the sub-run is not run again"
+  charge job.owner job.name job.id now
+  return .ok ()
+
 /-- A run of `repo` over `sampleIds`: one `pending` calibration job for each, at the sample's
     commit and with its base. In one transaction with the checks that every sample is the
     repository's, not deleted and not being reviewed by a live calibration job already — one
@@ -907,7 +918,7 @@ here")
     if made + 1 > cap then return .error (capError s!"{job.owner}/{job.name}" made 1 cap)
     let next := { job with statusRaw := JobStatus.pending.toString, queueEntry := none
                            error := none, postDirect := false, version := job.version + 1
-                           updatedAt := now }
+                           updatedAt := now, fanoutRound := none }
     HasModel.save next.toRow
     charge job.owner job.name id now
     return .ok next

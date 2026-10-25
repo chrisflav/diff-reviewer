@@ -668,7 +668,11 @@ what no category covers. Each is an orchestra task of its own.
   under, its scope (`subRun`, and at the end of its `instructions`) and the type (`prType`). Its
   submission is a partial review, checked as a review is, with every comment of its category for a
   category's sub-run, and kept on the sub-run. A run that ends without a submission is run once
-  more (`<job>.<key>.2`); then the sub-run has failed. The job's answers show its sub-runs
+  more (`<job>.<key>.2`, which its agent is named by too), charged against the day's cap like the
+  first — past it, the sub-run fails instead; then the sub-run has failed. A run given up on may
+  still submit, and the run that replaced it is then cancelled. The sub-runs are those of the job's
+  current attempt (`fanoutRound`): a job run again — fanned out anew, or as one run when the rubric
+  no longer fans out — leaves the old round as history, shown nowhere and naming nothing. The job's answers show its sub-runs
   (`subRuns`): key, category, status, attempts, error, how many comments.
 - **The merge.** When every sub-run has submitted or failed, their reviews are merged into the
   job's draft — the agent's one revision, which a calibration job is scored on — and it goes on as
@@ -688,6 +692,9 @@ what no category covers. Each is an orchestra task of its own.
   waits, `pending`, saying why. A repository's `maxFanout` (8 by default, 1 to 51) bounds the
   sub-runs of one review, the default's among them: a review that would make more fails, saying
   so — raise it, or fix a type with fewer categories. Running a failed job again fans it out anew.
+- **Rubric proposals** show a change of `fanout`, of the document or of a type, in their diff: a
+  proposal that turns fan-out on multiplies what reviews cost, and one that turns it off drops
+  what a person set.
 - **Calibration** jobs fan out as review jobs do — each sub-run narrowed and told it is not
   posted — and are scored on the merged draft.
 

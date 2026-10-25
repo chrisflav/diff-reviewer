@@ -62,6 +62,12 @@ def strOf (j : Json) (k : String) : Option String := (j.getObjValAs? String k).t
 
 def has (s t : String) : Bool := (s.splitOn t).length > 1
 
+/-- The JSON at `path` of `j`, compressed. -/
+def str? (j : Json) (path : List String) : Option String :=
+  match path with
+  | [] => some j.compress
+  | k :: ks => (j.getObjVal? k).toOption.bind (str? · ks)
+
 /-- Fan-out is planned from the fixed type, or the document, never from a type the agent would
     pick; keys are made of the categories' names, unique, and never a number. -/
 def theFanoutIsPlanned : Test := do
@@ -85,6 +91,16 @@ def theFanoutIsPlanned : Test := do
     ++ check (back == some doc) "the fanout flag survives a round trip"
     ++ check (!has (doc.toJson.compress) "\"fanout\":false") "and is written only when on"
     ++ check ((Rubric.ofJson (.mkObj [("fanout", "yes")])) matches .error _) "a fanout not a bool"
+    ++ checkEq (str? (Proposal.diffJson doc docWide) ["fanout", "after"]) (some "true")
+      "a proposal's diff shows the document's fanout"
+    ++ checkEq (str? (Proposal.diffJson docWide docWide) ["fanout"]) (some "null")
+      "and nothing when it is the same"
+    ++ checkEq (str? (Proposal.diffJson doc { doc with prTypes := doc.prTypes.map fun t =>
+        { t with fanout := false } }) ["typesChanged"])
+      (some "[{\"categoriesAdded\":[],\"categoriesChanged\":[],\"categoriesRemoved\":[],\
+\"description\":null,\"fanout\":{\"after\":false,\"before\":true},\"name\":\"feature\",\
+\"rubric\":null}]")
+      "a type whose fanout alone changed is changed"
     ++ checkEq (Fanout.keysOf ["Correctness", "naming!", "default", "42", "naming?", ""])
       ["default", "correctness", "naming", "default-2", "c42", "naming-2", "c"] "the keys"
 
@@ -120,6 +136,9 @@ def theMergeRules : Test := do
       "the duplicate merged into the first's place, the more severe kept"
     ++ checkEq (m.comments.map (·.severity)) [some .major, some .blocker, some .minor]
       "their severities"
+    ++ checkEq ((m.comments.head?).map fun c => (c.body, c.category))
+      (some ("rename this variable, to something clearer", some "correctness"))
+      "the kept comment's body and category are its own"
     ++ checkEq (m.comments.map (·.id)) [some "x1", none, some "x2"] "a repeated id cleared"
     ++ checkEq ids.length 3 "every comment has an id once assigned"
     ++ checkEq ids.eraseDups.length 3 "and they are unique"
@@ -400,6 +419,94 @@ def calibrationFansOut : Test := withTempDb do
     ++ checkEq (ratio ["score", "precision"]) (some "0.5") "scored on the merged draft: precision"
     ++ checkEq (ratio ["score", "recall"]) (some "0.5") "and recall"
 
+/-- A job fanned out, failed, and run again as one run — its rubric no longer fans out — is that
+    one run: the old round is history, shown nowhere, naming nothing on the agent API, never
+    settled over the new run's draft. -/
+def aStaleRoundIsHistory : Test := withTempDb do
+  let gh ← FakeGitHub.new #[pull7 jobHead]
+  let orch ← FakeOrchestra.new
+  let logs ← IO.mkRef #[]
+  let svc ← services gh orch logs
+  let st ← State.new cfg svc
+  let id ← fannedRepo st
+  Workers.queuePending svc
+  for e in ["e0", "e1", "e2"] do orch.set e "failed"
+  Workers.followSubRuns svc
+  Workers.queueRetries svc
+  for e in ["e3", "e4", "e5"] do orch.set e "failed"
+  Workers.followSubRuns svc
+  let some failed ← Platform.findJob id | return #["the job is gone"]
+  let _ ← route st (req .put "/api/v1/repos/acme/widgets" "{\"prType\": \"\"}")
+  let _ ← route st (req .post s!"/api/v1/jobs/{id}/status" (statusBody "pending" failed.version))
+  Workers.queuePending svc
+  let queued ← route st (req .get s!"/api/v1/jobs/{id}")
+  let stale ← route st (asJob (agentReq .get "") s!"{id}.default")
+  let shown ← route st (asJob (agentReq .get "") id)
+  Workers.followSubRuns svc
+  let some running ← Platform.findJob id | return #["the job is gone"]
+  let submitted ← route st (asJob (agentReq .post "/review"
+    (submission jobHead (prType := "\"feature\""))) id)
+  Workers.followSubRuns svc
+  let some after ← Platform.findJob id | return #["the job is gone"]
+  return checkEq failed.statusRaw "failed" "every sub-run failed"
+    ++ checkEq ((← orch.queued.get).back?.map (·.externalId)) (some s!"{id}.2")
+      "run again as one run"
+    ++ checkEq (subRunsOf queued) [] "the old round is not shown"
+    ++ checkStatus stale 404 "nor named"
+    ++ checkStatus shown 200 "the one run is answered"
+    ++ checkEq running.statusRaw "running" "and not failed by the old round"
+    ++ checkStatus submitted 200 "its review"
+    ++ checkEq after.statusRaw "draft" "is the draft"
+    ++ checkEq ((after.review?.bind (·.toOption)).map (·.body)) (some "Fine.")
+      "and no merge of the old round is written over it"
+
+/-- A run given up on may still submit: the run that replaced it, named `<job>.<key>.2`, is then
+    cancelled. Running a sub-run again costs a run more. -/
+def aGivenUpRunMaySubmit : Test := withTempDb do
+  let gh ← FakeGitHub.new #[pull7 jobHead]
+  let orch ← FakeOrchestra.new
+  let logs ← IO.mkRef #[]
+  let svc ← services gh orch logs
+  let st ← State.new cfg svc
+  let id ← fannedRepo st
+  Workers.queuePending svc
+  orch.set "e1" "unfinished"
+  Workers.followSubRuns svc
+  Workers.queueRetries svc
+  let retryPrompt := ((← orch.queued.get)[3]?.map (·.prompt)).getD ""
+  let spent ← Fanout.reviewSpend "acme" "widgets" "2000-01-01T00:00:00Z"
+  let late ← route st (asJob (agentReq .post "/review" (submission jobHead
+    (reviewJson "comment" "Late." [commentJson 4 4 "Off." "correctness" "minor"]) "\"feature\""))
+    s!"{id}.correctness")
+  let unknown ← route st (asJob (agentReq .get "") s!"{id}.naming.2")
+  return check (has retryPrompt s!"--job {id}.correctness.2") "the second run is named so"
+    ++ checkEq spent 4 "three sub-runs and a run again"
+    ++ checkStatus late 200 "the run given up on submits"
+    ++ checkEq (← orch.cancelled.get) #["e3"] "and the run that replaced it is cancelled"
+    ++ checkStatus unknown 404 "a run the platform never made"
+
+/-- A job retired between its queueing and the record of it has its run cancelled, as one run
+    and as a sub-run. -/
+def aRetiredJobsRunIsCancelled : Test := withTempDb do
+  let gh ← FakeGitHub.new #[pull7 jobHead]
+  let orch ← FakeOrchestra.new
+  let retiring : Orchestra.Client := { orch.client with
+    queue := fun r => do
+      let e ← orch.client.queue r
+      for j in ← Platform.jobsOfPull "acme" "widgets" 7 do
+        let _ ← Platform.updateJob j.id fun j => return { j with statusRaw := "stale" }
+      return e }
+  let svc ← Workers.Services.new (some gh.client) (some retiring) (fun _ => pure ())
+  let st ← State.new cfg svc
+  let _ ← newJob st
+  Workers.queuePending svc
+  let single ← orch.cancelled.get
+  let _ ← fannedRepo st
+  Workers.queuePending svc
+  let all ← orch.cancelled.get
+  return checkEq single #["e0"] "one run's entry"
+    ++ check (all.contains "e1") "a sub-run's entry"
+
 def all : List (String × Test) :=
   [("theFanoutIsPlanned", theFanoutIsPlanned),
    ("theMergeRules", theMergeRules),
@@ -407,6 +514,9 @@ def all : List (String × Test) :=
    ("subRunsAreBound", subRunsAreBound),
    ("aSubRunFails", aSubRunFails),
    ("fanoutsAreCapped", fanoutsAreCapped),
-   ("calibrationFansOut", calibrationFansOut)]
+   ("calibrationFansOut", calibrationFansOut),
+   ("aStaleRoundIsHistory", aStaleRoundIsHistory),
+   ("aGivenUpRunMaySubmit", aGivenUpRunMaySubmit),
+   ("aRetiredJobsRunIsCancelled", aRetiredJobsRunIsCancelled)]
 
 end DiffReviewerTest.Fanout

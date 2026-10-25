@@ -323,6 +323,9 @@ structure Job where
   /-- The version of the style notes the agent was given when it read the job, as
       `rubricVersion` records the rubric: what `Calibration.derivedOf` judges its score by. -/
   notesVersion : Option Nat := none
+  /-- The round of sub-runs the job's current attempt is reviewed by (`DiffReviewer.Fanout`), or
+      `none` when it is run as one run: a sub-run of any other round is history. -/
+  fanoutRound : Option Nat := none
 
 def Job.status? (j : Job) : Option JobStatus := JobStatus.ofString? j.statusRaw
 
@@ -392,7 +395,8 @@ def Job.ofRow (row : Store.JobRow) : Job :=
   , postedReview := row.posted_review, rubricVersion := row.rubric_version.map (·.toNat)
   , directPosts := (row.direct_posts.getD 0).toNat, postDirect := row.post_direct.getD false
   , kindRaw := row.kind, sampleId := row.sample_id, runId := row.run_id
-  , notesVersion := row.notes_version.map (·.toNat) }
+  , notesVersion := row.notes_version.map (·.toNat)
+  , fanoutRound := row.fanout_round.map (·.toNat) }
 
 def Job.toRow (j : Job) : Store.JobRow :=
   { id := j.id, owner := j.owner, name := j.name, pr_number := j.prNumber
@@ -405,7 +409,8 @@ def Job.toRow (j : Job) : Store.JobRow :=
   , posted_review := j.postedReview, rubric_version := j.rubricVersion.map Int.ofNat
   , direct_posts := some j.directPosts, post_direct := some j.postDirect
   , kind := j.kindRaw, sample_id := j.sampleId, run_id := j.runId
-  , notes_version := j.notesVersion.map Int.ofNat }
+  , notes_version := j.notesVersion.map Int.ofNat
+  , fanout_round := j.fanoutRound.map Int.ofNat }
 
 /-- The largest pull request number accepted: what fits a 32-bit column with room to spare. -/
 def maxPrNumber : Nat := 2147483647

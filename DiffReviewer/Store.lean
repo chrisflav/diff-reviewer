@@ -115,6 +115,9 @@ structure JobRow where
   /-- The version of the repository's style notes the agent was given when it read the job
       (`0005`), as `rubric_version` records the rubric it was checked against; none is none. -/
   notes_version : Option Int
+  /-- The round of sub-runs the job is reviewed by, when its current attempt fanned out
+      (`0006`); none for a job run as one run. Sub-runs of any other round are history. -/
+  fanout_round : Option Int
   deriving Repr
 
 /-- The diff of a pull request at one head commit, as GitHub gave it. A commit's diff never
@@ -396,8 +399,13 @@ structure SubRunRow where
 def jobKindIndex : TableIndex String :=
   { name := "idx_review_job_kind", keys := [{ column := "kind" }] }
 
+/-- A job's sub-runs are found by the job. -/
+def subRunJobIndex : TableIndex String :=
+  { name := "idx_fanout_run_job", keys := [{ column := "job_id" }] }
+
 def target : DatabaseRecipe :=
   (%database reviewdb).recipe.withIndexes "review_job" [jobKindIndex]
+    |>.withIndexes "fanout_run" [subRunJobIndex]
 
 /-- `0001_initial`: the repositories and the review jobs. -/
 def migration0001 : Db.Migration.Migration where
@@ -636,14 +644,16 @@ def migration0005 : Db.Migration.Migration where
            ("accepted_version", { type := .int, nullable := true })],
         primaryKey := ["id"] }]
 
-/-- `0006_m5`: fan-out — a repository's fixed pull request type and its bound on sub-runs, and the
-    sub-runs of each fan-out review. The new columns are nullable: a repository written before
+/-- `0006_m5`: fan-out — a repository's fixed pull request type and its bound on sub-runs, the
+    round of sub-runs a job is reviewed by, and the sub-runs of each fan-out review, found by
+    their job. The new columns are nullable: a repository written before
     lets the agent pick its type and may fan out to 8 sub-runs. -/
 def migration0006 : Db.Migration.Migration where
   name := "0006_m5"
   steps := [
     .addColumn "repo" "pr_type" { type := .text, nullable := true },
     .addColumn "repo" "max_fanout" { type := .int, nullable := true },
+    .addColumn "review_job" "fanout_round" { type := .int, nullable := true },
     .createTable "fanout_run"
       { columns := .ofList
           [("id", { type := .text, nullable := false }),
@@ -662,7 +672,8 @@ def migration0006 : Db.Migration.Migration where
            ("error", { type := .text, nullable := true }),
            ("created_at", { type := .text, nullable := false }),
            ("updated_at", { type := .text, nullable := false })],
-        primaryKey := ["id"] }]
+        primaryKey := ["id"] },
+    .createIndex "fanout_run" subRunJobIndex]
 
 /-- The migrations, in the order they are applied. Appended to, never edited. -/
 def migrations : List Db.Migration.Migration :=

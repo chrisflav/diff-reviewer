@@ -491,8 +491,13 @@ export type RubricProposalStatus = "pending" | "accepted" | "rejected";
 export type TextChange = { before: string; after: string } | null;
 
 /** What a proposal changes of the rubric version it was written from. */
+/** A flag before and after, or null when it is the same. */
+export type FlagChange = { before: boolean; after: boolean } | null;
+
 export interface RubricProposalDiff {
   defaultRubric: TextChange;
+  /** The document's `fanout`, when the proposal changes it (API 0.7.0). */
+  fanout?: FlagChange;
   typesAdded: PrType[];
   /** Their names. */
   typesRemoved: string[];
@@ -500,6 +505,8 @@ export interface RubricProposalDiff {
     name: string;
     description: TextChange;
     rubric: TextChange;
+    /** The type's `fanout`, when the proposal changes it (API 0.7.0). */
+    fanout?: FlagChange;
     categoriesAdded: Category[];
     categoriesRemoved: string[];
     /** Categories whose description changed. */

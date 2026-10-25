@@ -654,7 +654,7 @@ ask for a new one" .conflict
     -- Another run: the entry of the last one is history, and so is why it failed.
     if to == .pending then
       return { job with statusRaw := to.toString, queueEntry := none, error := none
-                        postDirect := false }
+                        postDirect := false, fanoutRound := none }
     -- A person's move ends the platform's own attempts to post.
     return { job with statusRaw := to.toString, postDirect := false }
 
@@ -940,9 +940,9 @@ private def apiRoute (st : State) (r : Req) (segs : List String) : IO Reply := d
       | some "all" => pure fun (_ : Job) => true
       | some k =>
         return .error s!"'kind' must be review, calibration, proposal or all, not '{k}'" .badRequest
-    let subs ← Fanout.currentByJob
-    return .json (items (((← Platform.listJobs).filter keep).map fun j =>
-      jobJson j ((subs.lookup j.id).getD #[])))
+    let jobs := (← Platform.listJobs).filter keep
+    let subs ← Fanout.currentByJob jobs
+    return .json (items (jobs.map fun j => jobJson j ((subs.lookup j.id).getD #[])))
   | ["jobs"], .post => createJob r.body
   | ["jobs", id], .get =>
     match ← Platform.findJob id with
@@ -1083,9 +1083,11 @@ def agentSegments (path : String) : Option (List String) :=
     running: guessing would let the run of a superseded head take over the review of the new one.
     A job of another kind — a rubric proposal — is refused (`404`): it has routes of its own.
 
-    A fan-out job is run by its sub-runs, each named `<job>.<key>` (`DiffReviewer.Fanout`): a
-    request naming the job alone is refused (`409`), and one naming a sub-run must name one of its
-    current round that is `queued` or `running`. The answer is the job and the sub-run named.
+    A fan-out job is run by its sub-runs, each named `<job>.<key>` — `<job>.<key>.<n>` for its
+    `n`th run (`DiffReviewer.Fanout`): a request naming the job alone is refused (`409`), and one
+    naming a sub-run must name a run the platform made of one of its current round (the job's
+    attempt's) that has not submitted, failed or been cancelled. The answer is the job, the sub-run
+    and the run named.
 
     kleis binds an agent's requests to its task's pull request, not to its job, so an agent could
     name another active job of the same pull request. Of the active jobs at one commit, only the one
@@ -1095,14 +1097,16 @@ def agentSegments (path : String) : Option (List String) :=
     same pull request can still be named; closing that needs kleis to bind the header to a fact of
     the task (its orchestra `external_id`), which it does not have. -/
 private def activeJob (owner name : String) (pr : Nat) (jobId : Option String) :
-    IO (Except Reply (Job × Option Fanout.SubRun)) := do
+    IO (Except Reply (Job × Option (Fanout.SubRun × Nat))) := do
   let some ref := jobId
     | return .error (Reply.error "name the job you run: X-Diff-Reviewer-Job (`--job <id>`, as \
 the prompt gives it)" .badRequest)
-  -- A sub-run of a fan-out is named `<job>.<key>`.
-  let (id, key) := match ref.splitOn "." with
-    | i :: k :: rest => (i, some (".".intercalate (k :: rest)))
-    | _ => (ref, none)
+  -- A sub-run of a fan-out is named `<job>.<key>`, and its `n`th run `<job>.<key>.<n>`.
+  let (id, key, attempt) := match ref.splitOn "." with
+    | [i, k] => (i, some k, 1)
+    | [i, k, n] => (i, some k, n.toNat?.getD 0)
+    | i :: k :: _ => (i, some k, 0)
+    | _ => (ref, none, 1)
   let active := (← Platform.jobsOfPull owner.toLower name.toLower pr).filter fun j =>
     (j.status? == some .queued || j.status? == some .running) &&
       (j.isReview || j.kind? == some .calibration)
@@ -1123,7 +1127,12 @@ of the same commit; it is not run" .conflict)
   | some k =>
     match subs.find? (·.key == k) with
     | some sub =>
-      if sub.status == "queued" || sub.status == "running" then return .ok (j, some sub)
+      -- A run given up on (`pending`, waiting to run again, or an older run's name) may still
+      -- submit; a run the platform never made may not.
+      unless 1 ≤ attempt && attempt ≤ sub.attempts do
+        return .error (Reply.error s!"sub-run {ref} names no run of the platform's" .notFound)
+      if ["pending", "queued", "running"].contains sub.status then
+        return .ok (j, some (sub, attempt))
       return .error (Reply.error s!"sub-run {ref} is {sub.status}, not being run" .notFound)
     | none => return .error (Reply.error s!"job {id} has no sub-run '{k}' being run" .notFound)
 
@@ -1173,7 +1182,7 @@ private def withScope (answer : Json) (job : Job) (scope : Workers.Scope) : Json
   answer.setObjVal! "instructions" (instructions ++ Workers.scopeInstructions scope)
     |>.setObjVal! "prType" ((job.prType.map Json.str).getD .null)
     |>.setObjVal! "subRun" (.mkObj [
-      ("key", scope.sub.key), ("id", scope.sub.agentId),
+      ("key", scope.sub.key), ("id", scope.ref),
       ("category", ((scope.category.map (·.name)).map Json.str).getD .null),
       ("description", ((scope.category.map (·.description)).map Json.str).getD .null),
       ("others", .arr (scope.others.map Json.str).toArray)])
@@ -1182,14 +1191,16 @@ private def withScope (answer : Json) (job : Job) (scope : Workers.Scope) : Json
     and its job with it. The examples of the repository's review style leave out every sample of
     the job's pull request (`Style.examplesFor`). A sub-run is shown the rubric its job fanned out
     under, and its scope. -/
-private def agentShow (job : Job) (sub : Option Fanout.SubRun) : IO Reply := do
+private def agentShow (job : Job) (named : Option (Fanout.SubRun × Nat)) : IO Reply := do
+  let sub := named.map (·.1)
   let rubric ← match ← (if sub.isSome then fanoutRubric job else agentRubric job) with
     | .ok r => pure r
     | .error reply => return reply
   let some repo ← Platform.findRepo job.owner job.name | return .error "not found" .notFound
   let examples ← Style.examplesFor repo job
-  let scope ← match sub with
-    | some s => pure ((← Workers.scopesOf job (← Fanout.current job.id)).find? (·.sub.id == s.id))
+  let scope ← match named with
+    | some (s, n) => pure (((← Workers.scopesOf job (← Fanout.current job.id))
+        |>.find? (·.sub.id == s.id)).map fun sc => { sc with ref := s.agentIdFor n })
     | none => pure none
   let fixed := fixedType repo (rubric.map (·.2))
   let answer (j : Job) :=
@@ -1202,8 +1213,8 @@ private def agentShow (job : Job) (sub : Option Fanout.SubRun) : IO Reply := do
 request type\n\nThe repository fixes the type of its reviews: `{t}`. Review by its rubric, and \
 submit with `prType` `{t}`.")
     | none, none => a
-  if let some s := sub then
-    if s.status == "queued" then
+  if let some (s, n) := named then
+    if s.status == "queued" && n == s.attempts then
       let _ ← Fanout.update s.id fun _ cur => do
         unless cur.status == "queued" || cur.status == "running" do throw "moved on"
         return { cur with status := "running" }
@@ -1268,8 +1279,8 @@ private def agentProposalSubmit (repo : Repo) (job : Job) (body : String) : IO R
     with every comment of its category. It is kept on the sub-run, not the job: once every sub-run
     is in, the platform merges them into the job's draft (`Workers.settleFanout`), which may be at
     once. -/
-private def subRunSubmit (st : State) (job : Job) (sub : Fanout.SubRun) (body : String) :
-    IO Reply := do
+private def subRunSubmit (st : State) (job : Job) (sub : Fanout.SubRun) (attempt : Nat)
+    (body : String) : IO Reply := do
   let j ← match parseBody body with
     | .ok j => pure j
     | .error e => return .error e .badRequest
@@ -1304,16 +1315,26 @@ give every comment the category '{c}'" .badRequest
   let review ← review.assignIds
   let headSha := headSha.toLower
   let submitted ← Fanout.update sub.id fun j cur => do
-    unless cur.status == "running" do
-      throw s!"sub-run {cur.agentId} is {cur.status}, not running; run `diff-reviewer agent show` \
-first"
+    -- Its latest run once it has started; a run given up on whenever it is still unsettled.
+    let given := attempt < cur.attempts || cur.status == "pending"
+    unless cur.status == "running" ||
+        (given && ["pending", "queued", "running"].contains cur.status) do
+      throw s!"sub-run {cur.agentIdFor attempt} is {cur.status}, not running; run \
+`diff-reviewer agent show` first"
     unless j.status? == some .queued || j.status? == some .running do
       throw s!"job {j.id} is {j.statusRaw}, not being run"
     unless j.headSha == some headSha do
       throw s!"the review is of {headSha}, but job {j.id} is of {j.headSha.getD "no commit"}"
     return { cur with status := "submitted", reviewRaw := some review.toJson.compress
                       error := none }
-  if let .error why := submitted then return .error why .conflict
+  let done ← match submitted with
+    | .ok d => pure d
+    | .error why => return .error why .conflict
+  -- A run given up on submitted after all: the run that replaced it is not wanted.
+  if attempt < sub.attempts then
+    if let (some entry, some orch) := (sub.queueEntry, st.services.orchestraFor job) then
+      if let .error e ← orch.cancel entry then
+        IO.eprintln s!"diff-reviewer: cancelling entry {entry} of sub-run {done.agentId}: {e}"
   Workers.settleFanout st.services job.id
   let after := (← Platform.findJob job.id).getD job
   return .json (.mkObj [("jobId", job.id), ("subRun", sub.key), ("subRunStatus", "submitted"),
@@ -1330,9 +1351,9 @@ first"
     stands. A calibration job's review is never posted, in any mode: it is scored against its
     sample instead. A sub-run of a fan-out submits its partial review instead
     (`subRunSubmit`). -/
-private def agentSubmit (st : State) (job : Job) (sub : Option Fanout.SubRun) (body : String) :
-    IO Reply := do
-  if let some s := sub then return ← subRunSubmit st job s body
+private def agentSubmit (st : State) (job : Job) (sub : Option (Fanout.SubRun × Nat))
+    (body : String) : IO Reply := do
+  if let some (s, n) := sub then return ← subRunSubmit st job s n body
   let j ← match parseBody body with
     | .ok j => pure j
     | .error e => return .error e .badRequest
@@ -1388,7 +1409,8 @@ private def agentRoute (st : State) (r : Req) : IO Reply := do
   let some segs := agentSegments r.path | return .error "not found" .notFound
   if r.method == .post && !isJsonContentType (r.header "content-type") then
     return .error "writes must be sent as application/json" .unsupportedMediaType
-  let pull (owner name pr : String) (k : Job → Option Fanout.SubRun → IO Reply) : IO Reply := do
+  let pull (owner name pr : String) (k : Job → Option (Fanout.SubRun × Nat) → IO Reply) :
+      IO Reply := do
     let some n := pr.toNat? | return .error "not found" .notFound
     match ← activeJob owner name n (r.header "x-diff-reviewer-job") with
     | .ok (job, sub) => k job sub

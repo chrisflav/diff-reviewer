@@ -784,7 +784,7 @@
           "schema": {
             "type": "string"
           },
-          "description": "The job the agent's prompt named (`--job`): a review or calibration job of the pull request, queued or running. Required: a request that names none is a `400`, and one naming a job of another kind (a rubric proposal) or not being run a `404`. Naming a job of a commit another active job of the same pull request was made for later (to the second) is a `409`: only the newest job of a commit is run. A fan-out job's sub-run is named `<job>.<key>`, and must be queued or running (`404`); naming a fan-out job alone is a `409`."
+          "description": "The job the agent's prompt named (`--job`): a review or calibration job of the pull request, queued or running. Required: a request that names none is a `400`, and one naming a job of another kind (a rubric proposal) or not being run a `404`. Naming a job of a commit another active job of the same pull request was made for later (to the second) is a `409`: only the newest job of a commit is run. A fan-out job's sub-run is named `<job>.<key>`, its `n`th run `<job>.<key>.<n>`; it must be of the job's current attempt, a run the platform made, and not submitted, failed or cancelled (`404`); naming a fan-out job alone is a `409`."
         }
       ],
       "get": {
@@ -856,7 +856,7 @@
           "schema": {
             "type": "string"
           },
-          "description": "The job the agent's prompt named (`--job`): a review or calibration job of the pull request, queued or running. Required: a request that names none is a `400`, and one naming a job of another kind (a rubric proposal) or not being run a `404`. Naming a job of a commit another active job of the same pull request was made for later (to the second) is a `409`: only the newest job of a commit is run. A fan-out job's sub-run is named `<job>.<key>`, and must be queued or running (`404`); naming a fan-out job alone is a `409`."
+          "description": "The job the agent's prompt named (`--job`): a review or calibration job of the pull request, queued or running. Required: a request that names none is a `400`, and one naming a job of another kind (a rubric proposal) or not being run a `404`. Naming a job of a commit another active job of the same pull request was made for later (to the second) is a `409`: only the newest job of a commit is run. A fan-out job's sub-run is named `<job>.<key>`, its `n`th run `<job>.<key>.<n>`; it must be of the job's current attempt, a run the platform made, and not submitted, failed or cancelled (`404`); naming a fan-out job alone is a `409`."
         }
       ],
       "get": {
@@ -937,7 +937,7 @@
           "schema": {
             "type": "string"
           },
-          "description": "The job the agent's prompt named (`--job`): a review or calibration job of the pull request, queued or running. Required: a request that names none is a `400`, and one naming a job of another kind (a rubric proposal) or not being run a `404`. Naming a job of a commit another active job of the same pull request was made for later (to the second) is a `409`: only the newest job of a commit is run. A fan-out job's sub-run is named `<job>.<key>`, and must be queued or running (`404`); naming a fan-out job alone is a `409`."
+          "description": "The job the agent's prompt named (`--job`): a review or calibration job of the pull request, queued or running. Required: a request that names none is a `400`, and one naming a job of another kind (a rubric proposal) or not being run a `404`. Naming a job of a commit another active job of the same pull request was made for later (to the second) is a `409`: only the newest job of a commit is run. A fan-out job's sub-run is named `<job>.<key>`, its `n`th run `<job>.<key>.<n>`; it must be of the job's current attempt, a run the platform made, and not submitted, failed or cancelled (`404`); naming a fan-out job alone is a `409`."
         }
       ],
       "post": {
@@ -3074,7 +3074,7 @@
             "items": {
               "$ref": "#/components/schemas/SubRun"
             },
-            "description": "The sub-runs of a fan-out review, of its latest attempt, in merge order (the default first); empty for a job that is not fanned out. In `GET /api/v1/jobs` and `GET /api/v1/jobs/{id}`. A fan-out job is `queued` until a sub-run starts, `running` until every sub-run has submitted or failed, and then a `draft` holding the merged review — or `failed`, when every sub-run failed."
+            "description": "The sub-runs of a fan-out review, of its latest attempt, in merge order (the default first); empty for a job that is not fanned out. In `GET /api/v1/jobs` and `GET /api/v1/jobs/{id}`. A fan-out job is `queued` until a sub-run starts, `running` until every sub-run has submitted or failed, and then a `draft` holding the merged review — or `failed`, when every sub-run failed. Only the round of the job's current attempt: a job fanned out before and run again as one run shows none."
           }
         }
       },
@@ -4541,6 +4541,21 @@
                     }
                   },
                   "description": "Categories whose description changed."
+                },
+                "fanout": {
+                  "type": [
+                    "object",
+                    "null"
+                  ],
+                  "properties": {
+                    "before": {
+                      "type": "boolean"
+                    },
+                    "after": {
+                      "type": "boolean"
+                    }
+                  },
+                  "description": "The type's `fanout` `{before, after}`, or null when unchanged. A change of it alone makes the type changed."
                 }
               }
             }
@@ -4559,6 +4574,21 @@
                 "type": "string"
               }
             }
+          },
+          "fanout": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "properties": {
+              "before": {
+                "type": "boolean"
+              },
+              "after": {
+                "type": "boolean"
+              }
+            },
+            "description": "The document's `fanout` `{before, after}`, or null when unchanged: turning fan-out on multiplies the runs a review is charged for, so it is always shown."
           }
         }
       },
@@ -4888,7 +4918,7 @@
         "properties": {
           "key": {
             "type": "string",
-            "description": "Unique within the job, made of the category's name (`default` for the default review). The agent names the sub-run `<job>.<key>`, and its orchestra `external_id` is `<job>.<key>` (`<job>.<key>.<n>` for its `n`th run; `<job>.<n>.<key>` when the job is in its `n`th attempt)."
+            "description": "Unique within the job, made of the category's name (`default` for the default review). The agent of its first run names it `<job>.<key>`, of its `n`th run `<job>.<key>.<n>`; its orchestra `external_id` is `<job>.<key>` (`<job>.<key>.<n>` for its `n`th run; `<job>.<m>.<key>` when the job is in its `m`th attempt)."
           },
           "category": {
             "type": [
@@ -4907,7 +4937,7 @@
               "failed",
               "cancelled"
             ],
-            "description": "A run that ends without a submission is run once more; then the sub-run has `failed`, and the review is merged without it."
+            "description": "A run that ends without a submission is run once more, charged against the day's cap (past it, the sub-run fails); then the sub-run has `failed`, and the review is merged without it. A run given up on may still submit, and the run that replaced it is then cancelled."
           },
           "queueEntry": {
             "type": [
@@ -4917,7 +4947,8 @@
           },
           "attempts": {
             "type": "integer",
-            "minimum": 0
+            "minimum": 0,
+            "description": "How many times it has been run; each run counts against the day's cap."
           },
           "error": {
             "type": [
