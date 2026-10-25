@@ -9,11 +9,16 @@
 
 import type { PostingMode, Repo, RepoSettings } from "./api";
 import { same } from "./review";
+import { utf8Bytes } from "./text";
 
 /** The most trusted reviewers a repository names (`maxTrustedReviewers`). */
 export const MAX_TRUSTED_REVIEWERS = 50;
 /** The longest GitHub login. */
 export const MAX_LOGIN_LENGTH = 39;
+/** The longest style notes, in bytes of UTF-8 (`maxStyleNotesBytes`). */
+export const MAX_STYLE_NOTES_BYTES = 16384;
+/** The share of pull requests held out when a repository has not said (`Repo.evalShare`). */
+export const DEFAULT_EVAL_SHARE = 50;
 
 /** What the page edits of a repository's settings. */
 export interface RepoForm {
@@ -21,6 +26,10 @@ export interface RepoForm {
   autoReview: boolean;
   /** In lower case, once each, as the server stores them. */
   trustedReviewers: string[];
+  /** Markdown, at most `MAX_STYLE_NOTES_BYTES`; empty for none. */
+  styleNotes: string;
+  /** Percent of new pull requests held out as `eval`, 0 to 100. */
+  evalShare: number;
 }
 
 /** The fields of a repository that are about the record, not settings a write sends. */
@@ -31,23 +40,33 @@ export function formOf(r: Repo): RepoForm {
     mode: r.mode,
     autoReview: r.autoReview,
     trustedReviewers: normalLogins(r.trustedReviewers ?? []),
+    styleNotes: typeof r.styleNotes === "string" ? r.styleNotes : "",
+    evalShare: typeof r.evalShare === "number" ? r.evalShare : DEFAULT_EVAL_SHARE,
   };
 }
+
+/** Fields of the record the server derives, never sent back. */
+const derivedFields = ["styleNotesVersion"];
 
 /**
  * The body of a write of `form` over `read`, the settings at the version last read: every field
  * read that is not about the record, a newer build's settings among them, so that a write from
  * this page leaves them as they were; the form on top; and the version, so that a write over a
- * newer one is a 409.
+ * newer one is a 409. The style notes and the share held out are sent only when the server has
+ * them (API 0.6.0), so that an older one is not sent fields it does not know. `fromProposal`
+ * names the rubric proposal the notes were taken from.
  */
-export function putBody(read: Repo, form: RepoForm): RepoSettings {
+export function putBody(read: Repo, form: RepoForm, fromProposal?: string): RepoSettings {
   const out: Record<string, unknown> = { ...read };
-  for (const f of metaFields) delete out[f];
+  for (const f of [...metaFields, ...derivedFields]) delete out[f];
   return {
     ...out,
     mode: form.mode,
     autoReview: form.autoReview,
     trustedReviewers: form.trustedReviewers,
+    ...("styleNotes" in read ? { styleNotes: form.styleNotes } : {}),
+    ...("evalShare" in read ? { evalShare: form.evalShare } : {}),
+    ...(fromProposal === undefined ? {} : { fromProposal }),
     version: read.version,
   };
 }
@@ -114,13 +133,32 @@ export function formProblem(f: RepoForm): string | null {
     const why = loginProblem(l);
     if (why !== null) return `'${l}': ${why}`;
   }
+  const why = notesProblem(f.styleNotes) ?? evalShareProblem(f.evalShare);
+  if (why !== null) return why;
   return null;
+}
+
+/** Why the server would refuse style notes `s`, or null. */
+export function notesProblem(s: string): string | null {
+  const n = utf8Bytes(s);
+  return n > MAX_STYLE_NOTES_BYTES
+    ? `The style notes are ${n} bytes; at most ${MAX_STYLE_NOTES_BYTES}.`
+    : null;
+}
+
+/** Why the server would refuse `evalShare` `n`, or null. */
+export function evalShareProblem(n: number): string | null {
+  return Number.isInteger(n) && n >= 0 && n <= 100
+    ? null
+    : "The share held out is a whole number of percent, 0 to 100.";
 }
 
 export function sameForm(a: RepoForm, b: RepoForm): boolean {
   return (
     a.mode === b.mode &&
     a.autoReview === b.autoReview &&
+    a.styleNotes === b.styleNotes &&
+    a.evalShare === b.evalShare &&
     a.trustedReviewers.length === b.trustedReviewers.length &&
     a.trustedReviewers.every((l, i) => b.trustedReviewers[i] === l)
   );
@@ -129,7 +167,9 @@ export function sameForm(a: RepoForm, b: RepoForm): boolean {
 /** A setting both this page and another write changed, to different values. */
 export type RepoConflict =
   | { field: "mode"; mine: PostingMode; theirs: PostingMode }
-  | { field: "autoReview"; mine: boolean; theirs: boolean };
+  | { field: "autoReview"; mine: boolean; theirs: boolean }
+  | { field: "styleNotes"; mine: string; theirs: string }
+  | { field: "evalShare"; mine: number; theirs: number };
 
 export interface RepoMerged {
   /** The merge, with the other write's value wherever there is a conflict. */
@@ -145,11 +185,13 @@ export interface RepoMerged {
  * changed to different values is a conflict, left at theirs until a side is picked: nothing is
  * overwritten unasked. With today's two-valued settings no conflict arises (two sides that both
  * changed a setting from its base changed it to the same value); the page still asks, and keeps
- * the sides picked across a reload, so that a setting of more values cannot be overwritten.
+ * the sides picked across a reload, so that a setting of more values cannot be overwritten. The
+ * style notes are one text: both sides changing them differently is a conflict, as is the share
+ * held out.
  */
 export function mergeRepoSettings(base: RepoForm, mine: RepoForm, theirs: RepoForm): RepoMerged {
   const conflicts: RepoConflict[] = [];
-  const scalar = <K extends "mode" | "autoReview">(k: K): RepoForm[K] => {
+  const scalar = <K extends RepoConflict["field"]>(k: K): RepoForm[K] => {
     if (mine[k] === base[k] || mine[k] === theirs[k]) return theirs[k];
     if (theirs[k] === base[k]) return mine[k];
     conflicts.push({ field: k, mine: mine[k], theirs: theirs[k] } as RepoConflict);
@@ -157,6 +199,8 @@ export function mergeRepoSettings(base: RepoForm, mine: RepoForm, theirs: RepoFo
   };
   const mode = scalar("mode");
   const autoReview = scalar("autoReview");
+  const styleNotes = scalar("styleNotes");
+  const evalShare = scalar("evalShare");
   const b = new Set(normalLogins(base.trustedReviewers));
   const m = normalLogins(mine.trustedReviewers);
   const mSet = new Set(m);
@@ -166,7 +210,7 @@ export function mergeRepoSettings(base: RepoForm, mine: RepoForm, theirs: RepoFo
     ...normalLogins(theirs.trustedReviewers).filter((l) => !removed.has(l)),
     ...added,
   ]);
-  return { form: { mode, autoReview, trustedReviewers }, conflicts };
+  return { form: { mode, autoReview, trustedReviewers, styleNotes, evalShare }, conflicts };
 }
 
 /** `form` with conflict `c` settled for `pick`. */

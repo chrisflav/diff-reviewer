@@ -12,9 +12,12 @@ import { Ratio } from "../components/Ratio";
 import { useLoad } from "../useLoad";
 import {
   CalibrationCrumbs,
+  DerivedToggle,
   jobCounts,
   repoPath,
+  SplitTag,
   StaleToggle,
+  useDerived,
   usePoll,
   useStale,
 } from "./Calibration";
@@ -22,13 +25,19 @@ import {
 export function CalibrationRunPage({ onUnauthorized }: { onUnauthorized: () => void }) {
   const { owner = "", name = "", id = "" } = useParams();
   const [stale, setStale] = useStale();
+  const [derived, setDerived] = useDerived();
   const fetch = useCallback(
-    () => api.calibrationRun(owner, name, id, stale),
-    [owner, name, id, stale],
+    () => api.calibrationRun(owner, name, id, stale, derived),
+    [owner, name, id, stale, derived],
   );
   const { data: run, error, reload } = useLoad(fetch, onUnauthorized);
   const live = run?.results?.some((r) => ["pending", "queued", "running"].includes(r.status));
   usePoll(reload, live ?? false);
+  // A run is of one split; what it is of is what its samples are of.
+  const splits = [
+    ...new Set((run?.results ?? []).flatMap((r) => (r.sample?.split ? [r.sample.split] : []))),
+  ];
+  const pool = splits.length === 1 && splits[0] === "pool";
 
   return (
     <>
@@ -48,13 +57,33 @@ export function CalibrationRunPage({ onUnauthorized }: { onUnauthorized: () => v
             <dd className="data">{run.samples}</dd>
             <dt>Jobs</dt>
             <dd>{jobCounts(run.jobs)}</dd>
+            {splits.length > 0 && (
+              <>
+                <dt>Of</dt>
+                <dd>
+                  {splits.map((x) => (
+                    <SplitTag key={x} split={x} />
+                  ))}{" "}
+                  samples
+                </dd>
+              </>
+            )}
           </dl>
+          {pool && (
+            <p className="notice warn-notice" role="status">
+              <strong>A run of the pool: never counted.</strong> Its scores are in no aggregate,
+              summary or chart; they are evidence for rubric proposals, which learn from the pool
+              and never from what calibration measures by.
+            </p>
+          )}
           <Limits />
           <StaleToggle stale={stale} onChange={setStale} />
+          <DerivedToggle derived={derived} onChange={setDerived} />
           <h2>Aggregate</h2>
           <p className="mute small-text">
-            Of this run's scores, deleted samples left out
-            {stale ? ", stale scores counted" : ", stale scores left out"}.
+            Of this run's <code>eval</code> scores, deleted samples left out
+            {stale ? ", stale scores counted" : ", stale scores left out"}
+            {derived ? ", derived scores counted" : ", derived scores left out"}.
           </p>
           <AggregateFigures a={run.aggregate} />
           <AggregateBreakdown a={run.aggregate} />
@@ -115,6 +144,15 @@ function Flags({ r }: { r: CalibrationRunResult }) {
           stale
         </span>
       )}
+      {r.scoreDerived === true && (
+        <span
+          className="tag flag-derived"
+          title="The rubric or style notes this score was made under learned from this pull request: left out of the aggregate unless asked."
+        >
+          derived
+        </span>
+      )}
+      {r.sample?.split === "pool" && <SplitTag split="pool" />}
     </>
   );
 }
@@ -136,7 +174,11 @@ function ResultRow({ owner, name, r }: { owner: string; name: string; r: Calibra
   const scored = isScore(score) ? scoreScope(score) : null;
   const now = s?.scope ?? null;
   return (
-    <tr className={s?.deleted === true || r.scoreStale ? "dimmed" : undefined}>
+    <tr
+      className={
+        s?.deleted === true || r.scoreStale || r.scoreDerived === true ? "dimmed" : undefined
+      }
+    >
       <td>
         {s === null ? (
           <span className="mute">gone</span>

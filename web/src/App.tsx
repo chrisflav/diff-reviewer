@@ -6,6 +6,7 @@ import { CalibrationRunPage } from "./pages/CalibrationRun";
 import { CalibrationSamplePage } from "./pages/CalibrationSample";
 import { JobsPage } from "./pages/Jobs";
 import { JobPage } from "./pages/Job";
+import { ProposalPage, ProposalsPage } from "./pages/Proposals";
 import { RepoSettingsPage } from "./pages/RepoSettings";
 import { ReposPage } from "./pages/Repos";
 import { RubricPage } from "./pages/Rubric";
@@ -72,6 +73,14 @@ function SignedIn({
           {
             path: "/repos/:owner/:name/calibration/samples/:id",
             element: <CalibrationSamplePage onUnauthorized={onUnauthorized} />,
+          },
+          {
+            path: "/repos/:owner/:name/proposals",
+            element: <ProposalsPage onUnauthorized={onUnauthorized} />,
+          },
+          {
+            path: "/repos/:owner/:name/proposals/:id",
+            element: <ProposalPage onUnauthorized={onUnauthorized} />,
           },
           { path: "*", element: <p className="mute">Nothing here.</p> },
         ],

@@ -226,11 +226,25 @@ describe("rubric stash", () => {
     expect(back?.pending).toBeNull();
     expect(reopenRubric(back!)?.rebased).toBeNull();
   });
+
+  it("keeps across a 401 the proposal the edits adopt, so that the save still names it", () => {
+    const base = toLocalRubric(doc);
+    stashRubric({ repo: "o/n", version: 1, base, doc: base, fromProposal: "p1" });
+    const back = unstashRubric("o/n");
+    expect(back?.fromProposal).toBe("p1");
+    expect(reopenRubric(back!)?.edits.fromProposal).toBe("p1");
+  });
 });
 
 describe("repo settings stash", () => {
   beforeEach(() => store.clear());
-  const base = { mode: "staged" as const, autoReview: false, trustedReviewers: ["alice"] };
+  const base = {
+    mode: "staged" as const,
+    autoReview: false,
+    trustedReviewers: ["alice"],
+    styleNotes: "",
+    evalShare: 50,
+  };
   const edits = {
     repo: "o/n",
     version: 4,
@@ -264,5 +278,33 @@ describe("repo settings stash", () => {
   it("refuses a stash it cannot read", () => {
     store.set("diff-reviewer:repo:o/n", JSON.stringify({ ...edits, savedAt: "t", pending: 3 }));
     expect(unstashRepo("o/n")).toBeNull();
+  });
+
+  it("keeps the proposal whose style notes the edits adopt", () => {
+    stashRepo({ ...edits, fromProposal: "p1" });
+    expect(unstashRepo("o/n")?.fromProposal).toBe("p1");
+  });
+
+  it("reads a stash from before the style notes, filled in alike on both sides", () => {
+    const strip = (f: object) => {
+      const o: Record<string, unknown> = { ...f };
+      delete o.styleNotes;
+      delete o.evalShare;
+      return o;
+    };
+    store.set(
+      "diff-reviewer:repo:o/n",
+      JSON.stringify({
+        ...edits,
+        base: strip(edits.base),
+        form: strip(edits.form),
+        savedAt: "t",
+        pending: null,
+      }),
+    );
+    const s = unstashRepo("o/n");
+    expect(s?.legacy).toBe(true);
+    expect(s?.base.styleNotes).toBe(s?.form.styleNotes);
+    expect(s?.form.trustedReviewers).toEqual(["alice", "bob"]);
   });
 });

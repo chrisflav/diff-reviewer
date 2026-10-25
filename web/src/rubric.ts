@@ -47,8 +47,19 @@ export interface LocalRubric {
   [field: string]: unknown;
 }
 
-/** The fields of a `GET`'s answer that are about the version, not the document. */
-const metaFields = ["owner", "name", "version", "createdAt", "documentError"];
+/**
+ * The fields of a `GET`'s answer that are about the version, not the document: what it was
+ * derived from among them, which the server records and ignores when sent back.
+ */
+const metaFields = [
+  "owner",
+  "name",
+  "version",
+  "createdAt",
+  "documentError",
+  "derivedFrom",
+  "derivedFromPulls",
+];
 
 /** The document a version holds, or `null` when this build cannot read it. */
 export function documentOf(v: RubricDocument): RubricDoc | null {

@@ -411,6 +411,8 @@ export interface CalibrationRunResult {
     comments: number;
     /** A deleted sample's score is shown here and left out of every aggregate. */
     deleted: boolean;
+    /** `eval` or `pool`, null until assigned. Absent before API 0.6.0. */
+    split?: "eval" | "pool" | null;
   } | null;
   /** Null until the job's draft is scored. */
   score: CalibrationScore | CalibrationUnscorable | null;
@@ -441,6 +443,8 @@ export interface CalibrationSummary {
   overall: CalibrationAggregate;
   /** Newest rubric version first; 0 is no rubric. */
   byRubricVersion: { rubricVersion: number | null; aggregate: CalibrationAggregate }[];
+  /** Whose scores: `eval`. Absent before API 0.6.0. */
+  split?: string;
 }
 
 export type RubricProposalStatus = "pending" | "accepted" | "rejected";
@@ -699,22 +703,35 @@ export const api = {
     which: ({ samples: string[] } | { count: number }) & { split?: "eval" | "pool" },
   ) => request<CalibrationRun>("POST", `${calibration(owner, name)}/runs`, which),
   /** One page of the runs, newest first, each with its aggregate. */
-  calibrationRuns: (owner: string, name: string, limit = 50, offset = 0, stale = false) =>
+  calibrationRuns: (
+    owner: string,
+    name: string,
+    limit = 50,
+    offset = 0,
+    stale = false,
+    derived = false,
+  ) =>
     request<Page<CalibrationRun>>(
       "GET",
-      `${calibration(owner, name)}/runs?${pageQuery(limit, offset)}${staleQuery(stale, "&")}`,
+      `${calibration(owner, name)}/runs?${pageQuery(limit, offset)}${scoreQuery(stale, derived, "&")}`,
     ),
-  /** One run, with each sample's result; `stale` counts stale scores in its aggregate. */
-  calibrationRun: (owner: string, name: string, id: string, stale = false) =>
+  /**
+   * One run, with each sample's result; `stale` counts stale scores in its aggregate, `derived`
+   * the scores of samples its rubric or style notes learned from (API 0.6.0).
+   */
+  calibrationRun: (owner: string, name: string, id: string, stale = false, derived = false) =>
     request<CalibrationRun>(
       "GET",
-      `${calibration(owner, name)}/runs/${seg(id)}${staleQuery(stale, "?")}`,
+      `${calibration(owner, name)}/runs/${seg(id)}${scoreQuery(stale, derived, "?")}`,
     ),
-  /** The aggregate over every run, and by rubric version; `stale` counts stale scores too. */
-  calibrationSummary: (owner: string, name: string, stale = false) =>
+  /**
+   * The aggregate over every run, and by rubric version; `stale` counts stale scores too, and
+   * `derived` derived ones.
+   */
+  calibrationSummary: (owner: string, name: string, stale = false, derived = false) =>
     request<CalibrationSummary>(
       "GET",
-      `${calibration(owner, name)}/summary${staleQuery(stale, "?")}`,
+      `${calibration(owner, name)}/summary${scoreQuery(stale, derived, "?")}`,
     ),
 
   /**
@@ -770,9 +787,13 @@ export interface Page<T> {
   nextOffset: number | null;
 }
 
-/** `?stale=include` (or `&…`) when stale scores are to be counted. */
-function staleQuery(stale: boolean, sep: "?" | "&"): string {
-  return stale ? `${sep}stale=include` : "";
+/**
+ * `?stale=include` (or `&…`) when stale scores are to be counted, and `derived=include` when
+ * derived ones are.
+ */
+export function scoreQuery(stale: boolean, derived: boolean, sep: "?" | "&"): string {
+  const q = [...(stale ? ["stale=include"] : []), ...(derived ? ["derived=include"] : [])];
+  return q.length === 0 ? "" : `${sep}${q.join("&")}`;
 }
 
 function pageQuery(limit: number, offset: number): string {

@@ -209,6 +209,11 @@ describe("documents", () => {
     expect(JSON.parse(JSON.stringify(back))).toEqual(doc);
   });
 
+  it("leave out what a version was derived from, which is the version's, not the document's", () => {
+    const d = documentOf({ ...version, derivedFrom: ["s-1"], derivedFromPulls: ["o/n#1"] });
+    expect(d).toEqual(doc);
+  });
+
   it("cannot be read when the server cannot", () => {
     expect(
       documentOf({ ...version, defaultRubric: null, prTypes: null, documentError: "bad" }),

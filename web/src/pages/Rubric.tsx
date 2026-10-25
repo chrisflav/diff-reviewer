@@ -1,6 +1,7 @@
 import { useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useBlocker, useParams, useSearchParams } from "react-router-dom";
 import { api, ApiError, UnauthorizedError, type RubricDocument } from "../api";
+import { loadAdoption, proposalPath, saveRubricEdits } from "../proposals";
 import {
   alignRubric,
   documentOf,
@@ -86,8 +87,19 @@ function RubricView({
   const [historyNonce, setHistoryNonce] = useState(0);
   const [offer, setOffer] = useState<StashedRubric | null>(() => {
     const s = unstashRubric(repo);
-    return s !== null && (s.pending !== null || !sameRubric(s.base, s.doc)) ? s : null;
+    return s !== null &&
+      (s.pending !== null || s.fromProposal !== undefined || !sameRubric(s.base, s.doc))
+      ? s
+      : null;
   });
+  // `?proposal=<id>`: that rubric proposal, to be opened here as unsaved edits and rebased.
+  const [params, setParams] = useSearchParams();
+  const adopt = params.get("proposal");
+  const [adoptBusy, setAdoptBusy] = useState(false);
+  const tried = useRef<string | null>(null);
+  const mergeOntoRef = useRef<
+    ((d: RubricDocument, e: RubricEdits, announce: boolean) => void) | null
+  >(null);
 
   const readable = useMemo(() => (doc === null ? null : documentOf(doc)), [doc]);
   const saved = useMemo(() => toLocalRubric(readable ?? emptyDoc), [readable]);
@@ -111,8 +123,11 @@ function RubricView({
   const unresolved =
     rebased !== null &&
     rebased.conflicts.some((c) => rebased.picks[rubricConflictId(c)] === undefined);
-  // Open conflicts count: what they are left at may be the newer version itself.
-  const dirty = edits !== null && (unresolved || !sameRubric(edits.base, edits.doc));
+  // Open conflicts count: what they are left at may be the newer version itself. So does adopting
+  // a proposal, even one that says what the rubric says: the save records where it came from.
+  const dirty =
+    edits !== null &&
+    (unresolved || edits.fromProposal !== undefined || !sameRubric(edits.base, edits.doc));
 
   // Every change is kept in the tab's storage, with the conflicts still open and the sides picked
   // so far, so that a 401 or a reload brings back the page as it was.
@@ -158,6 +173,68 @@ function RubricView({
 
   const problems = useMemo(() => rubricProblems(toRubricDoc(current)), [current]);
 
+  const dropAdoptParam = useCallback(
+    () =>
+      setParams(
+        (p) => {
+          const n = new URLSearchParams(p);
+          n.delete("proposal");
+          return n;
+        },
+        { replace: true },
+      ),
+    [setParams],
+  );
+
+  // A proposal named in the address is opened once the rubric is loaded: its document as edits to
+  // the version it was written from, moved onto the current one by the three-way merge. Edits this
+  // tab holds already are asked about first.
+  useEffect(() => {
+    if (adopt === null || doc === null || adoptBusy || tried.current === adopt) return;
+    if (offer !== null) {
+      if (offer.fromProposal === adopt) dropAdoptParam();
+      return;
+    }
+    if (edits?.fromProposal === adopt) {
+      dropAdoptParam();
+      return;
+    }
+    if (
+      dirty &&
+      !window.confirm(`Replace your unsaved edits of the rubric with proposal ${adopt}?`)
+    ) {
+      dropAdoptParam();
+      return;
+    }
+    tried.current = adopt;
+    setAdoptBusy(true);
+    loadAdoption(owner, name, adopt)
+      .then((e) => {
+        setSavedNote(null);
+        setConflict(null);
+        if (typeof e === "string") {
+          setError(e);
+          return;
+        }
+        setError(null);
+        setRebased(null);
+        // The current version, read now: the merge is onto what a save would be checked against.
+        return api.rubrics(owner, name).then((d) => {
+          mergeOntoRef.current?.(d, e, true);
+          setHistoryNonce((n) => n + 1);
+          requestAnimationFrame(() => document.getElementById("adopt-h")?.focus());
+        });
+      })
+      .catch((err: unknown) => {
+        if (err instanceof UnauthorizedError) return onUnauthorized();
+        setError(err instanceof Error ? err.message : String(err));
+      })
+      .finally(() => {
+        setAdoptBusy(false);
+        dropAdoptParam();
+      });
+  }, [adopt, doc, offer, edits, dirty, adoptBusy, owner, name, dropAdoptParam, onUnauthorized]);
+
   if (doc === null)
     return error !== null ? (
       <>
@@ -187,19 +264,27 @@ function RubricView({
       return;
     }
     const r = rebaseRubric(e.base, e.doc, theirs);
-    if (r.conflicts.length === 0 && sameRubric(r.review, r.base)) {
+    const adopting = e.fromProposal;
+    if (adopting === undefined && r.conflicts.length === 0 && sameRubric(r.review, r.base)) {
       setEdits(null);
       setRebased(null);
       dropRubricStash(repo);
       return;
     }
-    setEdits({ repo, version: d.version, base: r.base, doc: r.review });
+    setEdits({
+      repo,
+      version: d.version,
+      base: r.base,
+      doc: r.review,
+      ...(adopting === undefined ? {} : { fromProposal: adopting }),
+    });
     setRebased(
       announce || r.conflicts.length > 0
         ? { from: e.version, to: d.version, conflicts: r.conflicts, picks: {}, source: e }
         : null,
     );
   };
+  mergeOntoRef.current = mergeOnto;
 
   const save = () => {
     const sent = edits;
@@ -207,18 +292,28 @@ function RubricView({
     setBusy(true);
     setError(null);
     setSavedNote(null);
-    api
-      .putRubrics(owner, name, sent.version, toRubricDoc(sent.doc))
+    saveRubricEdits(owner, name, sent)
       .then((d) => {
         setHistoryNonce((n) => n + 1);
-        setSavedNote(`Saved as version ${d.version}.`);
+        setSavedNote(
+          `Saved as version ${d.version}.${
+            sent.fromProposal === undefined
+              ? ""
+              : ` It records proposal ${sent.fromProposal} as what it was derived from, and the proposal is accepted.`
+          }`,
+        );
         const now = editsRef.current;
         if (now === null || now === sent) {
           setDoc(d);
           setEdits(null);
           setRebased(null);
           dropRubricStash(repo);
-        } else mergeOnto(d, { ...now, version: sent.version, base: sent.doc }, false);
+        } else {
+          // Edits made while the save was under way: the proposal is adopted already.
+          const rest: RubricEdits = { ...now, version: sent.version, base: sent.doc };
+          delete rest.fromProposal;
+          mergeOnto(d, rest, false);
+        }
       })
       .catch(fail)
       .finally(() => setBusy(false));
@@ -317,6 +412,12 @@ function RubricView({
         <dd className="data">{doc.version === 0 ? "none yet" : doc.version}</dd>
         <dt>Written</dt>
         <dd className="data">{doc.createdAt ?? "—"}</dd>
+        {doc.derivedFrom !== undefined && (
+          <>
+            <dt>Derived from</dt>
+            <dd>{derivedSummary(doc)}</dd>
+          </>
+        )}
       </dl>
       <p className="mute small-text">
         The default rubric is what every review of the repository looks at. A pull request type is a
@@ -333,13 +434,25 @@ function RubricView({
             {offer.version}, kept {offer.savedAt}).
             {offer.version !== doc.version &&
               ` The rubric is at version ${doc.version} now; restoring moves them onto it, and asks where both changed the same thing.`}
+            {offer.fromProposal !== undefined && ` They adopt proposal ${offer.fromProposal}.`}
+            {adopt !== null &&
+              offer.fromProposal !== adopt &&
+              ` You asked to open proposal ${adopt}, which would replace them.`}
           </p>
           <div className="actions">
-            <button type="button" onClick={restoreOffer}>
+            <button
+              type="button"
+              onClick={() => {
+                if (adopt !== null && offer.fromProposal !== adopt) dropAdoptParam();
+                restoreOffer();
+              }}
+            >
               Restore them
             </button>
             <button type="button" className="ghost" onClick={dropOffer}>
-              Discard them
+              {adopt !== null && offer.fromProposal !== adopt
+                ? `Discard them, open proposal ${adopt}`
+                : "Discard them"}
             </button>
           </div>
         </div>
@@ -381,7 +494,31 @@ function RubricView({
           )}
         </div>
       )}
-      {rebased !== null && edits !== null && <ConflictNotice rebased={rebased} onPick={pick} />}
+      {adoptBusy && <p className="mute">Opening the proposal…</p>}
+      {edits?.fromProposal !== undefined && (
+        <section className="notice adopt-notice" aria-labelledby="adopt-h">
+          <h2 id="adopt-h" tabIndex={-1}>
+            Adopting proposal{" "}
+            <Link className="data" to={proposalPath(owner, name, edits.fromProposal)}>
+              {edits.fromProposal}
+            </Link>
+          </h2>
+          <p>
+            The editor below holds the proposal's document as unsaved edits on top of version{" "}
+            {edits.version === 0 ? "none" : edits.version} of the rubric. Change it as you like.
+            Saving makes it version {doc.version + 1} and names the proposal: the version records
+            what the proposal was derived from, and the proposal is accepted.
+          </p>
+          <div className="actions">
+            <button type="button" className="ghost" onClick={discard} disabled={busy}>
+              Stop adopting, discard the edits
+            </button>
+          </div>
+        </section>
+      )}
+      {rebased !== null && edits !== null && (
+        <ConflictNotice rebased={rebased} onPick={pick} adopting={edits.fromProposal} />
+      )}
 
       {readable === null ? (
         <div className="notice danger-notice" role="alert">
@@ -894,18 +1031,25 @@ function conflictLabel(c: RubricConflict): string {
 function ConflictNotice({
   rebased,
   onPick,
+  adopting,
 }: {
   rebased: Rebased;
   onPick: (c: RubricConflict, which: RubricPick) => void;
+  /** The proposal being adopted, when the edits moved are its document. */
+  adopting: string | undefined;
 }) {
   const open = rebased.conflicts.filter(
     (c) => rebased.picks[rubricConflictId(c)] === undefined,
   ).length;
+  const fromProposal = adopting !== undefined && rebased.source.fromProposal === adopting;
   return (
     <section className="notice warn-notice" aria-labelledby="rebase-h">
       <p id="rebase-h">
-        Your edits were moved from version {rebased.from} onto version {rebased.to}, which someone
-        else saved meanwhile. They are not saved yet.
+        {fromProposal
+          ? rebased.from === rebased.to
+            ? `Proposal ${adopting} was written from version ${rebased.from}, the current one. It is not saved yet.`
+            : `Proposal ${adopting} was written from version ${rebased.from}, and the rubric has moved on to version ${rebased.to} since: what the proposal changes was moved onto it. It is not saved yet.`
+          : `Your edits were moved from version ${rebased.from} onto version ${rebased.to}, which someone else saved meanwhile. They are not saved yet.`}
         {rebased.conflicts.length === 0
           ? " Nothing you changed was changed there too."
           : open > 0
@@ -933,7 +1077,7 @@ function ConflictNotice({
                 onChange={() => onPick(c, "mine")}
               />
               <span>
-                Keep mine
+                {fromProposal ? "Keep the proposal's" : "Keep mine"}
                 <span className="value">{mine}</span>
               </span>
             </label>
@@ -945,7 +1089,8 @@ function ConflictNotice({
                 onChange={() => onPick(c, "theirs")}
               />
               <span>
-                Keep theirs (version {rebased.to})<span className="value">{theirs}</span>
+                {fromProposal ? "Keep the rubric's" : "Keep theirs"} (version {rebased.to})
+                <span className="value">{theirs}</span>
               </span>
             </label>
           </fieldset>
@@ -1069,6 +1214,7 @@ function RubricHistory({
           </h3>
           <p className="mute small-text data">{viewed.createdAt ?? ""}</p>
           <ShownRubric v={viewed} />
+          <Provenance owner={owner} name={name} v={viewed} />
           <div className="actions">
             {canRestore && viewed.version !== current.version && documentOf(viewed) !== null && (
               <button type="button" onClick={() => onRestore(viewed)}>
@@ -1099,6 +1245,7 @@ function RubricHistory({
                 <th>Version</th>
                 <th>Written</th>
                 <th>Types</th>
+                <th>Derived from</th>
                 <th />
               </tr>
             </thead>
@@ -1119,6 +1266,7 @@ function RubricHistory({
                       v.prTypes.map((t) => t.name).join(", ")
                     )}
                   </td>
+                  <td className="small-text">{derivedSummary(v)}</td>
                   <td className="right">
                     <button
                       type="button"
@@ -1189,5 +1337,89 @@ function ShownRubric({ v }: { v: RubricDocument }) {
         ))
       )}
     </>
+  );
+}
+
+/** What a version was derived from, counted: its samples and pull requests, or nothing. */
+function derivedSummary(v: Pick<RubricDocument, "derivedFrom" | "derivedFromPulls">) {
+  const samples = v.derivedFrom ?? [];
+  const pulls = v.derivedFromPulls ?? [];
+  if (v.derivedFrom === undefined && v.derivedFromPulls === undefined)
+    return <span className="mute">not recorded</span>;
+  if (samples.length === 0 && pulls.length === 0) return <span className="mute">nothing</span>;
+  const n = (k: number, one: string, many: string) => `${k} ${k === 1 ? one : many}`;
+  return `${n(samples.length, "sample", "samples")}, ${n(pulls.length, "pull request", "pull requests")}`;
+}
+
+/** A pull request as the server names it, `owner/name#n`, split; null for anything else. */
+function pullOf(key: string): { slug: string; pr: number } | null {
+  const m = /^([A-Za-z0-9._-]+\/[A-Za-z0-9._-]+)#([0-9]+)$/.exec(key);
+  return m === null ? null : { slug: m[1] as string, pr: Number(m[2]) };
+}
+
+/**
+ * The provenance of a version: the calibration samples and pull requests the proposal it came
+ * from drew on, and every earlier version's. A score of any of them, made under this version, is
+ * derived: left out of calibration's aggregates unless asked.
+ */
+function Provenance({ owner, name, v }: { owner: string; name: string; v: RubricDocument }) {
+  const samples = v.derivedFrom ?? [];
+  const pulls = v.derivedFromPulls ?? [];
+  if (v.derivedFrom === undefined && v.derivedFromPulls === undefined) return null;
+  const base = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/calibration`;
+  return (
+    <section className="provenance" aria-labelledby="provenance-h">
+      <h4 id="provenance-h">Derived from</h4>
+      {samples.length === 0 && pulls.length === 0 ? (
+        <p className="mute small-text">
+          Nothing: no rubric proposal reached this version or an earlier one.
+        </p>
+      ) : (
+        <>
+          <p className="mute small-text">
+            What the rubric proposals that reached this version, or an earlier one, drew on.
+            Calibration scores of these pull requests made under this version are derived: left out
+            of the aggregates unless asked.
+          </p>
+          <h5>Pull requests ({pulls.length})</h5>
+          {pulls.length === 0 ? (
+            <p className="mute small-text">None.</p>
+          ) : (
+            <ul className="chips">
+              {pulls.map((k) => {
+                const p = pullOf(k);
+                return (
+                  <li key={k} className="data">
+                    {p === null ? (
+                      k
+                    ) : (
+                      <a
+                        href={`https://github.com/${p.slug}/pull/${p.pr}`}
+                        rel="noreferrer noopener"
+                        target="_blank"
+                      >
+                        {k}
+                      </a>
+                    )}
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+          <h5>Calibration samples ({samples.length})</h5>
+          {samples.length === 0 ? (
+            <p className="mute small-text">None.</p>
+          ) : (
+            <ul className="chips">
+              {samples.map((id) => (
+                <li key={id} className="data">
+                  <Link to={`${base}/samples/${encodeURIComponent(id)}`}>{id}</Link>
+                </li>
+              ))}
+            </ul>
+          )}
+        </>
+      )}
+    </section>
   );
 }

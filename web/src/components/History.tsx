@@ -536,7 +536,7 @@ const mark = { same: " ", add: "+", del: "-" } as const;
 const markLabel = { same: "", add: "added: ", del: "removed: " } as const;
 
 /** Two texts as a line diff; each line says whether it was added or removed in words too. */
-function TextDiff({
+export function TextDiff({
   before,
   after,
   label,

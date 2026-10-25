@@ -3,6 +3,7 @@ import { Link, useParams, useSearchParams } from "react-router-dom";
 import {
   api,
   ApiError,
+  scoreQuery,
   UnauthorizedError,
   type CalibrationImport,
   type CalibrationRun,
@@ -44,6 +45,64 @@ export function useStale(): [boolean, (on: boolean) => void] {
       { replace: true },
     );
   return [stale, set];
+}
+
+/** Whether derived scores are counted: `?derived=include` on the page, as on the API. */
+export function useDerived(): [boolean, (on: boolean) => void] {
+  const [params, setParams] = useSearchParams();
+  const derived = params.get("derived") === "include";
+  const set = (on: boolean) =>
+    setParams(
+      (p) => {
+        const n = new URLSearchParams(p);
+        if (on) n.set("derived", "include");
+        else n.delete("derived");
+        return n;
+      },
+      { replace: true },
+    );
+  return [derived, set];
+}
+
+export function DerivedToggle({
+  derived,
+  onChange,
+}: {
+  derived: boolean;
+  onChange: (on: boolean) => void;
+}) {
+  return (
+    <label className="check">
+      <input type="checkbox" checked={derived} onChange={(e) => onChange(e.target.checked)} />
+      Count derived scores too (scores of pull requests the rubric or style notes they were made
+      under learned from)
+    </label>
+  );
+}
+
+/** `eval` or `pool`, as a tag: what a sample is for. */
+export function SplitTag({ split }: { split: string | null | undefined }) {
+  if (split === undefined) return null;
+  if (split === null)
+    return (
+      <span className="tag" title="Not split yet: it is given one the first time it is read.">
+        unsplit
+      </span>
+    );
+  return (
+    <span
+      className={`tag split-${split}`}
+      title={
+        split === "eval"
+          ? "Held out: what calibration measures by, never learned from."
+          : split === "pool"
+            ? "What the style examples and rubric proposals learn from; never counted."
+            : undefined
+      }
+    >
+      {split}
+    </span>
+  );
 }
 
 export function StaleToggle({
@@ -110,6 +169,7 @@ function CalibrationView({
   onUnauthorized: () => void;
 }) {
   const [stale, setStale] = useStale();
+  const [derived, setDerived] = useDerived();
   // Bumped by anything that changes what the sections show: a new run, a deleted sample.
   const [nonce, setNonce] = useState(0);
   const changed = () => setNonce((n) => n + 1);
@@ -138,11 +198,13 @@ function CalibrationView({
       </nav>
       <Limits />
       <StaleToggle stale={stale} onChange={setStale} />
+      <DerivedToggle derived={derived} onChange={setDerived} />
 
       <Summary
         owner={owner}
         name={name}
         stale={stale}
+        derived={derived}
         nonce={nonce}
         onUnauthorized={onUnauthorized}
       />
@@ -150,6 +212,7 @@ function CalibrationView({
         owner={owner}
         name={name}
         stale={stale}
+        derived={derived}
         nonce={nonce}
         selected={selected}
         onStarted={() => {
@@ -175,18 +238,20 @@ function Summary({
   owner,
   name,
   stale,
+  derived,
   nonce,
   onUnauthorized,
 }: {
   owner: string;
   name: string;
   stale: boolean;
+  derived: boolean;
   nonce: number;
   onUnauthorized: () => void;
 }) {
   const fetch = useCallback(
-    () => api.calibrationSummary(owner, name, stale),
-    [owner, name, stale, nonce],
+    () => api.calibrationSummary(owner, name, stale, derived),
+    [owner, name, stale, derived, nonce],
   );
   const { data: s, error } = useLoad(fetch, onUnauthorized);
   return (
@@ -199,7 +264,13 @@ function Summary({
         <>
           <p className="mute small-text">
             Over {s.runs} {s.runs === 1 ? "run" : "runs"} and {s.samples}{" "}
-            {s.samples === 1 ? "sample" : "samples"}, deleted samples left out.
+            {s.samples === 1 ? "sample" : "samples"}, deleted samples left out
+            {s.split !== undefined && (
+              <>
+                ; of <code>{s.split}</code> samples only, never the pool
+              </>
+            )}
+            .
           </p>
           <AggregateFigures a={s.overall} />
           <AggregateBreakdown a={s.overall} />
@@ -208,7 +279,8 @@ function Summary({
               <h3>By rubric version</h3>
               <p className="mute small-text">
                 The rubric version each job was reviewed against, newest first: whether a rubric
-                change moved the numbers. Stale scores are {stale ? "counted" : "left out"}.
+                change moved the numbers. Stale scores are {stale ? "counted" : "left out"}, derived
+                ones {derived ? "counted" : "left out"}.
               </p>
               <div className="table-scroll">
                 <table>
@@ -293,6 +365,7 @@ function Runs({
   owner,
   name,
   stale,
+  derived,
   nonce,
   selected,
   onStarted,
@@ -301,6 +374,7 @@ function Runs({
   owner: string;
   name: string;
   stale: boolean;
+  derived: boolean;
   nonce: number;
   selected: string[];
   onStarted: () => void;
@@ -308,8 +382,8 @@ function Runs({
 }) {
   const [offset, setOffset] = useState(0);
   const fetch = useCallback(
-    () => api.calibrationRuns(owner, name, 50, offset, stale),
-    [owner, name, offset, stale, nonce],
+    () => api.calibrationRuns(owner, name, 50, offset, stale, derived),
+    [owner, name, offset, stale, derived, nonce],
   );
   const { data, error, reload } = useLoad(fetch, onUnauthorized);
   usePoll(reload, data?.items.some(runLive) ?? false);
@@ -317,13 +391,15 @@ function Runs({
   const [busy, setBusy] = useState(false);
   const [startError, setStartError] = useState<string | null>(null);
   const [started, setStarted] = useState<CalibrationRun | null>(null);
+  // What a run is of: `eval` unless asked, since only eval runs are measured by.
+  const [split, setSplit] = useState<"eval" | "pool">("eval");
 
   const start = (which: { samples: string[] } | { count: number }) => {
     setBusy(true);
     setStartError(null);
     setStarted(null);
     api
-      .createCalibrationRun(owner, name, which)
+      .createCalibrationRun(owner, name, { ...which, split })
       .then((r) => {
         setStarted(r);
         setOffset(0);
@@ -357,9 +433,37 @@ function Runs({
         the repository's daily cap of calibration jobs. A sample a live job is reviewing already
         cannot be run again until it ends.
       </p>
+      <fieldset className="split-pick">
+        <legend>Of which samples</legend>
+        <label className="check">
+          <input
+            type="radio"
+            name="run-split"
+            checked={split === "eval"}
+            onChange={() => setSplit("eval")}
+          />
+          <code>eval</code>, held out: what calibration measures by
+        </label>
+        <label className="check">
+          <input
+            type="radio"
+            name="run-split"
+            checked={split === "pool"}
+            onChange={() => setSplit("pool")}
+          />
+          <code>pool</code>: evidence for rubric proposals
+        </label>
+      </fieldset>
+      {split === "pool" && (
+        <p className="notice warn-notice small-text" role="status">
+          A pool run is never counted: its scores are in no aggregate, summary or chart. It gives
+          rubric proposals something to learn from; what the agent learns from is never what it is
+          measured by.
+        </p>
+      )}
       <form className="inline" onSubmit={submit}>
         <label>
-          Samples run least so far{" "}
+          {split === "pool" ? "Pool samples" : "Eval samples"} run least so far{" "}
           <input
             type="number"
             min={1}
@@ -380,12 +484,12 @@ function Runs({
           onClick={() => start({ samples: selected })}
         >
           Run the {selected.length === 0 ? "" : `${selected.length} `}selected{" "}
-          {selected.length === 1 ? "sample" : "samples"}
+          {selected.length === 1 ? "sample" : "samples"} as {split}
         </button>
       </form>
       <p id="run-count-help" className="mute small-text">
         {countOk
-          ? "Pick samples below to run those instead."
+          ? `Pick samples below to run those instead; every one must be of the ${split} split.`
           : `A whole number from 1 to ${MAX_RUN_SAMPLES}.`}
       </p>
       {startError !== null && (
@@ -399,7 +503,8 @@ function Runs({
           <Link to={`${repoPath(owner, name)}/calibration/runs/${encodeURIComponent(started.id)}`}>
             a run
           </Link>{" "}
-          of {started.samples} {started.samples === 1 ? "sample" : "samples"}.
+          of {started.samples} {started.samples === 1 ? "sample" : "samples"}
+          {split === "pool" ? " of the pool, never counted" : ""}.
         </p>
       )}
       {error !== null && <p className="error">{error}</p>}
@@ -411,8 +516,10 @@ function Runs({
         <>
           {data.items.length > 1 && <RunChart runs={data.items} stale={stale} />}
           <p className="mute small-text">
-            Each run's figures are of its own scores, deleted samples left out; stale scores are{" "}
-            {stale ? "counted" : "left out"}.
+            Each run's figures are of its own <code>eval</code> scores, deleted samples left out;
+            stale scores are {stale ? "counted" : "left out"}, derived ones{" "}
+            {derived ? "counted" : "left out"}. A run of the pool shows no figures: it is never
+            counted.
           </p>
           <div className="table-scroll">
             <table>
@@ -431,7 +538,7 @@ function Runs({
                   <tr key={r.id}>
                     <td>
                       <Link
-                        to={`${repoPath(owner, name)}/calibration/runs/${encodeURIComponent(r.id)}${stale ? "?stale=include" : ""}`}
+                        to={`${repoPath(owner, name)}/calibration/runs/${encodeURIComponent(r.id)}${scoreQuery(stale, derived, "?")}`}
                         className="data"
                       >
                         {r.createdAt}
@@ -550,7 +657,9 @@ function Samples({
       <p className="mute small-text">
         What one trusted reviewer said of one commit, every review of theirs of it merged; most
         recently reviewed first. Deleted samples are not listed: they are shown, marked, in the runs
-        that used them. Pick up to {MAX_RUN_SAMPLES} to run.
+        that used them. Pick up to {MAX_RUN_SAMPLES} to run. Each is held out as <code>eval</code>{" "}
+        (what runs measure by) or in the <code>pool</code> (what examples and proposals learn from),
+        by its pull request, once and for good.
       </p>
       <dl className="scopes small-text">
         {Object.entries(scopeMeans).map(([k, v]) => (
@@ -586,6 +695,7 @@ function Samples({
                   <th scope="col">Reviewer</th>
                   <th scope="col">Commit</th>
                   <th scope="col">State</th>
+                  <th scope="col">Split</th>
                   <th scope="col">Scope</th>
                   <th scope="col">Comments</th>
                   <th scope="col">Reviewed</th>
@@ -656,6 +766,9 @@ function SampleRow({
       <td className="data">{s.reviewer}</td>
       <td className="data">{s.commitId.slice(0, 10)}</td>
       <td className="data">{s.state}</td>
+      <td>
+        <SplitTag split={s.split} />
+      </td>
       <td>
         <span className={`tag scope-${s.scope}`} title={scopeMeans[s.scope] ?? undefined}>
           {s.scope}
