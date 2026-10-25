@@ -27,6 +27,9 @@ const job: Job = {
   postedUrl: null,
   postNote: null,
   postedReview: null,
+  rubricVersion: null,
+  directPosts: 0,
+  postDirect: false,
 };
 
 const text = `diff --git a/a b/a

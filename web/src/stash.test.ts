@@ -16,7 +16,7 @@ const review = {
   decision: "comment" as const,
   body: "b",
   rubric: "r1",
-  comments: [{ file: "a", start_line: 1, end_line: 1, body: "x", severity: "minor" }],
+  comments: [{ file: "a", start_line: 1, end_line: 1, body: "x", severity: "minor" as const }],
 };
 
 describe("stash", () => {
