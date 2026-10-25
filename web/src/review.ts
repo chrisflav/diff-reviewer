@@ -254,26 +254,31 @@ function alignTheirs(
     rank,
   );
   go(added, (k, o) => guessable(k, o) && same(withoutKey(k), o));
-  go(base.comments, (k, o) => guessable(k, o) && samePlace(k, o), rank);
-  // A moved comment: the same words in the same file. Only where the pairing is the one
-  // possible, both ways; two comments saying the same ("nit: naming") are not told apart by a
-  // guess, and what is left unpaired goes to the conflict path instead.
-  const moved = (k: LocalComment, o: InlineComment) =>
-    guessable(k, o) &&
-    k.file === o.file &&
-    ((k.body.trim() !== "" && k.body === o.body) ||
-      (k.suggestion !== undefined && k.suggestion === o.suggestion));
-  const freeBase = base.comments.filter((k) => !used.has(k[KEY]));
-  const freeTheirs = theirs.filter((_, i) => keys[i] === undefined);
-  theirs.forEach((o, i) => {
-    if (keys[i] !== undefined) return;
-    const ks = freeBase.filter((k) => moved(k, o));
-    const k = ks[0];
-    if (ks.length !== 1 || k === undefined) return;
-    if (freeTheirs.filter((x) => moved(k, x)).length !== 1) return;
-    keys[i] = k[KEY];
-    used.add(k[KEY]);
-  });
+  // The guesses: an edited comment keeps its place, a moved one its words. Each pairs only
+  // where the pairing is the one possible, both ways: two comments at one place, or saying the
+  // same ("nit: naming"), are not told apart by a guess, and what is left unpaired goes to the
+  // conflict path instead.
+  const unique = (fits: (k: LocalComment, o: InlineComment) => boolean) => {
+    const freeBase = base.comments.filter((k) => !used.has(k[KEY]));
+    const freeTheirs = theirs.filter((_, i) => keys[i] === undefined);
+    theirs.forEach((o, i) => {
+      if (keys[i] !== undefined) return;
+      const ks = freeBase.filter((k) => !used.has(k[KEY]) && fits(k, o));
+      const k = ks[0];
+      if (ks.length !== 1 || k === undefined) return;
+      if (freeTheirs.filter((x) => fits(k, x)).length !== 1) return;
+      keys[i] = k[KEY];
+      used.add(k[KEY]);
+    });
+  };
+  unique((k, o) => guessable(k, o) && samePlace(k, o));
+  unique(
+    (k, o) =>
+      guessable(k, o) &&
+      k.file === o.file &&
+      ((k.body.trim() !== "" && k.body === o.body) ||
+        (k.suggestion !== undefined && k.suggestion === o.suggestion)),
+  );
   return theirs.map((o, i) => ({ ...o, [KEY]: keys[i] ?? fresh() }));
 }
 
@@ -356,19 +361,30 @@ export function rebase(base: LocalReview, mine: LocalReview, theirsReview: Revie
   }
   // Their new comments, which may stand where a comment of the base was.
   const stand = theirs.comments.filter((c) => !b.has(c[KEY]) && !m.has(c[KEY]));
+  // The base comments they deleted and this person edited.
+  const orphans = base.comments.filter((bc) => {
+    const mc = m.get(bc[KEY]);
+    return !t.has(bc[KEY]) && mc !== undefined && !same(mc, bc);
+  });
+  const by = (x: InlineComment, y: InlineComment) =>
+    x.file === y.file && guessable(x, y) && near(x, y);
+  // The one new comment of theirs by `bc`'s lines, when it is by no other such comment: with two
+  // candidates either way, a pairing would be a guess, and a wrong one would drop a comment.
+  const standIn = (bc: LocalComment): LocalComment | undefined => {
+    const cs = stand.filter((c) => by(c, bc));
+    const c = cs[0];
+    if (cs.length !== 1 || c === undefined) return undefined;
+    return orphans.filter((o) => by(c, o)).length === 1 ? c : undefined;
+  };
   for (const bc of base.comments) {
     if (t.has(bc[KEY])) continue;
     const mc = m.get(bc[KEY]) ?? null;
-    const at =
-      mc === null || same(mc, bc)
-        ? -1
-        : stand.findIndex((c) => c.file === bc.file && guessable(c, bc) && near(c, bc));
-    const sub = stand[at];
+    const sub = mc === null || same(mc, bc) ? undefined : standIn(bc);
     if (sub !== undefined) {
       // Deleted on their side, with a new comment at or just by its lines, and edited on this
       // one: perhaps the same comment, changed by both. Their new one stays until the person
       // picks, and "both" is a choice, since it may be another comment altogether.
-      stand.splice(at, 1);
+      stand.splice(stand.indexOf(sub), 1);
       conflicts.push({ kind: "comment", key: bc[KEY], mine: mc, theirs: sub });
       continue;
     }

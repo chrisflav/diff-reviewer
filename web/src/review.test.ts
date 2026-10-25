@@ -566,4 +566,26 @@ describe("rebase", () => {
     expect(lines(resolve(near.review, nc, "both"))).toEqual(["a:6-7 y", "a:5-5 x!"]);
     expect(lines(resolve(resolve(near.review, nc, "both"), nc, "theirs"))).toEqual(["a:6-7 y"]);
   });
+
+  it("does not guess which of two comments at one place they changed", () => {
+    const b = toLocal({
+      decision: "comment",
+      body: "S",
+      comments: [cmt("a", 5, 5, "A"), cmt("a", 5, 5, "B")],
+    });
+    // They reword both and swap them; I reword A. No pick may lose their B.
+    const mine = edit(b, 0, (x) => ({ ...x, body: "A mine" }));
+    const r = rebase(b, mine, {
+      ...toReview(b),
+      comments: [cmt("a", 5, 5, "B theirs"), cmt("a", 5, 5, "A theirs")],
+    });
+    const c = r.conflicts[0];
+    if (c === undefined) throw new Error("no conflict");
+    for (const pick of ["mine", "theirs", "both"] as const) {
+      const out = lines(resolve(r.review, c, pick));
+      expect(out).toContain("a:5-5 B theirs");
+      expect(out).toContain("a:5-5 A theirs");
+    }
+    expect(lines(resolve(r.review, c, "mine"))).toContain("a:5-5 A mine");
+  });
 });
