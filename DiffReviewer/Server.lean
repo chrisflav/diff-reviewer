@@ -31,12 +31,15 @@ One person runs the platform — the one whose name approved reviews are posted 
 credentials reach it, none of which stands in for another:
 
   * **the password**, only ever sent to `POST /api/login`, which exchanges it for an `HttpOnly`,
-    `SameSite=Strict` session cookie. Failed attempts are rate-limited: past `loginFailureLimit`
-    within `loginWindowSeconds`, every attempt — right or wrong — is a `429` for a delay that
-    doubles with each further failure, so the password cannot be guessed at the speed of the
-    network.
+    `SameSite=Strict` session cookie. Failed attempts are rate-limited per client address, and
+    over all addresses together: past the limit, every attempt — right or wrong — is an
+    immediate `429` for a delay that doubles with each further failure, so the password cannot be
+    guessed at the speed of the network. Nothing waits in the handler: a slow refusal would hold
+    a request thread.
   * **the API token** (`apiToken`), what a script sends as `Authorization: Bearer` to `/api/v1/`.
-    The session cookie reaches the same routes.
+    The session cookie reaches the same routes, and `POST /api/login` takes the token too, never
+    rate-limited — it cannot be guessed — so that the operator can sign in while password
+    attempts are refused.
   * **the agent token** (`agentToken`), the only credential of `/api/agent/v1/`, and good for
     nothing else. Agents never hold it: an agent's request goes through kleis, which replaces the
     placeholder the agent sends with this token, and only for the routes, repository and pull
@@ -138,17 +141,14 @@ structure State where
   loginGlobal : IO.Ref Lockout
   /-- The current epoch second; replaced in the suite. -/
   clock : IO Int := nowEpoch
-  /-- Sleep this many milliseconds; replaced in the suite. -/
-  sleep : Nat → IO Unit := fun ms => IO.sleep ms.toUInt32
 
 def State.new (cfg : Config) (services : Option Workers.Services := none)
-    (clock : IO Int := nowEpoch) (sleep : Nat → IO Unit := fun ms => IO.sleep ms.toUInt32) :
-    IO State := do
+    (clock : IO Int := nowEpoch) : IO State := do
   let services ← match services with
     | some s => pure s
     | none => Workers.Services.new
   return { cfg, sessions := ← IO.mkRef #[], services, loginByAddress := ← IO.mkRef #[]
-         , loginGlobal := ← IO.mkRef {}, clock, sleep }
+         , loginGlobal := ← IO.mkRef {}, clock }
 
 def sessionCookieName : String := "diff_reviewer_session"
 
@@ -211,13 +211,12 @@ def agentAuthenticated (st : State) (r : Req) : Bool :=
     refused. -/
 def loginFailureLimit : Nat := 5
 
-/-- Failed logins from all addresses together within the window past which every attempt is slowed
-    by `loginGlobalDelayMs`: a guess spread over many addresses is slowed down, and the operator,
-    from an address of their own, is slowed too but never refused. -/
+/-- Failed logins from all addresses together within the window past which every password
+    attempt is refused for a while: a guess spread over many addresses is stopped too. The
+    operator is never locked out by it — `POST /api/login` also takes the API token, which no
+    limit counts — and nothing waits: a refusal is an immediate `429`, so no request thread is
+    held. -/
 def loginGlobalLimit : Nat := 100
-
-/-- The delay every login attempt takes while past `loginGlobalLimit`, in milliseconds. -/
-def loginGlobalDelayMs : Nat := 2000
 
 def loginWindowSeconds : Int := 900
 
@@ -283,17 +282,17 @@ def clientAddress (st : State) (r : Req) : String :=
     | none => peer
   else peer
 
-/-- The seconds a login attempt from `addr` must still wait, or `none` if it may be made. -/
-private def loginWait (st : State) (addr : String) : IO (Option Int) := do
+/-- The seconds a password attempt from `addr` must still wait, and why, or `none` if it may be
+    made: its own address's lock first, then the one over all addresses. -/
+private def loginWait (st : State) (addr : String) : IO (Option (Int × String)) := do
   let now ← st.clock
   let mine := ((← st.loginByAddress.get).find? (·.1 == addr)).map (·.2)
-  return mine.bind (·.wait now)
-
-/-- Slow the attempt down while all addresses together are past `loginGlobalLimit`. -/
-private def loginThrottle (st : State) : IO Unit := do
-  let now ← st.clock
-  let recent := (← st.loginGlobal.get).failures.filter (· > now - loginWindowSeconds)
-  if recent.size ≥ loginGlobalLimit then st.sleep loginGlobalDelayMs
+  if let some w := mine.bind (·.wait now) then
+    return some (w, s!"too many failed logins; try again in {w} seconds")
+  if let some w := (← st.loginGlobal.get).wait now then
+    return some (w, s!"too many failed logins from everywhere; try again in {w} seconds, or sign \
+in with the API token")
+  return none
 
 private def loginFailed (st : State) (addr : String) : IO Unit := do
   let now ← st.clock
@@ -483,6 +482,23 @@ private def postJob (st : State) (id body : String) : IO Reply := do
     return .json (.mkObj [("error", s!"GitHub refused the review: {why}"), ("job", job.toJson)])
       .badGateway
 
+/-- Settle a claimed job without posting. The body is `{"version": n}`. -/
+private def reconcileJob (st : State) (id body : String) : IO Reply := do
+  let j ← match parseBody body with
+    | .ok j => pure j
+    | .error e => return .error e .badRequest
+  let version ← match versionOf j with
+    | .ok v => pure v
+    | .error e => return .error e .badRequest
+  match ← Workers.reconcileJob st.services id version with
+  | .ok job => return .json job.toJson
+  | .error .notFound => return .error "not found" .notFound
+  | .error (.conflict why) => return .error why .conflict
+  | .error .unavailable =>
+    return .error "GitHub is not configured (DIFF_REVIEWER_GITHUB_TOKEN_FILE)" .serviceUnavailable
+  | .error (.github why job) =>
+    return .json (.mkObj [("error", why), ("job", job.toJson)]) .badGateway
+
 private def diffReply (st : State) (job : Job) (text : Bool) : IO Reply := do
   match ← Workers.diffOf st.services job with
   | .ok (head, diff) =>
@@ -505,6 +521,7 @@ def apiRoutes : Array (String × Array String) :=
     ("jobs/{id}/review",         #["put"]),
     ("jobs/{id}/status",         #["post"]),
     ("jobs/{id}/post",           #["post"]),
+    ("jobs/{id}/reconcile",      #["post"]),
     ("jobs/{id}/diff",           #["get"])]
 
 private def apiRoute (st : State) (r : Req) (segs : List String) : IO Reply := do
@@ -525,12 +542,14 @@ private def apiRoute (st : State) (r : Req) (segs : List String) : IO Reply := d
   | ["jobs", id, "review"], .put => putReview id r.body
   | ["jobs", id, "status"], .post => setStatus id r.body
   | ["jobs", id, "post"], .post => postJob st id r.body
+  | ["jobs", id, "reconcile"], .post => reconcileJob st id r.body
   | ["jobs", id, "diff"], .get =>
     match ← Platform.findJob id with
     | some j => diffReply st j (text := false)
     | none   => return .error "not found" .notFound
   | ["repos"], _ | ["repos", _, _], _ | ["jobs"], _ | ["jobs", _], _
   | ["jobs", _, "review"], _ | ["jobs", _, "status"], _ | ["jobs", _, "post"], _
+  | ["jobs", _, "reconcile"], _
   | ["jobs", _, "diff"], _ =>
     return .error "method not allowed" .methodNotAllowed
   | _, _ => return .error "not found" .notFound
@@ -713,19 +732,28 @@ def route (st : State) (r : Req) : IO Reply := do
     return { status := .ok, body := openApiSpec.toUTF8, headers := [("Cache-Control", "no-cache")] }
   if r.path == "/api/login" then
     unless r.method == .post do return .error "method not allowed" .methodNotAllowed
-    let supplied := (Json.parse r.body).toOption.bind (·.getObjValAs? String "password" |>.toOption)
-    let some p := supplied
-      | return .error "expected a JSON body of the form {\"password\": \"…\"}" .badRequest
-    let addr := clientAddress st r
-    loginThrottle st
-    if let some wait ← loginWait st addr then
-      return { Reply.error s!"too many failed logins; try again in {wait} seconds"
-                 .tooManyRequests with
-               headers := [("Cache-Control", "no-store"), ("Retry-After", toString wait)] }
-    unless constantTimeEq p st.cfg.password do
-      loginFailed st addr
-      return .error "invalid password" .unauthorized
-    loginSucceeded st addr
+    let body := (Json.parse r.body).toOption
+    let field (k : String) := body.bind (·.getObjValAs? String k |>.toOption)
+    -- The API token signs in too, unlimited: it is 32 characters or more of randomness, which no
+    -- rate of guessing reaches, and it is how the operator gets in while password attempts from
+    -- everywhere are refused.
+    if let some tok := field "token" then
+      let ok := match st.cfg.apiToken with
+        | some expected => constantTimeEq tok expected
+        | none => false
+      unless ok do return .error "invalid token" .unauthorized
+    else
+      let some p := field "password"
+        | return .error "expected a JSON body of the form {\"password\": \"…\"} or \
+{\"token\": \"…\"}" .badRequest
+      let addr := clientAddress st r
+      if let some (wait, why) ← loginWait st addr then
+        return { Reply.error why .tooManyRequests with
+                 headers := [("Cache-Control", "no-store"), ("Retry-After", toString wait)] }
+      unless constantTimeEq p st.cfg.password do
+        loginFailed st addr
+        return .error "invalid password" .unauthorized
+      loginSucceeded st addr
     let sid ← issueSession st
     return { Reply.json (.mkObj [("authenticated", true)]) with
              headers := [("Cache-Control", "no-store"),

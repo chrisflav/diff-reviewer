@@ -191,7 +191,8 @@ def Job.review? (j : Job) : Option (Except String Review) :=
 def Job.claimBlocks (j : Job) : Option String :=
   j.postStartedAt.map fun t =>
     s!"a post of job {j.id} (begun {t}) may have reached GitHub; it is being checked — post it \
-again (POST /api/v1/jobs/{j.id}/post) to settle it"
+again (POST /api/v1/jobs/{j.id}/post) or check it (POST /api/v1/jobs/{j.id}/reconcile) to \
+settle it"
 
 def Job.setReview (j : Job) (r : Review) : Job :=
   { j with reviewRaw := some r.toJson.compress }

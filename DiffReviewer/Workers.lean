@@ -263,6 +263,19 @@ changes")
 does not let its author approve it or request changes")
   else (decision, none)
 
+/-- Mark `job` posted as `r`, GitHub's record of it. The job's own review is left as it is, which
+    the claim kept from being edited meanwhile. -/
+private def recordPosted (s : Services) (job : Job) (r : GitHub.PostedReview)
+    (note : Option String) : IO (Except PostError Job) := do
+  s.log s!"posted the review of {job.owner}/{job.name}#{job.prNumber} (job {job.id}): {r.url}"
+  match ← Platform.updateJob job.id fun j =>
+      return { j with statusRaw := JobStatus.posted.toString, error := none
+                      postStartedAt := none, postedUrl := some r.url
+                      postedReview := some r.toJson.compress, postNote := note }
+  with
+  | .ok j => return .ok j
+  | .error _ => return .error .notFound
+
 /-- Post job `id`'s review to its pull request and mark it `posted`. The job must be `approved` and,
     when `version` is given, at that version; the review is pinned to the job's head commit, and
     its comments are checked against the diff first. `direct` posts it as a comment, whatever its
@@ -296,18 +309,7 @@ def postJob (s : Services) (id : String) (version : Option Nat := none) (direct 
     if let .ok (_, d) ← diffOf s job then
       if let .error e := Diff.check review d then
         return .error (.conflict s!"job {id}'s review would be refused by GitHub: {e}")
-    let markPosted (r : GitHub.PostedReview) (note : Option String) :
-        IO (Except PostError Job) := do
-      s.log s!"posted the review of {job.owner}/{job.name}#{job.prNumber} (job {id}): {r.url}"
-      -- What GitHub holds is the record; the job's review is left as it is, which the claim kept
-      -- from being edited meanwhile.
-      match ← Platform.updateJob id fun j =>
-          return { j with statusRaw := JobStatus.posted.toString, error := none
-                          postStartedAt := none, postedUrl := some r.url
-                          postedReview := some r.toJson.compress, postNote := note }
-      with
-      | .ok j => return .ok j
-      | .error _ => return .error .notFound
+    let markPosted := recordPosted s job
     -- Leave the job to be posted again, with why; `keepClaim` while whether it was posted is
     -- still unknown, so that the next attempt waits out the claim and looks before it posts.
     let failed (why : String) (keepClaim : Bool) : IO (Except PostError Job) := do
@@ -361,6 +363,48 @@ attempt" true
       | .error e2 =>
         failed s!"posting may have failed ({e.message}); GitHub's reviews could not be read to \
 tell ({e2.message}), and are looked at before the next attempt" true
+  finally
+    s.posting.modify (·.erase id)
+
+/-- Settle job `id`'s claim without posting: a person's way to free a job whose post may have
+    reached GitHub, so that it can be edited, rejected or left to go stale. The job must be
+    `approved`, at `version`, and claimed. The marker found among the operator's reviews makes it
+    `posted`; not found, the claim is cleared once its window has passed (within it, a post may
+    still be under way: `conflict`); reviews that cannot be read leave the claim as it is. -/
+def reconcileJob (s : Services) (id : String) (version : Nat) : IO (Except PostError Job) := do
+  let claimed ← s.posting.modifyGet fun ids =>
+    if ids.contains id then (false, ids) else (true, id :: ids)
+  unless claimed do return .error (.conflict s!"job {id} is being posted right now")
+  try
+    let some job ← Platform.findJob id | return .error .notFound
+    unless job.status? == some .approved && job.version == version do
+      return .error (.conflict s!"job {id} is {job.statusRaw} at version {job.version}, not an \
+approved job at version {version}; reload it")
+    let some started := job.postStartedAt
+      | return .error (.conflict s!"job {id} has no post to settle")
+    let some gh := s.github | return .error .unavailable
+    match ← findPosted s gh job with
+    | .ok (some r) =>
+      recordPosted s job r (some "found on GitHub after an attempt whose outcome was unknown")
+    | .ok none =>
+      let recent := isoOfEpoch ((← nowEpoch) - s.limits.postClaimSeconds)
+      if started > recent then
+        return .error (.conflict s!"posting job {id} began at {started} and may still be under \
+way; try again in a few minutes")
+      match ← Platform.updateJob id fun j => do
+          unless j.version == job.version && j.postStartedAt == job.postStartedAt do
+            throw (.conflict s!"job {id} changed while it was being checked; reload it")
+          return { j with postStartedAt := none
+                          error := some "the post did not reach GitHub; the job is free again" }
+      with
+      | .ok j => return .ok j
+      | .error .notFound => return .error .notFound
+      | .error (.conflict why) | .error (.invalid why) => return .error (.conflict why)
+    | .error e =>
+      let why := s!"GitHub's reviews could not be read to tell whether the post reached it \
+({e.message}); the claim stands"
+      let recorded ← Platform.updateJob id fun j => return { j with error := some why }
+      return .error (.github why (match recorded with | .ok j => j | .error _ => job))
   finally
     s.posting.modify (·.erase id)
 

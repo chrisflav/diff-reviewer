@@ -180,14 +180,6 @@ def loginsAreLimitedPerAddress : Test := do
       let _ ← loginFrom st "10.0.0.1" "wrong" (forwarded := some "5.5.5.5, 9.9.9.9")
     let proxiedLocked ← loginFrom st "10.0.0.1" password (forwarded := some "9.9.9.9")
     let proxiedOther ← loginFrom st "10.0.0.1" password (forwarded := some "8.8.8.8")
-    -- The ceiling over all addresses slows every attempt, refusing none.
-    let slept ← IO.mkRef (#[] : Array Nat)
-    let st2 ← State.new cfg (clock := now.get) (sleep := fun ms => slept.modify (·.push ms))
-    for i in [0:loginGlobalLimit] do
-      let _ ← loginFrom st2 s!"6.6.{i / 256}.{i % 256}" "wrong"
-    let sleptBefore := (← slept.get).size
-    let ceiling ← loginFrom st2 "4.4.4.4" password
-    let sleptAfter ← slept.get
     -- IPv6: one /64 is one client.
     let st3 ← State.new cfg (clock := now.get)
     for i in [0:5] do
@@ -199,15 +191,94 @@ def loginsAreLimitedPerAddress : Test := do
       ++ checkStatus spoofed 429 "an untrusted peer claiming another address"
       ++ checkStatus proxiedLocked 429 "the client the proxy names"
       ++ checkStatus proxiedOther 200 "another client behind the proxy"
-      ++ checkEq sleptBefore 0 "no delay below the ceiling"
-      ++ checkStatus ceiling 200 "past the ceiling, the right password still works"
-      ++ checkEq sleptAfter #[loginGlobalDelayMs] "but only after a delay"
       ++ check (loginGlobalLimit ≥ 10 * loginFailureLimit) "the ceiling is much higher"
       ++ checkStatus sameNet 429 "another address of the same /64"
       ++ checkStatus otherNet 200 "another /64"
       ++ checkEq (addressKey "2001:0DB8:0:0::1") "2001:db8:0:0::/64" "an IPv6 key"
       ++ checkEq (addressKey "::ffff:192.0.2.7") "192.0.2.7" "an IPv4-mapped address"
       ++ checkEq (addressKey "192.0.2.7") "192.0.2.7" "an IPv4 address"
+
+private def tokenLogin (st : State) (peer token : String) : IO Reply :=
+  route st { method := .post, path := "/api/login", peer := some peer
+           , body := s!"\{\"token\": \"{token}\"}"
+           , header := fun n => if n == "content-type" then some "application/json" else none }
+
+/-- Milliseconds `act` takes, and its answer. -/
+private def timed (act : IO α) : IO (Nat × α) := do
+  let t0 ← IO.monoMsNow
+  let a ← act
+  return ((← IO.monoMsNow) - t0, a)
+
+/-- Past the ceiling over all addresses, a password attempt is an immediate `429` — nothing waits,
+    so no request thread is held — while the API reaches its token at normal speed and the API
+    token still signs in, so the operator is never locked out. -/
+def theCeilingNeverLocksTheOperatorOut : Test := do
+  let now ← IO.mkRef (1000000 : Int)
+  let st ← State.new cfg (clock := now.get)
+  withTempDb do
+    for i in [0:loginGlobalLimit] do
+      let _ ← loginFrom st s!"6.6.{i / 256}.{i % 256}" "wrong"
+    let (apiMs, api) ← timed (route st (req .get "/api/v1/jobs"))
+    let (pwMs, pw) ← timed (loginFrom st "4.4.4.4" password)
+    let wrongToken ← tokenLogin st "4.4.4.4" "nope"
+    let (tokMs, tok) ← timed (tokenLogin st "4.4.4.4" apiToken)
+    let noApiToken ← State.new { cfg with apiToken := none } (clock := now.get)
+    let unset ← tokenLogin noApiToken "4.4.4.4" apiToken
+    return checkStatus api 200 "the API, with its token"
+      ++ check (apiMs < 500) s!"answered at normal speed ({apiMs} ms)"
+      ++ checkStatus pw 429 "a password attempt past the ceiling"
+      ++ check (pw.headers.lookup "Retry-After" |>.isSome) "with Retry-After"
+      ++ check (pwMs < 500) s!"answered without delay ({pwMs} ms)"
+      ++ checkStatus wrongToken 401 "a wrong token: refused, not rate-limited"
+      ++ checkStatus tok 200 "the API token signs in"
+      ++ check (tok.headers.lookup "Set-Cookie" |>.isSome) "and gets a session"
+      ++ check (tokMs < 500) s!"at normal speed ({tokMs} ms)"
+      ++ checkStatus unset 401 "no token login without an API token"
+
+/-- `reconcile` settles a claim without posting: found, posted; not found once the window has
+    passed, freed; within it, or with the reviews unreadable, left as it is. -/
+def aClaimIsReconciled : Test := withTempDb do
+  let gh ← FakeGitHub.new #[pull7 jobHead]
+  let logs ← IO.mkRef #[]
+  let st ← State.new cfg (← servicesWith gh none logs)
+  let reconcile (id : String) : IO Reply := do
+    route st (req .post s!"/api/v1/jobs/{id}/reconcile" s!"\{\"version\": {(← job! id).version}}")
+  let age (id : String) : IO Unit := do
+    let _ ← Platform.updateJob id fun j =>
+      return { j with postStartedAt := some "2000-01-01T00:00:00Z" }
+  -- Not posted (a 5xx): within the window a 409, past it freed, and then it moves.
+  let (a, va) ← approvedJob st
+  gh.outcome.set .failedUnposted
+  let _ ← post st a va
+  let tooSoon ← reconcile a
+  age a
+  let freed ← reconcile a
+  let ja ← job! a
+  let moved ← route st (req .post s!"/api/v1/jobs/{a}/status" (statusBody "draft" ja.version))
+  -- Posted, the answer lost, the reviews unreadable: a 502 and the claim stands; then found.
+  let (b, vb) ← approvedJob st
+  gh.outcome.set .lostAnswer
+  gh.listFails.set true
+  let _ ← post st b vb
+  age b
+  let unclear ← reconcile b
+  let jb ← job! b
+  gh.listFails.set false
+  let found ← reconcile b
+  -- Nothing to settle.
+  let (c, _) ← approvedJob st
+  let nothing ← reconcile c
+  return checkStatus tooSoon 409 "within the claim's window"
+    ++ checkStatus freed 200 "past it, nothing found"
+    ++ checkEq ja.statusRaw "approved" "the freed job"
+    ++ checkEq ja.postStartedAt none "without its claim"
+    ++ checkStatus moved 200 "and it can be moved back to draft"
+    ++ checkStatus unclear 502 "reviews that cannot be read"
+    ++ check jb.postStartedAt.isSome "the claim stands"
+    ++ checkStatus found 200 "found"
+    ++ checkEq (field found "status") (some "posted") "posted"
+    ++ checkEq (← gh.posted.get).size 1 "and nothing posted by reconciling"
+    ++ checkStatus nothing 409 "a job with no claim"
 
 /-- Nothing is spent on a head the pull request has moved on from: pending jobs of it are stale,
     queued and running ones cancelled and stale, and queueing checks again. -/
@@ -485,6 +556,8 @@ def all : List (String × Test) :=
   [("aReviewIsPostedOnce", aReviewIsPostedOnce),
    ("decisionsArePostedAsAPersonDecides", decisionsArePostedAsAPersonDecides),
    ("loginsAreLimitedPerAddress", loginsAreLimitedPerAddress),
+   ("theCeilingNeverLocksTheOperatorOut", theCeilingNeverLocksTheOperatorOut),
+   ("aClaimIsReconciled", aClaimIsReconciled),
    ("supersededHeadsCostNothing", supersededHeadsCostNothing),
    ("discoveryIsCapped", discoveryIsCapped),
    ("listingsReadEveryPage", listingsReadEveryPage),

@@ -155,6 +155,9 @@ export const api = {
     request<Job>("PUT", `/api/v1/jobs/${seg(id)}/review`, { version, review }),
   setStatus: (id: string, version: number, status: JobStatus) =>
     request<Job>("POST", `/api/v1/jobs/${seg(id)}/status`, { status, version }),
+  /** Settle a post whose outcome is unknown, without posting (`POST /api/v1/jobs/{id}/reconcile`). */
+  reconcileJob: (id: string, version: number) =>
+    request<Job>("POST", `/api/v1/jobs/${seg(id)}/reconcile`, { version }),
 };
 
 /** One path segment, encoded, so that a `/`, `?` or `#` in it cannot change the path. */

@@ -3,7 +3,7 @@
   "info": {
     "title": "diff-reviewer platform API",
     "version": "0.3.0",
-    "description": "The review platform: the repositories whose pull requests it reviews, and one review job per review. A job moves `pending → queued → running → draft → approved → posted`; `rejected` is a discarded draft, `stale` a draft whose pull request has moved on, and `failed` a run that ended without a review.\n\nThree credentials, none standing in for another. The password (`$DIFF_REVIEWER_PASSWORD`) is accepted only by `POST /api/login`, which sets the session cookie; failed logins are rate-limited (`429` with `Retry-After`). Every route under `/api/v1/` needs the session cookie or the API token (`$DIFF_REVIEWER_API_TOKEN_FILE`) as `Authorization: Bearer <token>`. Every route under `/api/agent/v1/` needs the agent token (`$DIFF_REVIEWER_AGENT_TOKEN_FILE`) as a bearer, and nothing else reaches it; an agent's requests go through kleis, which supplies it.\n\nEvery write must be `application/json` (`415` otherwise). Every write to a job under `/api/v1/` names the job's `version` as last read, and is a `409` if the job has changed since. A request the server fails on is a `500` whose reason goes to the server log; a method a route does not answer is a `405`. Collections answer `{\"items\": [...]}`. Instants are RFC 3339 in UTC; an absent value is `null`."
+    "description": "The review platform: the repositories whose pull requests it reviews, and one review job per review. A job moves `pending → queued → running → draft → approved → posted`; `rejected` is a discarded draft, `stale` a draft whose pull request has moved on, and `failed` a run that ended without a review.\n\nThree credentials, none standing in for another. The password (`$DIFF_REVIEWER_PASSWORD`) is accepted only by `POST /api/login`, which sets the session cookie; failed password logins are rate-limited (an immediate `429` with `Retry-After`), and the API token signs in there too, unlimited. Every route under `/api/v1/` needs the session cookie or the API token (`$DIFF_REVIEWER_API_TOKEN_FILE`) as `Authorization: Bearer <token>`. Every route under `/api/agent/v1/` needs the agent token (`$DIFF_REVIEWER_AGENT_TOKEN_FILE`) as a bearer, and nothing else reaches it; an agent's requests go through kleis, which supplies it.\n\nEvery write must be `application/json` (`415` otherwise). Every write to a job under `/api/v1/` names the job's `version` as last read, and is a `409` if the job has changed since. A request the server fails on is a `500` whose reason goes to the server log; a method a route does not answer is a `405`. Collections answer `{\"items\": [...]}`. Instants are RFC 3339 in UTC; an absent value is `null`."
   },
   "security": [
     {
@@ -16,7 +16,7 @@
   "paths": {
     "/api/login": {
       "post": {
-        "summary": "Exchange the password for a session cookie",
+        "summary": "Exchange the password, or the API token, for a session cookie",
         "security": [],
         "requestBody": {
           "required": true,
@@ -24,14 +24,29 @@
             "application/json": {
               "schema": {
                 "type": "object",
-                "required": [
-                  "password"
-                ],
-                "properties": {
-                  "password": {
-                    "type": "string"
+                "oneOf": [
+                  {
+                    "required": [
+                      "password"
+                    ],
+                    "properties": {
+                      "password": {
+                        "type": "string"
+                      }
+                    }
+                  },
+                  {
+                    "required": [
+                      "token"
+                    ],
+                    "properties": {
+                      "token": {
+                        "type": "string",
+                        "description": "The API token ($DIFF_REVIEWER_API_TOKEN_FILE)."
+                      }
+                    }
                   }
-                }
+                ]
               }
             }
           }
@@ -50,7 +65,7 @@
             "$ref": "#/components/responses/Error"
           }
         },
-        "description": "Failed attempts are counted per client address — an IPv6 client per /64 — the socket's peer, or, for a request from the proxy `--trusted-proxy` names, the last address of its `X-Forwarded-For`. After 5 failures from one address within 15 minutes every attempt from it, right or wrong, is a `429` for a delay that starts at 15 seconds and doubles with each further failure (at most 15 minutes); `Retry-After` says how long. After 100 failures from all addresses together every attempt is delayed by 2 seconds, and none is refused for it. A success clears its address's count."
+        "description": "Password attempts are counted per client address — an IPv6 client per /64 — the socket's peer, or, for a request from the proxy `--trusted-proxy` names, the last address of its `X-Forwarded-For`. After 5 failures from one address within 15 minutes every password attempt from it, right or wrong, is a `429` for a delay that starts at 15 seconds and doubles with each further failure (at most 15 minutes). After 100 failures from all addresses together, every password attempt is a `429` for a while. A refusal is immediate; `Retry-After` says how long. A success clears its address's count.\n\nThe API token signs in too, and no limit counts it or refuses it: it is how the operator gets in while password attempts from everywhere are refused."
       }
     },
     "/api/logout": {
@@ -917,6 +932,93 @@
           }
         }
       }
+    },
+    "/api/v1/jobs/{id}/reconcile": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "post": {
+        "summary": "Settle a post whose outcome is unknown, without posting",
+        "description": "For a job whose `postStartedAt` is set — a post that may have reached GitHub. The pull request's reviews by the operator are searched for the job's marker. Found, the job is `posted`, with GitHub's record in `postedReview`. Not found and the claim older than its window (three times the post's timeout), the claim is cleared and the job left `approved`, free to be moved back to `draft`, rejected, posted again or made `stale`. Not found within the window, a `409`: the post may still be under way. Reviews that cannot be read leave the claim as it is: a `502` that carries the job. `409` too for a job that is not `approved`, not at `version`, or has no claim.",
+        "operationId": "reconcileJob",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "version"
+                ],
+                "properties": {
+                  "version": {
+                    "type": "integer"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The job: `posted`, or `approved` without its claim.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Job"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "415": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "description": "GitHub's reviews could not be read; the claim stands.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "error",
+                    "job"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "job": {
+                      "$ref": "#/components/schemas/Job"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -1144,7 +1246,7 @@
               "null"
             ],
             "format": "date-time",
-            "description": "When posting last began, while its outcome is not known: the claim that keeps the review from being posted twice. While it is set the job cannot leave `approved`, have its review edited or be made `stale` (`409`); posting it again settles it."
+            "description": "When posting last began, while its outcome is not known: the claim that keeps the review from being posted twice. While it is set the job cannot leave `approved`, have its review edited or be made `stale` (`409`); posting it again, or `POST /api/v1/jobs/{id}/reconcile`, settles it."
           },
           "postedUrl": {
             "type": [
