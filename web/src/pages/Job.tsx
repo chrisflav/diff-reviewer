@@ -19,6 +19,7 @@ import { CommentCard, FormsContext, type CommentActions } from "../components/Co
 import { DiffView, type Selection } from "../components/DiffView";
 import { parseDiff, type DiffFile } from "../diff";
 import {
+  canKeepBoth,
   conflictId,
   freshKeys,
   fromJson,
@@ -36,6 +37,7 @@ import {
   type Conflict,
   type LocalComment,
   type LocalReview,
+  type Pick,
   type Placement,
 } from "../review";
 import { dropStash, stash, unstash, type Edits, type Stashed } from "../stash";
@@ -69,8 +71,6 @@ function jobOf(err: unknown): Job | null {
   const j = (b as { job: unknown }).job;
   return typeof j === "object" && j !== null && "id" in j && "version" in j ? (j as Job) : null;
 }
-
-type Pick = "mine" | "theirs";
 
 /** Edits moved onto a newer version of the job, and what that left for the person to settle. */
 interface Rebased {
@@ -786,6 +786,17 @@ function ConflictNotice({
                 Keep theirs (version {rebased.to})<span className="value">{theirs}</span>
               </span>
             </label>
+            {canKeepBoth(c) && (
+              <label className="side">
+                <input
+                  type="radio"
+                  name={cid}
+                  checked={rebased.picks[cid] === "both"}
+                  onChange={() => onPick(c, "both")}
+                />
+                <span>Keep both, as two comments</span>
+              </label>
+            )}
           </fieldset>
         );
       })}

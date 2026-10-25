@@ -3,6 +3,7 @@ import type { InlineComment, Review } from "./api";
 import { parseDiff } from "./diff";
 import {
   align,
+  canKeepBoth,
   commentProblem,
   freeze,
   fromJson,
@@ -495,5 +496,74 @@ describe("rebase", () => {
     const j = fromJson(JSON.stringify(theirs), withIds, withIds);
     if (typeof j === "string") throw new Error(j);
     expect(j.comments.map((x) => x[KEY])).toEqual([1]);
+  });
+
+  // Second re-review: merges that mixed two places, or two comments, without a word.
+  const single = (c: InlineComment) => toLocal({ decision: "comment", body: "S", comments: [c] });
+  const edit = (r: LocalReview, k: number, f: (c: LocalComment) => LocalComment): LocalReview => ({
+    ...r,
+    comments: r.comments.map((x) => (x[KEY] === k ? f(x) : x)),
+  });
+
+  it("takes a comment's lines, file and suggestion as one: both changing them is a conflict", () => {
+    const b = single({ ...cmt("a", 5, 5, "use const"), suggestion: "const x = 1;" });
+    const widen = edit(b, 0, (x) => ({ ...x, start_line: 4 }));
+    const suggest = edit(b, 0, (x) => ({ ...x, suggestion: "const x = 2;" }));
+    const moveFile = edit(b, 0, (x) => ({ ...x, file: "b" }));
+    for (const [mine, theirs] of [
+      [widen, suggest],
+      [suggest, widen],
+      [moveFile, widen],
+    ] as const) {
+      const r = rebase(b, mine, toReview(theirs));
+      expect(r.conflicts).toHaveLength(1);
+      expect(toReview(r.review)).toEqual(toReview(theirs));
+    }
+    // A body change still merges with a change of place.
+    const reword = edit(b, 0, (x) => ({ ...x, body: "prefer const" }));
+    const r = rebase(b, reword, toReview(widen));
+    expect(r.conflicts).toEqual([]);
+    expect(toReview(r.review).comments[0]).toEqual({
+      ...cmt("a", 4, 5, "prefer const"),
+      suggestion: "const x = 1;",
+    });
+  });
+
+  it("does not guess which of two comments saying the same was moved", () => {
+    const b = toLocal({
+      decision: "comment",
+      body: "S",
+      comments: [cmt("a", 5, 5, "nit: naming"), cmt("a", 9, 9, "nit: naming")],
+    });
+    // They delete X and move Y to 10; I edit X. My edit must not land on line 10.
+    const mine = edit(b, 0, (x) => ({ ...x, body: "nit: call it count" }));
+    const r = rebase(b, mine, { ...toReview(b), comments: [cmt("a", 10, 10, "nit: naming")] });
+    const placed = lines(r.review);
+    expect(placed).not.toContain("a:10-10 nit: call it count");
+    const c = r.conflicts.find((x) => x.kind === "comment");
+    if (c === undefined || c.kind !== "comment") throw new Error("no conflict");
+    expect(c.mine === null ? null : lines({ ...b, comments: [c.mine] })).toEqual([
+      "a:5-5 nit: call it count",
+    ]);
+    expect(lines(resolve(r.review, c, "mine"))).toContain("a:5-5 nit: call it count");
+  });
+
+  it("pairs a deleted comment only with a new one by its lines, and offers keeping both", () => {
+    const b = single(cmt("a", 5, 5, "x"));
+    const mine = edit(b, 0, (x) => ({ ...x, body: "x!" }));
+    // Far away: another comment, not this one changed. Keeping mine keeps theirs too.
+    const far = rebase(b, mine, { ...toReview(b), comments: [cmt("a", 40, 40, "unrelated")] });
+    const fc = far.conflicts[0];
+    if (fc === undefined) throw new Error("no conflict");
+    expect(canKeepBoth(fc)).toBe(false);
+    expect(lines(resolve(far.review, fc, "mine"))).toEqual(["a:40-40 unrelated", "a:5-5 x!"]);
+    // Nearby: offered as the same comment changed, with "both" as a choice.
+    const near = rebase(b, mine, { ...toReview(b), comments: [cmt("a", 6, 7, "y")] });
+    const nc = near.conflicts[0];
+    if (nc === undefined) throw new Error("no conflict");
+    expect(canKeepBoth(nc)).toBe(true);
+    expect(lines(resolve(near.review, nc, "mine"))).toEqual(["a:5-5 x!"]);
+    expect(lines(resolve(near.review, nc, "both"))).toEqual(["a:6-7 y", "a:5-5 x!"]);
+    expect(lines(resolve(resolve(near.review, nc, "both"), nc, "theirs"))).toEqual(["a:6-7 y"]);
   });
 });

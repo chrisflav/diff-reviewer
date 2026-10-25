@@ -255,16 +255,62 @@ function alignTheirs(
   );
   go(added, (k, o) => guessable(k, o) && same(withoutKey(k), o));
   go(base.comments, (k, o) => guessable(k, o) && samePlace(k, o), rank);
-  go(
-    base.comments,
-    (k, o) =>
-      guessable(k, o) &&
-      k.file === o.file &&
-      ((k.body.trim() !== "" && k.body === o.body) ||
-        (k.suggestion !== undefined && k.suggestion === o.suggestion)),
-    rank,
-  );
+  // A moved comment: the same words in the same file. Only where the pairing is the one
+  // possible, both ways; two comments saying the same ("nit: naming") are not told apart by a
+  // guess, and what is left unpaired goes to the conflict path instead.
+  const moved = (k: LocalComment, o: InlineComment) =>
+    guessable(k, o) &&
+    k.file === o.file &&
+    ((k.body.trim() !== "" && k.body === o.body) ||
+      (k.suggestion !== undefined && k.suggestion === o.suggestion));
+  const freeBase = base.comments.filter((k) => !used.has(k[KEY]));
+  const freeTheirs = theirs.filter((_, i) => keys[i] === undefined);
+  theirs.forEach((o, i) => {
+    if (keys[i] !== undefined) return;
+    const ks = freeBase.filter((k) => moved(k, o));
+    const k = ks[0];
+    if (ks.length !== 1 || k === undefined) return;
+    if (freeTheirs.filter((x) => moved(k, x)).length !== 1) return;
+    keys[i] = k[KEY];
+    used.add(k[KEY]);
+  });
   return theirs.map((o, i) => ({ ...o, [KEY]: keys[i] ?? fresh() }));
+}
+
+/** Where a comment is: its lines, and the suggestion, which is written for exactly those. */
+const placeFields = ["file", "start_line", "end_line", "suggestion"];
+
+function placeOf(c: InlineComment): unknown[] {
+  return placeFields.map((f) => c[f]);
+}
+
+/**
+ * A comment both sides changed, merged: its place (file, lines and suggestion, as one) and each
+ * other field take the change of the side that made one. `null` where both changed the place,
+ * or another field, differently: a line moved on one side and a file or a suggestion changed on
+ * the other would mix two places.
+ */
+export function mergeComment3(
+  bc: LocalComment,
+  mc: LocalComment,
+  tc: LocalComment,
+): LocalComment | null {
+  const [pb, pm, pt] = [placeOf(bc), placeOf(mc), placeOf(tc)];
+  if (!same(pm, pb) && !same(pt, pb) && !same(pm, pt)) return null;
+  const [merged, clash] = mergeFields(bc, mc, tc, placeFields);
+  if (clash.length > 0) return null;
+  const from = same(pt, pb) ? mc : tc;
+  const out = { ...merged, [KEY]: bc[KEY] } as LocalComment;
+  for (const f of placeFields) {
+    if (from[f] === undefined) delete out[f];
+    else out[f] = from[f];
+  }
+  return out;
+}
+
+/** Whether two comments' ranges overlap or lie within a few lines of each other. */
+function near(a: InlineComment, b: InlineComment): boolean {
+  return Math.max(a.start_line, b.start_line) - Math.min(a.end_line, b.end_line) <= 3;
 }
 
 /**
@@ -297,9 +343,8 @@ export function rebase(base: LocalReview, mine: LocalReview, theirsReview: Revie
     if (mc === null && tc === null) return null;
     if (mc !== null && tc !== null) {
       if (same(mc, tc)) return tc;
-      // Both changed it: field by field, a move on one side and a reword on the other is both.
-      const [merged, clash] = mergeFields(bc, mc, tc);
-      if (clash.length === 0) return { ...merged, [KEY]: key } as LocalComment;
+      const merged = mergeComment3(bc, mc, tc);
+      if (merged !== null) return merged;
     }
     conflicts.push({ kind: "comment", key, mine: mc, theirs: tc });
     return tc;
@@ -317,11 +362,12 @@ export function rebase(base: LocalReview, mine: LocalReview, theirsReview: Revie
     const at =
       mc === null || same(mc, bc)
         ? -1
-        : stand.findIndex((c) => c.file === bc.file && guessable(c, bc));
+        : stand.findIndex((c) => c.file === bc.file && guessable(c, bc) && near(c, bc));
     const sub = stand[at];
     if (sub !== undefined) {
-      // Deleted on their side, with a new comment in its file, and edited on this one: most
-      // likely the same comment, changed by both. Their new one stays until the person picks.
+      // Deleted on their side, with a new comment at or just by its lines, and edited on this
+      // one: perhaps the same comment, changed by both. Their new one stays until the person
+      // picks, and "both" is a choice, since it may be another comment altogether.
       stand.splice(at, 1);
       conflicts.push({ kind: "comment", key: bc[KEY], mine: mc, theirs: sub });
       continue;
@@ -335,7 +381,16 @@ export function rebase(base: LocalReview, mine: LocalReview, theirsReview: Revie
 }
 
 /** `r` with a conflict settled one way. Picking again settles it the other way. */
-export function resolve(r: LocalReview, c: Conflict, pick: "mine" | "theirs"): LocalReview {
+export type Pick = "mine" | "theirs" | "both";
+
+/** Whether keeping both sides is a choice: both are there, as two comments (not one changed). */
+export function canKeepBoth(c: Conflict): boolean {
+  return (
+    c.kind === "comment" && c.mine !== null && c.theirs !== null && c.mine[KEY] !== c.theirs[KEY]
+  );
+}
+
+export function resolve(r: LocalReview, c: Conflict, pick: Pick): LocalReview {
   if (c.kind === "field") {
     const out: LocalReview = { ...r };
     const v = pick === "mine" ? c.mine : c.theirs;
@@ -347,10 +402,11 @@ export function resolve(r: LocalReview, c: Conflict, pick: "mine" | "theirs"): L
   const keys = new Set([c.key]);
   if (c.theirs !== null) keys.add(c.theirs[KEY]);
   if (c.mine !== null) keys.add(c.mine[KEY]);
-  const v = pick === "mine" ? c.mine : c.theirs;
+  const keep =
+    pick === "both" && canKeepBoth(c) ? [c.theirs, c.mine] : [pick === "mine" ? c.mine : c.theirs];
   const at = r.comments.findIndex((x) => keys.has(x[KEY]));
   const comments = r.comments.filter((x) => !keys.has(x[KEY]));
-  if (v !== null) comments.splice(at < 0 ? comments.length : at, 0, v);
+  comments.splice(at < 0 ? comments.length : at, 0, ...keep.filter((x) => x !== null));
   return { ...r, comments };
 }
 
