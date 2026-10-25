@@ -26,5 +26,13 @@ export function useLoad<T>(fetcher: () => Promise<T>, onUnauthorized: () => void
 
   useEffect(reload, [reload]);
 
-  return { data, error, reload, setError };
+  // For a write that answers with the new value: showing it at once beats a reload, which would
+  // first show the old one again. A load still in flight is older, and is dropped.
+  const replace = useCallback((d: T) => {
+    latest.current++;
+    setData(d);
+    setError(null);
+  }, []);
+
+  return { data, error, reload, setError, setData: replace };
 }

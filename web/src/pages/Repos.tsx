@@ -1,11 +1,12 @@
-import { useState, type FormEvent } from "react";
-import { api, UnauthorizedError, type PostingMode } from "../api";
+import { useEffect, useState, type FormEvent } from "react";
+import { api, UnauthorizedError, type PostingMode, type Repo } from "../api";
 import { useLoad } from "../useLoad";
 
 export function ReposPage({ onUnauthorized }: { onUnauthorized: () => void }) {
   const { data: repos, error, reload, setError } = useLoad(api.repos, onUnauthorized);
   const [slug, setSlug] = useState("");
   const [mode, setMode] = useState<PostingMode>("staged");
+  const [autoReview, setAutoReview] = useState(false);
 
   const fail = (err: unknown) => {
     if (err instanceof UnauthorizedError) onUnauthorized();
@@ -20,7 +21,7 @@ export function ReposPage({ onUnauthorized }: { onUnauthorized: () => void }) {
       return;
     }
     api
-      .putRepo(owner, name, mode)
+      .putRepo(owner, name, mode, autoReview)
       .then(() => {
         setSlug("");
         reload();
@@ -48,6 +49,14 @@ export function ReposPage({ onUnauthorized }: { onUnauthorized: () => void }) {
           <option value="staged">staged — approve before posting</option>
           <option value="direct">direct — post as submitted</option>
         </select>
+        <label className="check">
+          <input
+            type="checkbox"
+            checked={autoReview}
+            onChange={(e) => setAutoReview(e.target.checked)}
+          />
+          Review open pull requests on its own
+        </label>
         <button type="submit" disabled={slug.trim() === ""}>
           Register
         </button>
@@ -63,6 +72,7 @@ export function ReposPage({ onUnauthorized }: { onUnauthorized: () => void }) {
             <tr>
               <th>Repository</th>
               <th>Posting</th>
+              <th>Automatic</th>
               <th>Registered</th>
               <th />
             </tr>
@@ -74,6 +84,9 @@ export function ReposPage({ onUnauthorized }: { onUnauthorized: () => void }) {
                   {r.owner}/{r.name}
                 </td>
                 <td>{r.mode}</td>
+                <td>
+                  <AutoReviewToggle repo={r} onChanged={reload} onError={fail} />
+                </td>
                 <td className="data mute">{r.createdAt}</td>
                 <td className="right">
                   <button
@@ -92,5 +105,44 @@ export function ReposPage({ onUnauthorized }: { onUnauthorized: () => void }) {
         </table>
       )}
     </>
+  );
+}
+
+/** Turns finding the repository's open pull requests on or off, keeping its posting mode. */
+function AutoReviewToggle({
+  repo,
+  onChanged,
+  onError,
+}: {
+  repo: Repo;
+  onChanged: () => void;
+  onError: (err: unknown) => void;
+}) {
+  // What was asked for, shown until the server's answer replaces it (or, refused, drops it).
+  const [asked, setAsked] = useState<boolean | null>(null);
+  const on = asked ?? repo.autoReview;
+  useEffect(() => setAsked(null), [repo]);
+  return (
+    <label className="check">
+      <input
+        type="checkbox"
+        checked={on}
+        disabled={asked !== null}
+        onChange={(e) => {
+          setAsked(e.target.checked);
+          api
+            .putRepo(repo.owner, repo.name, repo.mode, e.target.checked)
+            .then(onChanged)
+            .catch((err: unknown) => {
+              setAsked(null);
+              onError(err);
+            });
+        }}
+      />
+      <span className="sr-only">
+        Review open pull requests of {repo.owner}/{repo.name} on its own
+      </span>
+      {on ? "on" : "off"}
+    </label>
   );
 }

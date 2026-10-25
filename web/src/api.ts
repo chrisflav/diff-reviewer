@@ -14,10 +14,13 @@ export class UnauthorizedError extends Error {
 
 export class ApiError extends Error {
   readonly status: number;
-  constructor(status: number, message: string) {
+  /** The answer's JSON, for errors that carry more than a message (a failed post's job). */
+  readonly body: unknown;
+  constructor(status: number, message: string, body: unknown = null) {
     super(message);
     this.name = "ApiError";
     this.status = status;
+    this.body = body;
   }
 }
 
@@ -45,18 +48,25 @@ export interface Repo {
   createdAt: string;
 }
 
+/**
+ * Fields this build does not know (a newer one's `category`, `severity`, …) are kept on every
+ * round trip through the page, hence the index signatures: an edit changes what it edits and
+ * passes the rest through.
+ */
 export interface InlineComment {
   file: string;
   start_line: number;
   end_line: number;
   body: string;
   suggestion?: string;
+  [field: string]: unknown;
 }
 
 export interface Review {
   decision: Decision;
   body: string;
   comments: InlineComment[];
+  [field: string]: unknown;
 }
 
 export interface Job {
@@ -95,6 +105,12 @@ export interface Job {
   postedReview: { id: number; url: string; body: string } | null;
 }
 
+export interface JobDiff {
+  headSha: string;
+  /** Unified diff text, as `git diff` writes it. */
+  diff: string;
+}
+
 /** Thrown when the server could not be reached at all. */
 export class NetworkError extends Error {
   constructor() {
@@ -129,7 +145,7 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
       json !== null && typeof json === "object" && "error" in json
         ? String((json as { error: unknown }).error)
         : `${res.status} ${res.statusText}`;
-    throw new ApiError(res.status, msg);
+    throw new ApiError(res.status, msg, json);
   }
   return json as T;
 }
@@ -137,11 +153,15 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
 export const api = {
   session: () => request<{ authenticated: boolean }>("GET", "/api/session"),
   login: (password: string) => request<{ authenticated: boolean }>("POST", "/api/login", { password }),
+  /** Sign in with the API token: never rate-limited, the way in while password attempts are not. */
+  loginWithToken: (token: string) =>
+    request<{ authenticated: boolean }>("POST", "/api/login", { token }),
   logout: () => request<{ authenticated: boolean }>("POST", "/api/logout"),
 
   repos: () => request<{ items: Repo[] }>("GET", "/api/v1/repos").then((r) => r.items),
-  putRepo: (owner: string, name: string, mode: PostingMode) =>
-    request<Repo>("PUT", `/api/v1/repos/${seg(owner)}/${seg(name)}`, { mode }),
+  /** Replaces the settings: both are sent, since an omitted one would fall back to its default. */
+  putRepo: (owner: string, name: string, mode: PostingMode, autoReview: boolean) =>
+    request<Repo>("PUT", `/api/v1/repos/${seg(owner)}/${seg(name)}`, { mode, autoReview }),
   deleteRepo: (owner: string, name: string) =>
     request<void>("DELETE", `/api/v1/repos/${seg(owner)}/${seg(name)}`),
 
@@ -158,6 +178,11 @@ export const api = {
   /** Settle a post whose outcome is unknown, without posting (`POST /api/v1/jobs/{id}/reconcile`). */
   reconcileJob: (id: string, version: number) =>
     request<Job>("POST", `/api/v1/jobs/${seg(id)}/reconcile`, { version }),
+  /** The pull request's diff at the job's head. */
+  diff: (id: string) => request<JobDiff>("GET", `/api/v1/jobs/${seg(id)}/diff`),
+  /** Post an approved review to GitHub, under the operator's account; the job becomes `posted`. */
+  post: (id: string, version: number) =>
+    request<Job>("POST", `/api/v1/jobs/${seg(id)}/post`, { version }),
 };
 
 /** One path segment, encoded, so that a `/`, `?` or `#` in it cannot change the path. */
@@ -178,6 +203,16 @@ export function nextStatuses(s: string): JobStatus[] {
     default:
       return [];
   }
+}
+
+/** Whether a GitHub URL the server recorded may be shown as a link: GitHub's own pages only. */
+export function githubLink(url: string | null): string | null {
+  return url !== null && url.startsWith("https://github.com/") ? url : null;
+}
+
+/** Whether a job may be posted now; posting is its own action, not a status move. */
+export function canPost(s: string): boolean {
+  return s === "approved";
 }
 
 /** Whether a person may edit the review now; mirrors `JobStatus.personCanEdit` in Lean. */
