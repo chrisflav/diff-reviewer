@@ -404,7 +404,8 @@ private def parseBody (body : String) : Except String Json :=
 /-- Register a repository or change its settings. Every field is optional. `prType` fixes the pull
     request type of the repository's reviews (a type of its current rubric; `""` for none, the
     agent's pick), which a fan-out needs (`DiffReviewer.Fanout`), and `maxFanout` bounds the
-    sub-runs one review fans out to; both are kept when left out. `fromProposal` names
+    sub-runs one review fans out to; `incremental` turns incremental re-review on or off. All three
+    are kept when left out. `fromProposal` names
     the rubric proposal the style notes written come from: they record its provenance, and it is
     accepted with the write. `mode` and
     `autoReview` take their defaults when left out, as they always have; `trustedReviewers` and
@@ -477,6 +478,10 @@ or be \"\" for none; '{t}' is not one" .badRequest
           return .error s!"'maxFanout' must be between 1 and {maxFanoutLimit}" .badRequest
         pure (some n)
       | .error _ => return .error "'maxFanout' must be a whole number" .badRequest
+  let incremental ← match j.getObjVal? "incremental" with
+    | .error _ | .ok .null => pure none
+    | .ok (.bool b) => pure (some b)
+    | .ok _ => return .error "'incremental' must be true or false" .badRequest
   -- Style notes a person wrote from a rubric proposal — after rebasing it, say — record its
   -- provenance, and the proposal is accepted with the write.
   let provenance ← match j.getObjVal? "fromProposal" with
@@ -488,7 +493,7 @@ or be \"\" for none; '{t}' is not one" .badRequest
     | .ok _ => return .error "'fromProposal' must be a proposal's id" .badRequest
   match ← Platform.putRepo owner name
       { mode, autoReview, trustedReviewers := trusted, styleNotes, evalShare, prType, maxFanout
-      , expected, provenance } with
+      , incremental, expected, provenance } with
   | .ok (existed, repo) => return .json repo.toJson (if existed then .ok else .created)
   | .error (.invalid why) => return .error why .badRequest
   | .error (.conflict why) => return .error why .conflict
@@ -701,6 +706,25 @@ private def diffReply (st : State) (job : Job) (text : Bool) : IO Reply := do
       return { status := .ok, body := diff.toUTF8, contentType := "text/plain; charset=utf-8"
              , headers := [("Cache-Control", "no-store")] }
     return .json (.mkObj [("headSha", head), ("diff", diff)])
+  | .error .noHead => return .error Workers.DiffError.noHead.message .conflict
+  | .error .unavailable => return .error Workers.DiffError.unavailable.message .serviceUnavailable
+  | .error (.tooLarge why) => return .error why .payloadTooLarge
+  | .error (.github why) => return .error s!"the diff could not be read: {why}" .badGateway
+
+/-- The diff of the changes an incremental re-review reviews, as text: `since` must be the head its
+    previous review was of (`400` otherwise, saying which), so that an agent reads the range its
+    job is bound to and no other. -/
+private def rangeDiffReply (st : State) (job : Job) (since : String) : IO Reply := do
+  let some expected := job.incrementalSince
+    | return .error s!"job {job.id} is a full review, not an incremental one; read its diff \
+without 'since'" .badRequest
+  unless since.toLower == expected do
+    return .error s!"job {job.id} follows up the review of {expected}; ask for the diff since it \
+('since={expected}')" .badRequest
+  match ← Workers.rangeDiffOf st.services job with
+  | .ok diff =>
+    return { status := .ok, body := diff.toUTF8, contentType := "text/plain; charset=utf-8"
+           , headers := [("Cache-Control", "no-store")] }
   | .error .noHead => return .error Workers.DiffError.noHead.message .conflict
   | .error .unavailable => return .error Workers.DiffError.unavailable.message .serviceUnavailable
   | .error (.tooLarge why) => return .error why .payloadTooLarge
@@ -1147,6 +1171,41 @@ private def agentRubric (job : Job) : IO (Except Reply (Option (Nat × Rubric)))
     | .error e => return .error (.error s!"the rubric of {job.owner}/{job.name} (version \
 {v.version}) cannot be read by this build ({e}); the review waits for it to be fixed" .conflict)
 
+/-- What an incremental re-review's agent is given of what it follows up: the head the earlier
+    review was of and its job, the review as GitHub holds it (`postedReview`) with the comments it
+    was posted with — what GitHub last holds of it in the job's history — the commits since, and
+    the command that prints their diff. `null` for a full review. -/
+private def incrementalJson (job : Job) (ref : String) : IO Json := do
+  let some since := job.incrementalSince | return .null
+  let prev ← match job.previousJob with
+    | some id => Platform.findJob id
+    | none => pure none
+  let posted : Json := (prev.bind (·.postedReview) |>.bind (Json.parse · |>.toOption)).getD .null
+  -- The comments as posted: GitHub's revision of the job, or its own review failing that.
+  let revs ← match prev with
+    | some p => Platform.revisions p.id
+    | none => pure #[]
+  let raw := ((revs.filter (·.author == Author.github.toString)).back?.map (·.reviewRaw)) <|>
+    (prev.bind (·.reviewRaw))
+  let comments : Json := match raw.map Review.ofJsonString with
+    | some (.ok r) => .arr (r.comments.map InlineComment.toJson).toArray
+    | _ => .arr #[]
+  let commits := (job.incrementalCommitsRaw.bind (Json.parse · |>.toOption)).getD (.arr #[])
+  return .mkObj [("previousJobId", (job.previousJob.map Json.str).getD .null),
+                 ("sinceSha", since), ("postedReview", posted), ("postedComments", comments),
+                 ("commits", commits),
+                 ("diffCommand", s!"diff-reviewer agent diff {job.owner}/{job.name} \
+{job.prNumber} --since {since} --job {ref}")]
+
+/-- What an incremental re-review's `instructions` end with. -/
+private def incrementalInstructions (since : String) : String :=
+  s!"\n\n# This review follows up an earlier one\n\nThe pull request was reviewed at `{since}`, \
+and that review was posted: `incremental` holds it as GitHub does, with its comments, and the \
+commits since. Review the changes since — `incremental.diffCommand` prints their diff, and every \
+inline comment must be on a line of it — and do not repeat a point the earlier review made, \
+resolved or not. Say in the summary which of its points the new commits resolve, and which still \
+stand."
+
 private def agentJobJson (job : Job) (rubric : Option (Nat × Rubric)) (styleNotes : String)
     (examples : Array Style.Example) : Json :=
   let doc := rubric.map (·.2)
@@ -1213,6 +1272,14 @@ private def agentShow (job : Job) (named : Option (Fanout.SubRun × Nat)) : IO R
 request type\n\nThe repository fixes the type of its reviews: `{t}`. Review by its rubric, and \
 submit with `prType` `{t}`.")
     | none, none => a
+  let incremental ← incrementalJson job ((scope.map (·.ref)).getD job.id)
+  let answer (j : Job) : Json :=
+    let a := answer j
+    if incremental matches .null then a.setObjVal! "incremental" .null else
+    let instructions := (a.getObjValAs? String "instructions").toOption.getD ""
+    a.setObjVal! "incremental" incremental
+      |>.setObjVal! "instructions"
+        (instructions ++ incrementalInstructions (j.incrementalSince.getD ""))
   if let some (s, n) := named then
     if s.status == "queued" && n == s.attempts then
       let _ ← Fanout.update s.id fun _ cur => do
@@ -1310,8 +1377,8 @@ give every comment the category '{c}'" .badRequest
   | none =>
     if let .error e := review.checkCategories (doc.categoriesFor job.prType) then
       return .error s!"'review': {e}" .badRequest
-  if let .ok (_, d) ← Workers.diffOf st.services job then
-    if let .error e := Diff.check review d then return .error s!"'review': {e}" .badRequest
+  if let .error e ← Workers.checkDiffs st.services job review then
+    return .error s!"'review': {e}" .badRequest
   let review ← review.assignIds
   let headSha := headSha.toLower
   let submitted ← Fanout.update sub.id fun j cur => do
@@ -1380,9 +1447,10 @@ private def agentSubmit (st : State) (job : Job) (sub : Option (Fanout.SubRun ×
           .badRequest
   if let .error e := review.checkCategories (doc.categoriesFor prType) then
     return .error s!"'review': {e}" .badRequest
-  -- GitHub refuses a comment off the diff; the agent is told now, while it can still fix it.
-  if let .ok (_, d) ← Workers.diffOf st.services job then
-    if let .error e := Diff.check review d then return .error s!"'review': {e}" .badRequest
+  -- GitHub refuses a comment off the diff, and an incremental re-review takes none off the changes
+  -- since its previous review; the agent is told now, while it can still fix it.
+  if let .error e ← Workers.checkDiffs st.services job review then
+    return .error s!"'review': {e}" .badRequest
   let review ← review.assignIds
   let headSha := headSha.toLower
   let drafted ← Platform.updateJob job.id (revision := Job.revisionBy .agent) fun j => do
@@ -1423,7 +1491,9 @@ private def agentRoute (st : State) (r : Req) : IO Reply := do
   match segs, r.method with
   | ["repos", o, n, "pulls", pr], .get => pull o n pr agentShow
   | ["repos", o, n, "pulls", pr, "diff"], .get =>
-    pull o n pr fun job _ => diffReply st job (text := true)
+    pull o n pr fun job _ => match queryParam r.query "since" with
+      | none => diffReply st job (text := true)
+      | some since => rangeDiffReply st job since
   | ["repos", o, n, "pulls", pr, "review"], .post => pull o n pr (agentSubmit st · · r.body)
   | ["repos", o, n, "proposals", id], .get => proposal o n id agentProposalShow
   | ["repos", o, n, "proposals", id], .post =>

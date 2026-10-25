@@ -51,6 +51,9 @@ structure RepoRow where
   pr_type : Option String
   /-- The most sub-runs one fan-out review may make (`0006`); none is 8. -/
   max_fanout : Option Int
+  /-- Whether a new head of a pull request with a posted review is reviewed incrementally, the
+      changes since that review only (`0007`); none is `true`. -/
+  incremental : Option Bool
   deriving Repr
 
 /-- One review of one pull request at one head commit: queued, run, drafted, approved, posted. -/
@@ -118,6 +121,15 @@ structure JobRow where
   /-- The round of sub-runs the job is reviewed by, when its current attempt fanned out
       (`0006`); none for a job run as one run. Sub-runs of any other round are history. -/
   fanout_round : Option Int
+  /-- An incremental re-review (`0007`): the job whose posted review it follows up, the head that
+      review was of — the diff it reviews is from there — and the commits since, as a JSON array
+      of `{"sha", "message"}`. None for a full review. -/
+  previous_job : Option String
+  incremental_since : Option String
+  incremental_commits : Option String
+  /-- Why a review that would have been incremental is a full one: the head the last review was
+      of is not an ancestor of this one (a force-push) (`0007`). -/
+  full_review_reason : Option String
   deriving Repr
 
 /-- The diff of a pull request at one head commit, as GitHub gave it. A commit's diff never
@@ -675,9 +687,23 @@ def migration0006 : Db.Migration.Migration where
         primaryKey := ["id"] },
     .createIndex "fanout_run" subRunJobIndex]
 
+/-- `0007_m6`: incremental re-review — a repository's switch for it, and a job's previous job, the
+    head it reviews from with the commits since, and why it is a full review when it would have
+    been incremental. The new columns are nullable: a repository written before reviews
+    incrementally, and a job written before was a full review. -/
+def migration0007 : Db.Migration.Migration where
+  name := "0007_m6"
+  steps := [
+    .addColumn "repo" "incremental" { type := .bool, nullable := true },
+    .addColumn "review_job" "previous_job" { type := .text, nullable := true },
+    .addColumn "review_job" "incremental_since" { type := .text, nullable := true },
+    .addColumn "review_job" "incremental_commits" { type := .text, nullable := true },
+    .addColumn "review_job" "full_review_reason" { type := .text, nullable := true }]
+
 /-- The migrations, in the order they are applied. Appended to, never edited. -/
 def migrations : List Db.Migration.Migration :=
-  [migration0001, migration0002, migration0003, migration0004, migration0005, migration0006]
+  [migration0001, migration0002, migration0003, migration0004, migration0005, migration0006,
+   migration0007]
 
 /-- Where the database is. Set once at start-up (`serve --db`), and by the tests. -/
 initialize pathRef : IO.Ref System.FilePath ← IO.mkRef (System.FilePath.mk "diff-reviewer.db")

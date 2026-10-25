@@ -74,6 +74,8 @@ export interface Repo {
   prType?: string | null;
   /** The most sub-runs one fan-out review may make (1 to 51, 8 by default). API 0.7.0. */
   maxFanout?: number;
+  /** Whether a new head after a posted review is reviewed incrementally (default true; 0.8.0). */
+  incremental?: boolean;
   /** Incremented by every write of the settings; sent back to have a stale write refused (409). */
   version: number;
   createdAt: string;
@@ -100,6 +102,8 @@ export interface RepoSettings {
   prType?: string;
   /** 1 to 51; kept when left out. */
   maxFanout?: number;
+  /** Incremental re-review on or off; kept when left out. */
+  incremental?: boolean;
   version?: number;
   [field: string]: unknown;
 }
@@ -247,6 +251,14 @@ export interface Job {
    * answers of `GET /api/v1/jobs` and `GET /api/v1/jobs/{id}` (API 0.7.0).
    */
   subRuns?: SubRun[];
+  /** An incremental re-review: the job whose posted review it follows up (API 0.8.0). */
+  previousJob?: string | null;
+  /** The head that review was of, from which the diff it reviews starts. */
+  incrementalSince?: string | null;
+  /** The commits since, at most 100. */
+  incrementalCommits?: { sha: string; message: string }[] | null;
+  /** Why a review that would have been incremental is a full one (a force-push, …). */
+  fullReviewReason?: string | null;
 }
 
 /** One sub-run of a fan-out review (API 0.7.0). */

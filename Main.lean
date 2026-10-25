@@ -33,13 +33,14 @@ USAGE:
       X-Forwarded-For names the client, for the login rate limit.
 
   diff-reviewer agent show   <owner/repo> <pr-number> --job <id>
-  diff-reviewer agent diff   <owner/repo> <pr-number> --job <id>
+  diff-reviewer agent diff   <owner/repo> <pr-number> [--since <sha>] --job <id>
   diff-reviewer agent submit <owner/repo> <pr-number> <submission.json | -> --job <id>
       What a reviewing agent runs: the review it is to write, the diff under
       review, and submitting the review. The platform's URL and token are in
       ~/.config/diff-reviewer/agent.json ({\"url\": …, \"token\": …}), and
       $DIFF_REVIEWER_URL and $DIFF_REVIEWER_TOKEN override them. --job names
-      the job the agent's prompt gave it, and is required.
+      the job the agent's prompt gave it, and is required. --since prints an
+      incremental re-review's diff of the changes since its earlier review.
 
   diff-reviewer agent proposal show   <owner/repo> --job <id>
   diff-reviewer agent proposal submit <owner/repo> <proposal.json | -> --job <id>
@@ -213,8 +214,8 @@ def main (args : List String) : IO Unit := do
     let some job := Agent.jobFlag rest | IO.print usage; IO.Process.exit 1
     IO.Process.exit (← Agent.showPull repo pr job).toUInt8
   | "agent" :: "diff" :: repo :: pr :: rest =>
-    let some job := Agent.jobFlag rest | IO.print usage; IO.Process.exit 1
-    IO.Process.exit (← Agent.printDiff repo pr job).toUInt8
+    let some (since, job) := Agent.diffFlags rest | IO.print usage; IO.Process.exit 1
+    IO.Process.exit (← Agent.printDiff repo pr job since).toUInt8
   | ["agent", "proposal", "show", repo, "--job", job] =>
     IO.Process.exit (← Agent.showProposal repo job).toUInt8
   | ["agent", "proposal", "submit", repo, path, "--job", job] =>

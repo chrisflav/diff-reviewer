@@ -118,6 +118,26 @@ def ReviewComment.ofJson (j : Json) : Except String ReviewComment := do
          , originalLine := nat? "original_line", originalStartLine := nat? "original_start_line"
          , originalCommitId := ((str? "original_commit_id").getD "").toLower
          , inReplyTo := nat? "in_reply_to_id" }
+/-- What GitHub says of two commits, `base...head`: how `head` stands to `base` — `ahead` when
+    `base` is an ancestor of `head`, otherwise `behind`, `diverged` or `identical` — and the commits
+    from their merge base to `head`, each its id and message. -/
+structure Comparison where
+  status  : String
+  commits : Array (String × String) := #[]
+  deriving Repr, BEq
+
+def Comparison.ofJson (j : Json) : Except String Comparison := do
+  let status ← j.getObjValAs? String "status"
+  let commits := match j.getObjVal? "commits" >>= (·.getArr?) with
+    | .ok xs => xs.filterMap fun c =>
+      match c.getObjValAs? String "sha" with
+      | .ok sha =>
+        let msg := ((c.getObjVal? "commit").bind (·.getObjValAs? String "message")).toOption
+        some (sha.toLower, msg.getD "")
+      | .error _ => none
+    | .error _ => #[]
+  return { status, commits }
+
 /-- Seconds before a request to GitHub is given up. -/
 def requestTimeout : Nat := 60
 
@@ -212,6 +232,10 @@ structure Client where
   /-- The merge base of `base` and `head`: the base a pull request whose base is `base` had at
       `head`. -/
   mergeBase : (owner name base head : String) → IO (Except Error String) :=
+    fun _ _ _ _ => return .error (.definite "comparing commits is not supported")
+  /-- How `head` stands to `base`, and the commits between: whether a pull request's new head
+      descends from the head reviewed last. -/
+  compare : (owner name base head : String) → IO (Except Error Comparison) :=
     fun _ _ _ _ => return .error (.definite "comparing commits is not supported")
   /-- What GitHub last said of the rate limit, if it has said anything. -/
   rateLimit : IO (Option RateLimit) := pure none
@@ -317,6 +341,9 @@ def Client.curl (token : String) (api : String) (maxDiffBytes : Nat := defaultMa
       return (← call "GET" s!"/repos/{owner}/{name}/compare/{base}...{head}?per_page=1").bind
         (parse fun j => do
           return (← (← j.getObjVal? "merge_base_commit").getObjValAs? String "sha").toLower)
+    compare := fun owner name base head => do
+      return (← call "GET" s!"/repos/{owner}/{name}/compare/{base}...{head}?per_page=100").bind
+        (parse Comparison.ofJson)
     rateLimit := lastRateLimit.get }
 
 /-- The client configured by the environment: the token in `DIFF_REVIEWER_GITHUB_TOKEN_FILE`, or
