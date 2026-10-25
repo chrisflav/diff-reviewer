@@ -168,7 +168,8 @@ and digest in that file; its labels name the commit it was built from
 (`org.opencontainers.image.revision`) and the base it was built on
 (`org.opencontainers.image.base.name`, `org.opencontainers.image.base.digest`).
 
-A review task asks for it by name (orchestra's `execution_image`), which beats both the operator's
+It needs orchestra's per-task `execution_image` (orchestra PR #220, not yet merged at the time of
+writing). A review task asks for it by name (orchestra's `execution_image`), which beats both the operator's
 per-repository pin and a repository's own `execution.image`: a review needs this CLI whatever the
 repository it reviews. In the client file above:
 
