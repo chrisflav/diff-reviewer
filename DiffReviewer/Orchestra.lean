@@ -31,14 +31,20 @@ structure QueueRequest where
       syntax, added to what the client file gives every task: a task can be given less than the
       client's spec, never more. Empty for a review. -/
   kleisNarrow : List String := []
+  /-- The commit to check the task's repository out at (`checkout`), rather than its default
+      branch. Not yet sent: orchestra's queue API does not take it yet (see `queuePending`). -/
+  checkout    : Option String := none
   deriving Repr
 
 def QueueRequest.toJson (r : QueueRequest) : Json :=
   let fields : List (String × Json) :=
     [("prompt", r.prompt), ("goal", r.goal), ("upstream", r.upstream),
      ("issue_number", r.issueNumber), ("external_id", r.externalId)]
-  .mkObj (if r.kleisNarrow.isEmpty then fields
-    else fields ++ [("kleis_narrow", .arr (r.kleisNarrow.map Json.str).toArray)])
+  let fields := if r.kleisNarrow.isEmpty then fields
+    else fields ++ [("kleis_narrow", .arr (r.kleisNarrow.map Json.str).toArray)]
+  .mkObj (match r.checkout with
+    | some sha => fields ++ [("checkout", (sha : Json))]
+    | none => fields)
 
 /-- What the platform reads of a queue entry. -/
 structure Entry where

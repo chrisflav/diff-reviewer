@@ -533,8 +533,10 @@ left as it is")
     -- A person's edit ends the platform's own attempts to post.
     return { job.setReview review with statusRaw := JobStatus.draft.toString, postDirect := false }
 
-/-- Make a person's decision on a job. The body is `{"status": …, "version": n}`. -/
-private def setStatus (id body : String) : IO Reply := do
+/-- Make a person's decision on a job. The body is `{"status": …, "version": n}`. Running a failed
+    calibration job again charges its repository's daily cap of calibration jobs, as a new one
+    does: `429` past it. -/
+private def setStatus (st : State) (id body : String) : IO Reply := do
   let j ← match parseBody body with
     | .ok j => pure j
     | .error e => return .error e .badRequest
@@ -543,6 +545,16 @@ private def setStatus (id body : String) : IO Reply := do
     | .error e => return .error e .badRequest
   let some to := (j.getObjValAs? String "status").toOption.bind JobStatus.ofString?
     | return .error "'status' must be approved, rejected, stale, draft or pending" .badRequest
+  if to == .pending then
+    if let some job ← Platform.findJob id then
+      if job.kind? == some .calibration then
+        return match ← Calibration.retryJob id version
+            st.services.limits.maxCalibrationJobsPerDay with
+          | .ok j => .json j.toJson
+          | .error .notFound => .error "not found" .notFound
+          | .error (.invalid why) => .error why .badRequest
+          | .error (.conflict why) => .error why .conflict
+          | .error (.capped why) => .error why .tooManyRequests
   updateReply <$> Platform.updateJob id fun job => do
     let st ← current job version
     if let some why := job.claimBlocks then throw (.conflict why)
@@ -696,7 +708,9 @@ private def calibrationRun (st : State) (owner name body : String) : IO Reply :=
       return .error s!"a run reviews at most {most} samples" .badRequest
     match ← Calibration.createRun repo ids st.services.limits.maxCalibrationJobsPerDay with
     | .ok (run, _) => return .json (← Calibration.runJson run (detail := true)) .created
+    | .error .notFound => return .error "not found" .notFound
     | .error (.invalid why) => return .error why .badRequest
+    | .error (.conflict why) => return .error why .conflict
     | .error (.capped why) => return .error why .tooManyRequests
 
 /-- Every route under `/api/v1/`, with the methods it answers. `DiffReviewerTest.Server` checks
@@ -715,6 +729,7 @@ def apiRoutes : Array (String × Array String) :=
     ("repos/{owner}/{name}/rubrics",         #["get", "put"]),
     ("repos/{owner}/{name}/rubrics/history", #["get"]),
     ("repos/{owner}/{name}/calibration/import",       #["get", "post"]),
+    ("repos/{owner}/{name}/calibration/import/{id}/cancel", #["post"]),
     ("repos/{owner}/{name}/calibration/samples",      #["get"]),
     ("repos/{owner}/{name}/calibration/samples/{id}", #["get", "delete"]),
     ("repos/{owner}/{name}/calibration/runs",         #["get", "post"]),
@@ -745,7 +760,7 @@ private def apiRoute (st : State) (r : Req) (segs : List String) : IO Reply := d
     | some j => return .json j.toJson
     | none   => return .error "not found" .notFound
   | ["jobs", id, "review"], .put => putReview id r.body
-  | ["jobs", id, "status"], .post => setStatus id r.body
+  | ["jobs", id, "status"], .post => setStatus st id r.body
   | ["jobs", id, "post"], .post => postJob st id r.body
   | ["jobs", id, "reconcile"], .post => reconcileJob st id r.body
   | ["jobs", id, "diff"], .get =>
@@ -771,6 +786,14 @@ private def apiRoute (st : State) (r : Req) (segs : List String) : IO Reply := d
   | ["repos", owner, name, "calibration", "import"], .get =>
     withRepo owner name fun repo => do
       page r.query ((← Calibration.importsOf repo.owner repo.name).map (·.toJson))
+  | ["repos", owner, name, "calibration", "import", id, "cancel"], .post =>
+    withRepo owner name fun repo => do
+      match ← Calibration.cancelImport repo.owner repo.name id with
+      | some (.ok i) => return .json i.toJson
+      | some (.error i) =>
+        return .json (.mkObj [("error", s!"import {id} is {i.status}; only a queued or running \
+import is cancelled"), ("import", i.toJson)]) .conflict
+      | none => return .error "not found" .notFound
   | ["repos", owner, name, "calibration", "samples"], .get =>
     withRepo owner name fun repo => do
       page r.query ((← Calibration.listSamples repo.owner repo.name).map (·.toJson))
@@ -801,6 +824,7 @@ private def apiRoute (st : State) (r : Req) (segs : List String) : IO Reply := d
     withRepo owner name fun repo => do
       return .json (← Calibration.summaryJson repo.owner repo.name)
   | ["repos", _, _, "calibration", "import"], _ | ["repos", _, _, "calibration", "samples"], _
+  | ["repos", _, _, "calibration", "import", _, "cancel"], _
   | ["repos", _, _, "calibration", "samples", _], _ | ["repos", _, _, "calibration", "runs"], _
   | ["repos", _, _, "calibration", "runs", _], _ | ["repos", _, _, "calibration", "summary"], _ =>
     return .error "method not allowed" .methodNotAllowed
@@ -831,7 +855,15 @@ def agentSegments (path : String) : Option (List String) :=
 /-- The job an agent is running for a pull request: one that is `queued` or `running` — the one the
     agent names (`X-Diff-Reviewer-Job`, from `--job`), or else the only one. With two, an agent
     that does not say which it runs is told so rather than given one: the run of a superseded head
-    must not take over the review of the new one. -/
+    must not take over the review of the new one.
+
+    kleis binds an agent's requests to its task's pull request, not to its job, so an agent could
+    name another active job of the same pull request. Of the active jobs at one commit, only the one
+    made last (to the second, as creation times are kept) is answered: an older run of that commit —
+    a job asked for again by hand — is refused rather than let take over the newer one, and a run
+    never shares its sample with another (`Calibration.createRun`). A job of another commit of the
+    same pull request can still be named; closing that needs kleis to bind the header to a fact of
+    the task (its orchestra `external_id`), which it does not have. -/
 private def activeJob (owner name : String) (pr : Nat) (jobId : Option String) :
     IO (Except Reply Job) := do
   let active := (← Platform.jobsOfPull owner.toLower name.toLower pr).filter fun j =>
@@ -839,7 +871,12 @@ private def activeJob (owner name : String) (pr : Nat) (jobId : Option String) :
   let notRun := Reply.error s!"no review of {owner}/{name}#{pr} is being run" .notFound
   match jobId with
   | some id => return match active.find? (·.id == id) with
-    | some j => .ok j
+    | some j =>
+      -- Made later, to the second: two jobs made in one second are both answered.
+      match active.find? fun k => k.headSha == j.headSha && k.createdAt > j.createdAt with
+      | some newer => .error (Reply.error s!"job {id} has been superseded by job {newer.id}, a \
+newer review of the same commit; it is not run" .conflict)
+      | none => .ok j
     | none => .error (Reply.error s!"job {id} is not a review of {owner}/{name}#{pr} being run"
         .notFound)
   | none =>

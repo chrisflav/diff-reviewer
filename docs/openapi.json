@@ -493,7 +493,7 @@
       ],
       "post": {
         "summary": "Make a person's decision on a job",
-        "description": "A person's moves only: `draft → approved | rejected | stale`, `approved → draft`, `rejected → draft`, and `failed → pending` to run the review again (which clears `queueEntry` and `error`; the next attempt is queued under a new orchestra `external_id`). Queueing, running, the agent's draft and posting are the platform's own, and no request makes them — posting is asked for with `POST /api/v1/jobs/{id}/post`. Any other move is a `409`, and so is approving a job without a readable review. `409` while a post of the job may have reached GitHub (`postStartedAt` is set). A `calibration` job is never approved: `409`.",
+        "description": "A person's moves only: `draft → approved | rejected | stale`, `approved → draft`, `rejected → draft`, and `failed → pending` to run the review again (which clears `queueEntry` and `error`; the next attempt is queued under a new orchestra `external_id`). Queueing, running, the agent's draft and posting are the platform's own, and no request makes them — posting is asked for with `POST /api/v1/jobs/{id}/post`. Any other move is a `409`, and so is approving a job without a readable review. `409` while a post of the job may have reached GitHub (`postStartedAt` is set). A `calibration` job is never approved: `409`. Running a failed `calibration` job again (`failed → pending`) charges the repository's daily cap of calibration jobs: `429` past it.",
         "operationId": "setJobStatus",
         "requestBody": {
           "required": true,
@@ -549,6 +549,9 @@
           },
           "415": {
             "$ref": "#/components/responses/Error"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error"
           }
         }
       }
@@ -566,7 +569,7 @@
       ],
       "post": {
         "summary": "Post an approved review to GitHub",
-        "description": "Posts the job's review to its pull request — submitted, pinned to `headSha` with every comment on the right-hand side, its body ending in the marker `<!-- diff-reviewer job <id> -->` — and then marks the job `posted`, recording GitHub's id, URL and body of the review in `postedReview`. The event is the review's decision, except on a pull request the operator (`DIFF_REVIEWER_GITHUB_LOGIN`) wrote, where an approval or a request for changes is posted as a comment and `postNote` says so. The job must be `approved` and at the `version` named, its review valid and its comments on the diff (`409` otherwise). Posting is claimed (`postStartedAt`) immediately before the request to GitHub; a claim less than three times that request's timeout old is a `409`, as a post that may still be under way. An older claim is settled first: the pull request's reviews by the operator are searched for the marker, and a review found is recorded rather than posted again. A `4xx` from GitHub clears the claim and leaves the job `approved` with the reason in `error` (a `502` that carries the job). No answer or a `5xx` keeps the claim, even when the review is not found yet, so the next attempt looks again before posting. `503` when the platform has no GitHub token. A `calibration` job is never posted: `409`.",
+        "description": "Posts the job's review to its pull request — submitted, pinned to `headSha` with every comment on the right-hand side, its body ending in the marker `<!-- diff-reviewer job <id> -->` — and then marks the job `posted`, recording GitHub's id, URL and body of the review in `postedReview`. The event is the review's decision, except on a pull request the operator (`DIFF_REVIEWER_GITHUB_LOGIN`) wrote, where an approval or a request for changes is posted as a comment and `postNote` says so. The job must be `approved` and at the `version` named, its review valid and its comments on the diff (`409` otherwise). Posting is claimed (`postStartedAt`) immediately before the request to GitHub; a claim less than three times that request's timeout old is a `409`, as a post that may still be under way. An older claim is settled first: the pull request's reviews by the operator are searched for the marker, and a review found is recorded rather than posted again. A `4xx` from GitHub clears the claim and leaves the job `approved` with the reason in `error` (a `502` that carries the job). No answer, a `5xx` or GitHub's rate limit keeps the claim — a rate-limited post is not made again until the claim is settled, after the limit has had time to reset — even when the review is not found yet, so the next attempt looks again before posting. `503` when the platform has no GitHub token. A `calibration` job is never posted: `409`.",
         "operationId": "postJob",
         "requestBody": {
           "required": true,
@@ -738,7 +741,7 @@
       ],
       "get": {
         "summary": "The review the agent is running",
-        "description": "The job the agent runs (see `X-Diff-Reviewer-Job`), `queued` or `running`; reading a `queued` one moves it to `running`. `404` when no review of the pull request is being run. `409` too when the repository's rubric cannot be read by this build.",
+        "description": "The job the agent runs (see `X-Diff-Reviewer-Job`), `queued` or `running`; reading a `queued` one moves it to `running`. `404` when no review of the pull request is being run. `409` too when the repository's rubric cannot be read by this build. With `X-Diff-Reviewer-Job` naming a job of a commit another active job of the same pull request was made for later (to the second), `409`: only the newest job of a commit is run.",
         "operationId": "agentShow",
         "security": [
           {
@@ -1355,7 +1358,7 @@
       "post": {
         "summary": "Import past reviews by the trusted reviewers",
         "operationId": "requestCalibrationImport",
-        "description": "Queues an import of the most recently updated closed pull requests (`limit`, 50 by default, at most 200); the workers read it on, a bounded number of pull requests a pass, and stop when GitHub says its rate limit is reached, to go on the next pass. Each submitted review by a trusted reviewer becomes a sample, unless one of it is stored already (or was deleted). `409` while an import of the repository is under way (with it, as `import`) or when the repository names no `trustedReviewers`; `503` without a GitHub token.",
+        "description": "Queues an import of the most recently updated closed pull requests (`limit`, 50 by default, at most 200); the workers read it on, a bounded number of pull requests a pass, and pause when GitHub says its rate limit is reached, or when the requests it has left fall under `--github-reserve` (500 by default, kept for discovery and posting), to go on once it resets. A pull request that fails 3 times is skipped. What each trusted reviewer said of each commit becomes a sample. Every review is looked at once: importing again adds only new reviews, to the sample of their commit and reviewer when there is one, and nothing to a deleted sample. `409` while an import of the repository is under way (with it, as `import`) or when the repository names no `trustedReviewers`; `503` without a GitHub token.",
         "requestBody": {
           "required": true,
           "content": {
@@ -1653,7 +1656,7 @@
       "post": {
         "summary": "Run the agent on samples",
         "operationId": "createCalibrationRun",
-        "description": "One `calibration` job per sample, at the sample's commit and with its base for the diff, queued and run as any review is, with the same prompt and rubric, and never posted. Each job's orchestra request carries the kleis narrowing `github: only discover, fetch`: the task clones and fetches over git, and cannot read GitHub's REST or GraphQL API, where the person's review is. `{\"samples\": [id, …]}` names them; `{\"count\": n}` takes the n reviewed by the fewest runs so far, the most recent first. At most 20 either way. `429` when the jobs would pass `--max-calibration-jobs-per-day` (20 by default) for the repository, a cap apart from `--max-jobs-per-day`.",
+        "description": "One `calibration` job per sample, at the sample's commit and with its base for the diff, queued and run as any review is, with the same prompt and rubric, and never posted. Each job's orchestra request carries the kleis narrowing `github: only discover, fetch`: the task clones and fetches over git, and cannot read GitHub's REST or GraphQL API, where the person's review is. `{\"samples\": [id, …]}` names them; `{\"count\": n}` takes the n reviewed by the fewest runs so far, the most recent first. At most 20 either way, and a sample a live (pending, queued or running) calibration job is reviewing is refused (`409`); `count` leaves those out. `429` when the jobs would pass `--max-calibration-jobs-per-day` (20 by default) for the repository, a cap apart from `--max-jobs-per-day`: each job is a charge on it, and so is each time a person runs a failed one again.",
         "requestBody": {
           "required": true,
           "content": {
@@ -1703,6 +1706,9 @@
             "$ref": "#/components/responses/Error"
           },
           "429": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
             "$ref": "#/components/responses/Error"
           }
         }
@@ -1866,6 +1872,63 @@
             "$ref": "#/components/responses/Error"
           },
           "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/v1/repos/{owner}/{name}/calibration/import/{id}/cancel": {
+      "parameters": [
+        {
+          "name": "owner",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "name",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "post": {
+        "summary": "Cancel an import",
+        "operationId": "cancelCalibrationImport",
+        "description": "A queued or running import is read no further; what it stored stays. `409` (with the import, as `import`) for one that has ended.",
+        "responses": {
+          "200": {
+            "description": "Cancelled.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CalibrationImport"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "415": {
             "$ref": "#/components/responses/Error"
           }
         }
@@ -2555,7 +2618,7 @@
           "owner",
           "name",
           "prNumber",
-          "reviewId",
+          "reviewIds",
           "reviewer",
           "state",
           "body",
@@ -2565,9 +2628,11 @@
           "comments",
           "dropped",
           "submittedAt",
-          "importedAt"
+          "importedAt",
+          "scope",
+          "updatedAt"
         ],
-        "description": "One review a trusted reviewer wrote of one commit of a closed pull request.",
+        "description": "What one trusted reviewer said of one commit of a closed pull request: every review they submitted of it, merged. Its comments are theirs together, its state the strongest (`CHANGES_REQUESTED`, then `APPROVED`, then `COMMENTED`), its bodies joined.",
         "properties": {
           "id": {
             "type": "string"
@@ -2581,9 +2646,12 @@
           "prNumber": {
             "type": "integer"
           },
-          "reviewId": {
-            "type": "integer",
-            "description": "GitHub's id of the review; an import never stores one twice."
+          "reviewIds": {
+            "type": "array",
+            "items": {
+              "type": "integer"
+            },
+            "description": "GitHub's ids of the reviews merged into it. An import adds a later review of the same commit by the same reviewer; never to a deleted sample."
           },
           "reviewer": {
             "type": "string",
@@ -2591,7 +2659,7 @@
           },
           "state": {
             "type": "string",
-            "description": "GitHub's state of the review, as it gave it: `APPROVED`, `CHANGES_REQUESTED`, `COMMENTED`, `DISMISSED`."
+            "description": "The strongest state of its reviews, as GitHub gave it: `CHANGES_REQUESTED`, then `APPROVED`, then `COMMENTED`."
           },
           "body": {
             "type": "string"
@@ -2607,6 +2675,15 @@
           "title": {
             "type": "string"
           },
+          "scope": {
+            "type": "string",
+            "enum": [
+              "full",
+              "partial",
+              "decision"
+            ],
+            "description": "What it is scored for. `full`: everything. `partial`: comments were dropped (`dropped.left`, `dropped.outdated`), so its comments are not the whole review — its decision only. `decision`: an approval or a request for changes that says nothing else — its decision only."
+          },
           "comments": {
             "type": "array",
             "items": {
@@ -2620,7 +2697,7 @@
               "outdated",
               "replies"
             ],
-            "description": "The review's comments that were not kept: on the old side, not placed on a line of `commitId`, and replies in a thread.",
+            "description": "Comments of its reviews not kept: on the old side (`left`), not anchored to a line of `commitId` — written against another commit, or on the whole file (`outdated`; not GitHub's outdated, which is against later commits) — and replies in a thread (`replies`).",
             "properties": {
               "left": {
                 "type": "integer"
@@ -2643,6 +2720,11 @@
           "importedAt": {
             "type": "string",
             "format": "date-time"
+          },
+          "updatedAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When a review was last merged into it."
           }
         }
       },
@@ -2656,6 +2738,7 @@
           "status",
           "pullsListed",
           "pullsRead",
+          "failures",
           "stats",
           "error",
           "requestedAt",
@@ -2682,7 +2765,8 @@
               "queued",
               "running",
               "done",
-              "failed"
+              "failed",
+              "cancelled"
             ]
           },
           "pullsListed": {
@@ -2704,19 +2788,19 @@
               },
               "reviews": {
                 "type": "integer",
-                "description": "Submitted reviews by trusted reviewers."
+                "description": "Submitted reviews by trusted reviewers not seen by an earlier import."
               },
               "imported": {
                 "type": "integer",
-                "description": "Samples stored."
+                "description": "Samples made."
               },
               "known": {
                 "type": "integer",
-                "description": "Reviews stored before (or deleted), not stored again."
+                "description": "Reviews an earlier import looked at; never counted again."
               },
               "empty": {
                 "type": "integer",
-                "description": "Reviews with no body and no comment kept: nothing to compare."
+                "description": "Comments (and dismissed reviews) that say nothing: no body and no comment kept. An approval or a request for changes that says nothing is kept, as a `decision` sample."
               },
               "unreachable": {
                 "type": "integer",
@@ -2724,7 +2808,7 @@
               },
               "unreadable": {
                 "type": "integer",
-                "description": "Pull requests whose reviews GitHub refused to list."
+                "description": "Pull requests whose reviews GitHub refused to list, or that failed 3 times."
               },
               "droppedLeft": {
                 "type": "integer",
@@ -2737,6 +2821,14 @@
               "droppedReplies": {
                 "type": "integer",
                 "description": "Replies in a thread."
+              },
+              "merged": {
+                "type": "integer",
+                "description": "Reviews merged into a sample of the same commit and reviewer."
+              },
+              "deleted": {
+                "type": "integer",
+                "description": "Reviews of a group whose sample was deleted: added to nothing."
               }
             }
           },
@@ -2745,7 +2837,7 @@
               "string",
               "null"
             ],
-            "description": "Why the last pass stopped short — GitHub's rate limit, an error to retry — or why it failed."
+            "description": "Why the last pass stopped short — GitHub's rate limit, the requests left under `--github-reserve` (paused until the reset), an error to retry — or why it failed."
           },
           "requestedAt": {
             "type": "string",
@@ -2754,6 +2846,10 @@
           "updatedAt": {
             "type": "string",
             "format": "date-time"
+          },
+          "failures": {
+            "type": "integer",
+            "description": "How many times reading the next pull request has failed; at 3 it is skipped as `unreadable`."
           }
         }
       },
@@ -2761,6 +2857,7 @@
         "type": "object",
         "required": [
           "matcherVersion",
+          "scope",
           "agentComments",
           "humanComments",
           "matched",
@@ -2773,7 +2870,7 @@
           "unmatchedAgent",
           "unmatchedHuman"
         ],
-        "description": "One calibration job's draft against its sample. Comments are paired one to one, greedily, closest first: on the same file, with ranges that overlap or are at most 3 lines apart. Pairing is by place only.",
+        "description": "One calibration job's draft against its sample. Comments are paired one to one, greedily, closest first: on the same file, with ranges that overlap or are at most 3 lines apart. Pairing is by place only. A draft that cannot be scored (it does not read, or its sample is gone) is recorded once as `{\"matcherVersion\", \"unscorable\": why}` instead, and left out of aggregates.",
         "properties": {
           "matcherVersion": {
             "type": "integer",
@@ -2794,14 +2891,14 @@
               "number",
               "null"
             ],
-            "description": "`matched / agentComments`: how many of the agent's comments were on something the person commented on. To four decimals; null when there is nothing to divide by."
+            "description": "`matched / agentComments`: how many of the agent's comments were on something the person commented on. To four decimals; null when there is nothing to divide by. Null for a sample scored for its decision only."
           },
           "recall": {
             "type": [
               "number",
               "null"
             ],
-            "description": "`matched / humanComments`: how many of the person's comments the agent found. To four decimals; null when there is nothing to divide by."
+            "description": "`matched / humanComments`: how many of the person's comments the agent found. To four decimals; null when there is nothing to divide by. Null for a sample scored for its decision only."
           },
           "byCategory": {
             "type": "array",
@@ -3001,6 +3098,15 @@
             "items": {
               "$ref": "#/components/schemas/HumanComment"
             }
+          },
+          "scope": {
+            "type": "string",
+            "enum": [
+              "full",
+              "partial",
+              "decision"
+            ],
+            "description": "The sample's scope. Only `full` has a precision and recall, and adds its comments to aggregates; the others count for their decision."
           }
         }
       },
@@ -3009,6 +3115,7 @@
         "required": [
           "matcherVersion",
           "scored",
+          "commentsScored",
           "agentComments",
           "humanComments",
           "matched",
@@ -3018,7 +3125,7 @@
           "bySeverity",
           "decisions"
         ],
-        "description": "Scores by the current matcher added up: counts first, every ratio computed from the sums, so each comment weighs the same.",
+        "description": "Scores by the current matcher of samples not deleted, added up: counts first, every ratio computed from the sums, so each comment weighs the same.",
         "properties": {
           "matcherVersion": {
             "type": "integer"
@@ -3163,6 +3270,10 @@
                 }
               }
             }
+          },
+          "commentsScored": {
+            "type": "integer",
+            "description": "Of `scored`, the jobs of `full` samples: the ones whose comments the counts, precision and recall are of. Decisions are of all."
           }
         }
       },
@@ -3271,20 +3382,20 @@
                       "type": "integer"
                     },
                     "deleted": {
-                      "type": "boolean"
+                      "type": "boolean",
+                      "description": "A deleted sample's score is shown here and left out of every aggregate."
+                    },
+                    "scope": {
+                      "type": "string"
                     }
                   }
                 },
                 "score": {
-                  "oneOf": [
-                    {
-                      "$ref": "#/components/schemas/CalibrationScore"
-                    },
-                    {
-                      "type": "null"
-                    }
+                  "type": [
+                    "object",
+                    "null"
                   ],
-                  "description": "Null until the job's draft is scored."
+                  "description": "A `CalibrationScore`, an `unscorable` record, or null until the job's draft is scored."
                 }
               }
             }
@@ -3315,7 +3426,8 @@
             "type": "integer"
           },
           "overall": {
-            "$ref": "#/components/schemas/CalibrationAggregate"
+            "$ref": "#/components/schemas/CalibrationAggregate",
+            "description": "Of every scored job whose sample is not deleted."
           },
           "byRubricVersion": {
             "type": "array",

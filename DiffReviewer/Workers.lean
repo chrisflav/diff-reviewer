@@ -54,8 +54,9 @@ after GitHub has acted on it. So:
     settled before anything is posted again: the pull request's reviews by the operator
     (`DIFF_REVIEWER_GITHUB_LOGIN`) are searched for the marker, and a review found is recorded
     as posted — GitHub's id, URL and body.
-  * only a definite refusal (a `4xx`) clears the claim. No answer, or a `5xx`, keeps it, even when
-    the review is not to be found yet.
+  * only a definite refusal (a `4xx`) clears the claim. No answer, a `5xx`, or GitHub's rate limit
+    keeps it, even when the review is not to be found yet: a rate-limited post is retried once
+    the claim is settled, after the limit has had time to reset, not at once.
   * while a claim stands, the job cannot leave `approved`, have its review edited or be made
     `stale` (`Job.claimBlocks`): what it says is what may have been posted. Posting it again
     settles the claim.
@@ -104,6 +105,9 @@ structure Limits where
   maxCalibrationJobsPerDay : Nat := 20
   /-- Pull requests the calibration imports read in one pass, together. -/
   importPullsPerPass : Nat := 25
+  /-- GitHub requests kept for discovery and posting: imports pause, until the limit resets, when
+      fewer are left. -/
+  githubReserve : Nat := 500
 
 structure Services where
   github    : Option GitHub.Client
@@ -134,30 +138,41 @@ def Services.logOnce (s : Services) (key msg : String) : IO Unit := do
 /-! ## What the agent is told -/
 
 /-- The step of `prompt` that has the agent check out the commit under review. A calibration
-    job's commit is of a pull request that has since been closed, and may no longer be its head:
-    it is fetched by its id, and the agent is told to review it as it stood then, without reading
-    what was said about the pull request since — which is what it is scored against, and which
-    its token's narrowing (`calibrationNarrowing`) keeps it from reading. -/
+    job's commit is of a pull request that has since been closed. The task's checkout is the
+    repository's default branch, mounted read-only — which may well hold the change as it was
+    merged, after the review — so the agent reviews from the platform's diff, reads files at the
+    commit with `git show` where the clone has it, and is told to read no other ref; what was said
+    of the pull request on GitHub its token's narrowing (`calibrationNarrowing`) keeps from it. -/
 private def checkoutStep (job : Job) : String :=
   let slug := s!"{job.owner}/{job.name}"
   let diff := s!"`diff-reviewer agent diff {slug} {job.prNumber} --job {job.id}` prints the diff \
 under review."
   if job.kind? == some .calibration then
-    s!"2. The repository is checked out read-only in your working directory. The pull request may \
-have moved on or been closed since the head commit it names: fetch that commit itself (`git fetch \
-origin <headSha> && git checkout <headSha>`, or `git fetch origin pull/{job.prNumber}/head` first \
-if that fails) and review the change as it stands there, as if it were open for review now. Do not \
-read the pull request's reviews, comments or later commits; this task reaches GitHub only to clone \
-and fetch, not through its API. {diff}"
+    s!"2. Review the change as it stands at the head commit it names, as if the pull request were \
+open for review now. {diff} Read that diff first. The working directory holds the repository \
+read-only, at a later state than that commit: do not read its files as they are, and do not check \
+out, fetch or read any other ref, branch or commit. For the context of a changed file, read it at \
+the head commit, `git show <headSha>:<path>`, where that commit is in the clone; where it is not, \
+review from the diff alone. Do not read the pull request's reviews or comments; this task reaches \
+GitHub only through git, not through its API."
   else
     s!"2. The repository is checked out read-only in your working directory. Check out the head \
 commit it names (`git fetch origin pull/{job.prNumber}/head && git checkout <headSha>`) and read \
 the change in context. {diff}"
 
+/-- The prompt's last line: who posts the review, which for a calibration job is nobody. -/
+private def postingLine (job : Job) : String :=
+  if job.kind? == some .calibration then
+    "Do not comment on, review or otherwise write to the pull request on GitHub: the review is \
+kept by the platform, and never posted."
+  else
+    "Do not comment on, review or otherwise write to the pull request on GitHub yourself: the \
+review is posted, once accepted, by the platform."
+
 /-- The prompt of the orchestra task that reviews `job`. It names no head commit: the agent asks the
     platform which one (`agent show`), so a prompt never disagrees with the job. A calibration job's
-    differs only in how the commit is checked out (`checkoutStep`), and says nothing of the review
-    it is scored against. -/
+    differs only in how the commit is read (`checkoutStep`) and in who posts the review
+    (`postingLine`), and says nothing of the review it is scored against. -/
 def prompt (job : Job) : String :=
   let slug := s!"{job.owner}/{job.name}"
   s!"Review pull request #{job.prNumber} of {slug} for the diff-reviewer platform (job {job.id}).
@@ -179,8 +194,7 @@ submit again until it is accepted.
 A review may carry at most {maxInlineComments} inline comments; merge or drop the least \
 important rather than exceed it.
 
-Do not comment on, review or otherwise write to the pull request on GitHub yourself: the review \
-is posted, once accepted, by the platform."
+{postingLine job}"
 
 /-- The narrowing of a calibration job's kleis token: of GitHub, only the ref advertisement
     (`discover`) and `git-upload-pack` (`fetch`) — enough to clone and fetch the commit, and no
@@ -459,7 +473,13 @@ could not be read to tell ({e.message})" true
     match ← gh.postReview job.owner job.name job.prNumber (withMarker id review) (some head)
         (some event) with
     | .ok r => markPosted r note (some event)
-    | .error (.definite why) | .error (.rateLimited why) => failed s!"posting failed: {why}" false
+    | .error (.definite why) => failed s!"posting failed: {why}" false
+    | .error (.rateLimited why) =>
+      -- Nothing was posted, but a post is not to be made again before the limit resets, nor by
+      -- a person who reads "refused" as "try now": the claim stands, as for an unknown outcome,
+      -- and is settled — the marker looked for, then cleared — once its window has passed.
+      failed s!"GitHub's rate limit refused the post ({why}); it is checked and can be posted \
+again once the limit resets" true
     | .error e =>
       -- No answer, or a 5xx: the review may yet appear. The claim is kept either way, until it is
       -- found or a later attempt, past the claim's window, has looked and not found it.
@@ -654,7 +674,11 @@ and GitHub is not configured to read them"
     let req : Orchestra.QueueRequest :=
       { prompt := prompt job, goal := goal job, upstream := s!"{job.owner}/{job.name}"
       , issueNumber := job.prNumber, externalId := externalId job.id job.attempts
-      , kleisNarrow := narrowingFor job }
+      , kleisNarrow := narrowingFor job
+      -- TODO(orchestra): send `checkout := job.headSha` for a calibration job once orchestra's
+      -- `POST /api/v1/queue` takes `checkout` (its per-task "check out this commit"); until then
+      -- it refuses the field, and the task is checked out at the default branch.
+      , checkout := none }
     match ← orch.queue req with
     | .error e => recordError job.id .pending s!"queueing on orchestra: {e}"
     | .ok entry =>
@@ -776,7 +800,7 @@ def tick (s : Services) : IO Unit := do
     if n > 0 then s.log s!"dropped {n} kept diff(s)"
   let calibrate : IO Unit := do
     if let some gh := s.github then
-      Calibration.importStep gh s.log s.limits.importPullsPerPass
+      Calibration.importStep gh s.log s.limits.importPullsPerPass s.limits.githubReserve
     let n ← Calibration.scorePending
     if n > 0 then s.log s!"scored {n} calibration job(s)"
   for (what, step) in [("discovery", discover s), ("queueing", queuePending s),

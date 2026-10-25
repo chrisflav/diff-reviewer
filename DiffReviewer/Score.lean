@@ -28,6 +28,12 @@ person's that were found (*recall*), precision for each of the agent's categorie
 whether the agent's decision was the person's, the pairs, and what was left over on each side.
 Counts are kept beside every ratio, and aggregates (`Aggregate`) add counts up before dividing, so
 that a review with one comment weighs as one comment, not as a whole review.
+
+**Scope.** A sample whose comments are not the whole of what the person said — some were dropped,
+being on the old side or not on a line of the commit (`partial`) — or that is an approval or a
+request for changes saying nothing else (`decision`) is scored for its decision only: its comments
+are still paired, to be read, but it has no precision or recall of its own and adds nothing to an
+aggregate's; its decision counts.
 -/
 
 namespace DiffReviewer.Score
@@ -140,9 +146,15 @@ def decisionOfState : String → Option Decision
   | "COMMENTED"         => some .comment
   | _                   => none
 
+/-- What a sample is scored for: everything (`full`), or its decision only (`partial`,
+    `decision`). -/
+def commentsCount (scope : String) : Bool := scope == "full"
+
 /-- What the matcher says of one calibration job: its review against its sample's. -/
 structure Score where
   matcherVersion : Nat := Score.matcherVersion
+  /-- The sample's scope: `full`, `partial` or `decision`. -/
+  scope          : String := "full"
   agentComments  : Nat
   humanComments  : Nat
   matched        : Nat
@@ -159,7 +171,8 @@ structure Score where
 
 /-- Score `agent`, the agent's review, against a person's review in state `state` with inline
     comments `human`. -/
-def score (agent : Review) (state : String) (human : List HumanComment) : Score := Id.run do
+def score (agent : Review) (state : String) (human : List HumanComment) (scope := "full") :
+    Score := Id.run do
   let pairs := matchComments agent.comments human
   let matchedA := pairs.map (·.agent)
   let matchedH := pairs.map (·.human)
@@ -170,7 +183,7 @@ def score (agent : Review) (state : String) (human : List HumanComment) : Score 
     byCategory := bump byCategory c.category t
     bySeverity := bump bySeverity (c.severity.map (·.toString)) t
   let human? := decisionOfState state
-  return { agentComments := agent.comments.length, humanComments := human.length
+  return { scope, agentComments := agent.comments.length, humanComments := human.length
          , matched := pairs.length, byCategory, bySeverity, agentDecision := agent.decision
          , humanState := state, agree := human?.map (· == agent.decision)
          , pairs := pairs.filterMap fun p => do
@@ -190,11 +203,13 @@ private def agentJson (c : InlineComment) : Json :=
           ("severity", (c.severity.map (Json.str ·.toString)).getD .null)]
 
 def Score.toJson (s : Score) : Json :=
+  let counts := commentsCount s.scope
   .mkObj [
-    ("matcherVersion", s.matcherVersion),
+    ("matcherVersion", s.matcherVersion), ("scope", s.scope),
     ("agentComments", s.agentComments), ("humanComments", s.humanComments),
     ("matched", s.matched),
-    ("precision", ratio s.matched s.agentComments), ("recall", ratio s.matched s.humanComments),
+    ("precision", if counts then ratio s.matched s.agentComments else .null),
+    ("recall", if counts then ratio s.matched s.humanComments else .null),
     ("byCategory", talliesJson "category" s.byCategory),
     ("bySeverity", talliesJson "severity" s.bySeverity),
     ("decision", .mkObj [("agent", s.agentDecision.toJson), ("human", s.humanState),
@@ -210,6 +225,8 @@ def Score.toJson (s : Score) : Json :=
 /-- Scores added up: counts, from which every ratio is computed afresh. -/
 structure Aggregate where
   scored        : Nat := 0
+  /-- Of them, those whose comments count: of `full` samples. -/
+  commentsScored : Nat := 0
   agentComments : Nat := 0
   humanComments : Nat := 0
   matched       : Nat := 0
@@ -222,10 +239,14 @@ structure Aggregate where
   confusion     : List ((String × String) × Nat) := []
   deriving Inhabited
 
-/-- Add a stored score, `Score.toJson` as written, to `a`. A score that does not read is left out,
-    and so answers `none`. -/
+/-- Add a stored score, `Score.toJson` as written, to `a`: its decision, and its comments when its
+    scope says they count (a score written without a scope is `full`). A score that does not read
+    — one marked `unscorable` among them — is left out, and so answers `none`. -/
 def Aggregate.add (a : Aggregate) (j : Json) : Option Aggregate := do
-  let n (k : String) : Option Nat := (j.getObjValAs? Nat k).toOption
+  let counts := commentsCount ((j.getObjValAs? String "scope").toOption.getD "full")
+  let n (k : String) : Option Nat := do
+    let v ← (j.getObjValAs? Nat k).toOption
+    return if counts then v else 0
   let d := (j.getObjVal? "decision").toOption.getD .null
   let agree := (d.getObjValAs? Bool "agree").toOption
   let pair := ((d.getObjValAs? String "agent").toOption.getD "?",
@@ -233,11 +254,14 @@ def Aggregate.add (a : Aggregate) (j : Json) : Option Aggregate := do
   let confusion := if a.confusion.any (·.1 == pair) then
       a.confusion.map fun (p, c) => if p == pair then (p, c + 1) else (p, c)
     else a.confusion ++ [(pair, 1)]
-  let byCategory := (talliesOfJson "category" ((j.getObjVal? "byCategory").toOption.getD .null))
+  let tallies (k : String) := if counts then (j.getObjVal? k).toOption.getD .null else .null
+  let byCategory := (talliesOfJson "category" (tallies "byCategory"))
     |>.foldl (fun ts (k, t) => bump ts k t) a.byCategory
-  let bySeverity := (talliesOfJson "severity" ((j.getObjVal? "bySeverity").toOption.getD .null))
+  let bySeverity := (talliesOfJson "severity" (tallies "bySeverity"))
     |>.foldl (fun ts (k, t) => bump ts k t) a.bySeverity
-  return { scored := a.scored + 1, agentComments := a.agentComments + (← n "agentComments")
+  return { scored := a.scored + 1
+         , commentsScored := a.commentsScored + (if counts then 1 else 0)
+         , agentComments := a.agentComments + (← n "agentComments")
          , humanComments := a.humanComments + (← n "humanComments")
          , matched := a.matched + (← n "matched"), byCategory, bySeverity
          , decisions := a.decisions + (if agree.isSome then 1 else 0)
@@ -246,6 +270,7 @@ def Aggregate.add (a : Aggregate) (j : Json) : Option Aggregate := do
 def Aggregate.toJson (a : Aggregate) : Json :=
   .mkObj [
     ("matcherVersion", matcherVersion), ("scored", a.scored),
+    ("commentsScored", a.commentsScored),
     ("agentComments", a.agentComments), ("humanComments", a.humanComments),
     ("matched", a.matched),
     ("precision", ratio a.matched a.agentComments), ("recall", ratio a.matched a.humanComments),

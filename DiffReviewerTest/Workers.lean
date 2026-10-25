@@ -26,6 +26,8 @@ inductive PostOutcome where
   | lostAnswer
   /-- A `502`, and nothing posted. -/
   | failedUnposted
+  /-- A `403` for the rate limit, and nothing posted. -/
+  | rateLimited
   deriving BEq
 
 structure FakeGitHub where
@@ -82,6 +84,8 @@ def FakeGitHub.client (f : FakeGitHub) : GitHub.Client where
     match ← f.outcome.get with
     | .refused => return .error (.definite "GitHub answered 422: Unprocessable Entity")
     | .failedUnposted => return .error (.indefinite "GitHub answered 502")
+    | .rateLimited =>
+      return .error (.rateLimited "GitHub answered 403: API rate limit exceeded for user ID 1.")
     | .lostAnswer =>
       let _ ← record
       return .error (.indefinite "curl: (28) Operation timed out")

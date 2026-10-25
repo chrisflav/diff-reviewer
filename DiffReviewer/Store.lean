@@ -135,19 +135,21 @@ structure RevisionRow where
   created_at : String
   deriving Repr
 
-/-- One review a trusted reviewer wrote on a pull request, kept to score the agent's review of the
-    same commit against (`0004`). Never changed once written, except that deleting it sets
-    `deleted_at`: the row stays, so that importing again does not bring it back. -/
+/-- What one trusted reviewer said of one commit of a pull request — every review they submitted
+    of it, merged — kept to score the agent's review of the same commit against (`0004`). An import
+    that finds another review of the group adds it; deleting the sample sets `deleted_at`, and the
+    row stays, so that importing again neither brings it back nor adds to it. -/
 @[model (dbName := "calibration_sample") (primaryKey := ["id"]) reviewdb]
 structure SampleRow where
   id : String
   owner : String
   name : String
   pr_number : Int
-  /-- GitHub's id of the review: what makes importing idempotent. -/
-  review_id : Int
+  /-- GitHub's ids of the reviews merged into it, as a JSON array. -/
+  review_ids : String
   reviewer : String
-  /-- GitHub's `state` of the review, as it gave it: `APPROVED`, `CHANGES_REQUESTED`, … -/
+  /-- The strongest `state` of its reviews, as GitHub gave it: `CHANGES_REQUESTED`, then
+      `APPROVED`, then `COMMENTED`. -/
   state : String
   body : String
   /-- The commit the review was of, and the base the pull request's diff had there. -/
@@ -162,9 +164,40 @@ structure SampleRow where
   dropped_left : Int
   dropped_outdated : Int
   dropped_replies : Int
+  /-- What it is scored for: `full`; `partial`, when comments were dropped and its comments are
+      not the whole of what was said, so that only its decision counts; `decision`, an approval or
+      a request for changes that says nothing else. -/
+  scope : String
   submitted_at : Option String
   imported_at : String
+  updated_at : String
   deleted_at : Option String
+  deriving Repr
+
+/-- Every review an import has looked at and what became of it (`0004`): what makes importing
+    idempotent by GitHub's review id — a review in here is never looked at again, whether it
+    went into a sample or was dropped — so that importing again neither adds nor counts it. -/
+@[model (dbName := "calibration_review") (primaryKey := ["owner", "name", "review_id"]) reviewdb]
+structure ReviewSeenRow where
+  owner : String
+  name : String
+  review_id : Int
+  /-- `sample` (it went into `sample_id`), `empty`, `unreachable` or `deleted` (its group's
+      sample had been deleted). -/
+  outcome : String
+  sample_id : Option String
+  seen_at : String
+  deriving Repr
+
+/-- One calibration job's claim on its repository's daily cap (`0004`): one when a run makes it,
+    and one each time a person runs it again. -/
+@[model (dbName := "calibration_charge") (primaryKey := ["id"]) reviewdb]
+structure ChargeRow where
+  id : String
+  owner : String
+  name : String
+  job_id : String
+  charged_at : String
   deriving Repr
 
 /-- A request to import the samples of a repository's recent closed pull requests, and how far
@@ -176,12 +209,14 @@ structure ImportRow where
   name : String
   /-- How many recent closed pull requests to read. -/
   pull_limit : Int
-  /-- `queued`, `running`, `done` or `failed`. -/
+  /-- `queued`, `running`, `done`, `failed` or `cancelled`. -/
   status : String
   /-- The pull requests to read, as a JSON array, once they have been listed. -/
   pulls : Option String
   /-- How many of `pulls` have been read. -/
   next_index : Int
+  /-- How many times reading the next of them has failed; past 3 it is skipped. -/
+  failures : Int
   /-- What was found so far, as a JSON object of counts. -/
   stats : String
   error : Option String
@@ -217,8 +252,12 @@ structure ScoreRow where
   created_at : String
   deriving Repr
 
+/-- Calibration's jobs are found by their kind, among every review the platform has made. -/
+def jobKindIndex : TableIndex String :=
+  { name := "idx_review_job_kind", keys := [{ column := "kind" }] }
+
 def target : DatabaseRecipe :=
-  (%database reviewdb).recipe
+  (%database reviewdb).recipe.withIndexes "review_job" [jobKindIndex]
 
 /-- `0001_initial`: the repositories and the review jobs. -/
 def migration0001 : Db.Migration.Migration where
@@ -302,7 +341,8 @@ def migration0003 : Db.Migration.Migration where
         primaryKey := ["job_id", "version"] }]
 
 /-- `0004_m3`: calibration — a repository's trusted reviewers and the version of its settings, a
-    job's kind with its sample and run, and the samples, imports, runs and scores. The new columns
+    job's kind with its sample and run (and an index on the kind), and the samples, the reviews
+    imports have seen, imports, runs, charges on the daily cap and scores. The new columns
     are nullable: a repository written before has no trusted reviewers and is at version 1, and a
     job written before is a review. -/
 def migration0004 : Db.Migration.Migration where
@@ -319,7 +359,7 @@ def migration0004 : Db.Migration.Migration where
            ("owner", { type := .text, nullable := false }),
            ("name", { type := .text, nullable := false }),
            ("pr_number", { type := .int, nullable := false }),
-           ("review_id", { type := .int, nullable := false }),
+           ("review_ids", { type := .text, nullable := false }),
            ("reviewer", { type := .text, nullable := false }),
            ("state", { type := .text, nullable := false }),
            ("body", { type := .text, nullable := false }),
@@ -331,9 +371,28 @@ def migration0004 : Db.Migration.Migration where
            ("dropped_left", { type := .int, nullable := false }),
            ("dropped_outdated", { type := .int, nullable := false }),
            ("dropped_replies", { type := .int, nullable := false }),
+           ("scope", { type := .text, nullable := false }),
            ("submitted_at", { type := .text, nullable := true }),
            ("imported_at", { type := .text, nullable := false }),
+           ("updated_at", { type := .text, nullable := false }),
            ("deleted_at", { type := .text, nullable := true })],
+        primaryKey := ["id"] },
+    .createTable "calibration_review"
+      { columns := .ofList
+          [("owner", { type := .text, nullable := false }),
+           ("name", { type := .text, nullable := false }),
+           ("review_id", { type := .int, nullable := false }),
+           ("outcome", { type := .text, nullable := false }),
+           ("sample_id", { type := .text, nullable := true }),
+           ("seen_at", { type := .text, nullable := false })],
+        primaryKey := ["owner", "name", "review_id"] },
+    .createTable "calibration_charge"
+      { columns := .ofList
+          [("id", { type := .text, nullable := false }),
+           ("owner", { type := .text, nullable := false }),
+           ("name", { type := .text, nullable := false }),
+           ("job_id", { type := .text, nullable := false }),
+           ("charged_at", { type := .text, nullable := false })],
         primaryKey := ["id"] },
     .createTable "calibration_import"
       { columns := .ofList
@@ -344,6 +403,7 @@ def migration0004 : Db.Migration.Migration where
            ("status", { type := .text, nullable := false }),
            ("pulls", { type := .text, nullable := true }),
            ("next_index", { type := .int, nullable := false }),
+           ("failures", { type := .int, nullable := false }),
            ("stats", { type := .text, nullable := false }),
            ("error", { type := .text, nullable := true }),
            ("requested_at", { type := .text, nullable := false }),
@@ -368,7 +428,8 @@ def migration0004 : Db.Migration.Migration where
            ("rubric_version", { type := .int, nullable := true }),
            ("score", { type := .text, nullable := false }),
            ("created_at", { type := .text, nullable := false })],
-        primaryKey := ["job_id", "matcher_version"] }]
+        primaryKey := ["job_id", "matcher_version"] },
+    .createIndex "review_job" jobKindIndex]
 
 /-- The migrations, in the order they are applied. Appended to, never edited. -/
 def migrations : List Db.Migration.Migration :=

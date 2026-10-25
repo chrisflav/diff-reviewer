@@ -170,6 +170,24 @@ def reviewRequestBody (r : Review) (commitId : Option String) (event : Option De
     | none => fields
     | some e => fields ++ [("event", (Decision.toEvent e : Json))])
 
+/-- What GitHub last said of the token's rate limit: the requests left, and when the window
+    resets (epoch seconds). -/
+structure RateLimit where
+  remaining : Nat
+  resetAt   : Int
+  deriving Repr, BEq
+
+/-- The rate limit an answer's `X-RateLimit-Remaining` and `X-RateLimit-Reset` give, if both are
+    there. -/
+def RateLimit.ofResponse? (r : Http.Response) : Option RateLimit := do
+  let remaining ← (← r.header? "x-ratelimit-remaining").toNat?
+  let resetAt ← (← r.header? "x-ratelimit-reset").toNat?
+  return { remaining, resetAt := resetAt }
+
+/-- The rate limit the curl client last saw. One per process: the platform holds one GitHub
+    token, and every request with it draws on one budget. -/
+initialize lastRateLimit : IO.Ref (Option RateLimit) ← IO.mkRef none
+
 /-- What the platform does on GitHub. Every operation answers an error rather than throwing:
     GitHub being unreachable is a state a worker records and retries, not a crash. -/
 structure Client where
@@ -195,6 +213,8 @@ structure Client where
       `head`. -/
   mergeBase : (owner name base head : String) → IO (Except Error String) :=
     fun _ _ _ _ => return .error (.definite "comparing commits is not supported")
+  /-- What GitHub last said of the rate limit, if it has said anything. -/
+  rateLimit : IO (Option RateLimit) := pure none
 
 /-- The API's root, `https://api.github.com` unless `DIFF_REVIEWER_GITHUB_API` names another. -/
 def defaultApi : IO String := do
@@ -246,6 +266,7 @@ def Client.curl (token : String) (api : String) (maxDiffBytes : Nat := defaultMa
     | .error (.noAnswer _ 63) => return .error (.tooLarge maxDiffBytes)
     | .error (.noAnswer why _) => return .error (.indefinite why)
     | .ok r =>
+      if let some l := RateLimit.ofResponse? r then lastRateLimit.set (some l)
       if 200 ≤ r.status && r.status < 300 then return .ok r
       else if rateLimited r then return .error (.rateLimited (errorOf r))
       else if r.status < 500 then return .error (.definite (errorOf r))
@@ -295,7 +316,8 @@ def Client.curl (token : String) (api : String) (maxDiffBytes : Nat := defaultMa
     mergeBase := fun owner name base head => do
       return (← call "GET" s!"/repos/{owner}/{name}/compare/{base}...{head}?per_page=1").bind
         (parse fun j => do
-          return (← (← j.getObjVal? "merge_base_commit").getObjValAs? String "sha").toLower) }
+          return (← (← j.getObjVal? "merge_base_commit").getObjValAs? String "sha").toLower)
+    rateLimit := lastRateLimit.get }
 
 /-- The client configured by the environment: the token in `DIFF_REVIEWER_GITHUB_TOKEN_FILE`, or
     `none` when it is unset. -/
