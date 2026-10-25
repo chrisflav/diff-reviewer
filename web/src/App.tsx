@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useState, type FormEvent } from "react";
-import { BrowserRouter, NavLink, Route, Routes } from "react-router-dom";
+import { useCallback, useContext, useEffect, useRef, useState, type FormEvent } from "react";
+import { createBrowserRouter, NavLink, Outlet, RouterProvider } from "react-router-dom";
 import { api, ApiError, NetworkError, UnauthorizedError } from "./api";
 import { JobsPage } from "./pages/Jobs";
 import { JobPage } from "./pages/Job";
 import { ReposPage } from "./pages/Repos";
+import { UnsavedContext } from "./unsaved";
 
 type AuthState = "checking" | "unreachable" | "signedOut" | "signedIn";
 
@@ -25,8 +26,42 @@ export function App() {
     return <div className="center error">The server could not be reached. Reload to try again.</div>;
   if (auth === "signedOut") return <Login onSignedIn={() => setAuth("signedIn")} />;
 
+  return <SignedIn onUnauthorized={onUnauthorized} onSignedOut={() => setAuth("signedOut")} />;
+}
+
+function SignedIn({
+  onUnauthorized,
+  onSignedOut,
+}: {
+  onUnauthorized: () => void;
+  onSignedOut: () => void;
+}) {
+  const unsaved = useRef(false);
+  // A data router, made once: it is what lets a page with unsaved edits hold up a navigation.
+  const [router] = useState(() =>
+    createBrowserRouter([
+      {
+        element: <Layout onSignedOut={onSignedOut} />,
+        children: [
+          { path: "/", element: <JobsPage onUnauthorized={onUnauthorized} /> },
+          { path: "/jobs/:id", element: <JobPage onUnauthorized={onUnauthorized} /> },
+          { path: "/repos", element: <ReposPage onUnauthorized={onUnauthorized} /> },
+          { path: "*", element: <p className="mute">Nothing here.</p> },
+        ],
+      },
+    ]),
+  );
   return (
-    <BrowserRouter>
+    <UnsavedContext.Provider value={unsaved}>
+      <RouterProvider router={router} />
+    </UnsavedContext.Provider>
+  );
+}
+
+function Layout({ onSignedOut }: { onSignedOut: () => void }) {
+  const unsaved = useContext(UnsavedContext);
+  return (
+    <>
       <header className="bar">
         <span className="wordmark">diff-reviewer</span>
         <nav>
@@ -38,21 +73,24 @@ export function App() {
         <button
           className="ghost"
           onClick={() => {
-            void api.logout().finally(() => setAuth("signedOut"));
+            // The edits stay in this tab's storage, and the page offers them back on return.
+            if (
+              unsaved.current &&
+              !window.confirm(
+                "This review has unsaved edits. Sign out anyway? They are kept in this tab and offered back when you sign in again here.",
+              )
+            )
+              return;
+            void api.logout().finally(onSignedOut);
           }}
         >
           Sign out
         </button>
       </header>
       <main>
-        <Routes>
-          <Route path="/" element={<JobsPage onUnauthorized={onUnauthorized} />} />
-          <Route path="/jobs/:id" element={<JobPage onUnauthorized={onUnauthorized} />} />
-          <Route path="/repos" element={<ReposPage onUnauthorized={onUnauthorized} />} />
-          <Route path="*" element={<p className="mute">Nothing here.</p>} />
-        </Routes>
+        <Outlet />
       </main>
-    </BrowserRouter>
+    </>
   );
 }
 

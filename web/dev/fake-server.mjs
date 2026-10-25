@@ -7,11 +7,18 @@
  * It holds a few jobs in memory (a draft, a failed run, an approved review) and answers the
  * routes the pages call, with the versions, 409s and status moves the real server makes. Any
  * password signs in. Nothing is written to disk.
+ *
+ * Two switches, for trying what the page does when things go wrong:
+ *
+ *     curl -X POST 127.0.0.1:8091/__fake/expire          # the session ends: 401 until sign-in
+ *     curl -X POST '127.0.0.1:8091/__fake/delay?ms=3000' # writes answer after a pause
  */
 
 import { createServer } from "node:http";
 
 const port = Number(process.env.PORT ?? 8091);
+let signedIn = true;
+let delay = 0;
 const now = () => new Date().toISOString();
 
 const big = Array.from({ length: 450 }, (_, i) => `+export const n${i} = ${i};`).join("\n");
@@ -69,6 +76,7 @@ Binary files a/web/public/logo.png and b/web/public/logo.png differ
 `;
 
 const review = {
+  rubric: { name: "default", version: 2 },
   decision: "request_changes",
   body: "Two things before this goes in.\n\nThe new decision is not handled by `Decision.ofJson`.\n<b>This is not bold.</b>",
   comments: [
@@ -77,6 +85,9 @@ const review = {
       start_line: 9,
       end_line: 9,
       body: '`Decision.ofJson` does not read "dismiss" yet.',
+      // Fields a newer build writes, which this front-end must pass through untouched.
+      category: "correctness",
+      severity: "major",
     },
     {
       file: "DiffReviewer/Types.lean",
@@ -154,16 +165,37 @@ async function readJson(req) {
 
 createServer(async (req, res) => {
   const url = new URL(req.url ?? "/", "http://x");
-  const parts = url.pathname
-    .split("/")
-    .filter((p) => p !== "")
-    .map(decodeURIComponent);
+  let parts;
+  try {
+    parts = url.pathname
+      .split("/")
+      .filter((p) => p !== "")
+      .map(decodeURIComponent);
+  } catch {
+    return send(res, 400, { error: "malformed path" });
+  }
   const body = req.method === "GET" ? {} : await readJson(req).catch(() => null);
   if (body === null) return send(res, 400, { error: "not JSON" });
 
-  if (url.pathname === "/api/session") return send(res, 200, { authenticated: true });
-  if (url.pathname === "/api/login") return send(res, 200, { authenticated: true });
-  if (url.pathname === "/api/logout") return send(res, 200, { authenticated: false });
+  if (url.pathname === "/__fake/expire") {
+    signedIn = false;
+    return send(res, 200, {});
+  }
+  if (url.pathname === "/__fake/delay") {
+    delay = Number(url.searchParams.get("ms") ?? 0);
+    return send(res, 200, {});
+  }
+  if (url.pathname === "/api/session") return send(res, 200, { authenticated: signedIn });
+  if (url.pathname === "/api/login") {
+    signedIn = true;
+    return send(res, 200, { authenticated: true });
+  }
+  if (url.pathname === "/api/logout") {
+    signedIn = false;
+    return send(res, 200, { authenticated: false });
+  }
+  if (!signedIn) return send(res, 401, { error: "unauthorized" });
+  if (req.method !== "GET" && delay > 0) await new Promise((r) => setTimeout(r, delay));
   if (url.pathname === "/api/v1/repos")
     return send(res, 200, {
       items: [{ owner: "chrisflav", name: "diff-reviewer", mode: "staged", createdAt: now() }],

@@ -89,4 +89,14 @@ ${Array.from({ length: n }, (_, i) => `+line ${i}`).join("\n")}
     expect(html).not.toContain("line 7");
     expect(html).not.toMatch(/<details[^>]*open/);
   });
+
+  it("shows what it could not read, open, and sizes the number columns", () => {
+    const html = render(
+      diff.replace("@@ -1,2 +1,2 @@", "@@ -99999,2 +99999,2 @@") + "@@ -x @@\n",
+      [],
+      false,
+    );
+    expect(html).toContain("Unreadable hunk header: @@ -x @@");
+    expect(html).toContain("digits-6");
+  });
 });

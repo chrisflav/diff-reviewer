@@ -7,47 +7,239 @@
 import type { Decision, InlineComment, Review } from "./api";
 import { displayPath, type DiffFile } from "./diff";
 
+/**
+ * The key a comment is known by while the page edits it. A symbol, so that it can never clash
+ * with a field of the review, and `JSON.stringify` leaves it out on its own.
+ */
+export const KEY: unique symbol = Symbol("comment key");
+
 /** A comment with a key that stays put while comments around it are added and deleted. */
 export interface LocalComment extends InlineComment {
-  key: number;
+  [KEY]: number;
 }
 
 export interface LocalReview {
   decision: Decision;
   body: string;
   comments: LocalComment[];
+  [field: string]: unknown;
 }
 
-export function toLocal(r: Review): LocalReview {
-  return {
-    decision: r.decision,
-    body: r.body,
-    comments: r.comments.map((c, i) => ({ ...c, key: i })),
-  };
+/** Key `r`'s comments: by `keys` where given (a stored edit), else by position. */
+export function toLocal(r: Review, keys?: number[]): LocalReview {
+  return { ...r, comments: r.comments.map((c, i) => ({ ...c, [KEY]: keys?.[i] ?? i })) };
 }
 
-/** The review as the API takes it: the keys dropped, and no `suggestion` key when there is none. */
+/** The review as the API takes it: every field it came with, the keys dropped. */
 export function toReview(r: LocalReview): Review {
-  return {
-    decision: r.decision,
-    body: r.body,
-    comments: r.comments.map((c) => withoutKey(c)),
-  };
+  return { ...r, comments: r.comments.map(withoutKey) };
 }
 
 function withoutKey(c: LocalComment): InlineComment {
-  const out: InlineComment = {
-    file: c.file,
-    start_line: c.start_line,
-    end_line: c.end_line,
-    body: c.body,
-  };
-  if (c.suggestion !== undefined) out.suggestion = c.suggestion;
+  const out: Partial<LocalComment> & InlineComment = { ...c };
+  delete out[KEY];
   return out;
 }
 
 export function nextKey(r: LocalReview): number {
-  return r.comments.reduce((k, c) => Math.max(k, c.key + 1), 0);
+  return r.comments.reduce((k, c) => Math.max(k, c[KEY] + 1), 0);
+}
+
+/**
+ * `old` with the fields a form edits replaced by `edited`'s, and the rest kept. A suggestion
+ * turned off is removed, not left behind.
+ */
+export function mergeComment(old: LocalComment, edited: InlineComment): LocalComment {
+  const out: LocalComment = {
+    ...old,
+    file: edited.file,
+    start_line: edited.start_line,
+    end_line: edited.end_line,
+    body: edited.body,
+  };
+  if (edited.suggestion === undefined) delete out.suggestion;
+  else out.suggestion = edited.suggestion;
+  return out;
+}
+
+/** Equality of JSON values; symbol keys (the comment keys) do not count. */
+export function same(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) return false;
+  if (Array.isArray(a) !== Array.isArray(b)) return false;
+  if (Array.isArray(a) && Array.isArray(b))
+    return a.length === b.length && a.every((x, i) => same(x, b[i]));
+  const ra = a as Record<string, unknown>;
+  const rb = b as Record<string, unknown>;
+  const ka = Object.keys(ra).filter((k) => ra[k] !== undefined);
+  const kb = Object.keys(rb).filter((k) => rb[k] !== undefined);
+  return ka.length === kb.length && ka.every((k) => same(ra[k], rb[k]));
+}
+
+/** Whether two reviews say the same, keys aside. */
+export function sameReview(a: LocalReview, b: LocalReview): boolean {
+  return same(toReview(a), toReview(b));
+}
+
+/**
+ * Key `other`'s comments by the comments of `known` they are: first those that are the same, then
+ * those at the same place (an edited comment keeps its place). With `positional`, the comments
+ * left over then pair up in order, as an edit of the same list does; without it, they are new.
+ * The review has no comment ids, so this is the best a page can do, and what it gets wrong
+ * shows up as a conflict, not as a lost edit.
+ */
+export function align(
+  known: LocalComment[],
+  other: InlineComment[],
+  positional: boolean,
+  fresh: () => number,
+): LocalComment[] {
+  const keys: (number | undefined)[] = other.map(() => undefined);
+  const used = new Set<number>();
+  const pass = (fits: (k: LocalComment, o: InlineComment) => boolean) => {
+    other.forEach((o, i) => {
+      if (keys[i] !== undefined) return;
+      const k = known.find((c) => !used.has(c[KEY]) && fits(c, o));
+      if (k === undefined) return;
+      keys[i] = k[KEY];
+      used.add(k[KEY]);
+    });
+  };
+  pass((k, o) => same(withoutKey(k), o));
+  pass((k, o) => k.file === o.file && k.start_line === o.start_line && k.end_line === o.end_line);
+  // The first comment not yet taken, in order.
+  if (positional) pass(() => true);
+  return other.map((o, i) => ({ ...o, [KEY]: keys[i] ?? fresh() }));
+}
+
+/** A counter past every key in `rs`, for comments that are new to all of them. */
+export function freshKeys(...rs: LocalReview[]): () => number {
+  let next = Math.max(0, ...rs.map(nextKey));
+  return () => next++;
+}
+
+/**
+ * The review `text` (JSON someone edited) says, keyed against `current` so that edits stay edits
+ * of the same comments; new comments get keys `base` has not used either.
+ */
+export function fromJson(
+  text: string,
+  current: LocalReview,
+  base: LocalReview,
+): LocalReview | string {
+  const r = parseReview(text);
+  if (typeof r === "string") return r;
+  return { ...r, comments: align(current.comments, r.comments, true, freshKeys(current, base)) };
+}
+
+/** Where this person and another writer changed the same thing differently. */
+export type Conflict =
+  | { kind: "field"; name: string; mine: unknown; theirs: unknown }
+  | { kind: "comment"; key: number; mine: LocalComment | null; theirs: LocalComment | null };
+
+export function conflictId(c: Conflict): string {
+  return c.kind === "field" ? `field:${c.name}` : `comment:${c.key}`;
+}
+
+export interface Rebased {
+  /** `theirs` with this person's changes made to it; where both changed a thing, theirs. */
+  review: LocalReview;
+  /** `theirs`, keyed like the edits: what the edits are now changes to. */
+  base: LocalReview;
+  conflicts: Conflict[];
+}
+
+/**
+ * Move this person's edits (`mine`, made to `base`) onto a newer version (`theirs`): what only
+ * one side changed takes that side's change, what both changed alike is that, and what both
+ * changed differently is a conflict, left at their version until the person picks one. Nothing
+ * the other writer did is undone without the person choosing so.
+ */
+export function rebase(base: LocalReview, mine: LocalReview, theirsReview: Review): Rebased {
+  const theirs: LocalReview = {
+    ...theirsReview,
+    comments: align(base.comments, theirsReview.comments, false, freshKeys(base, mine)),
+  };
+  const conflicts: Conflict[] = [];
+  const review: LocalReview = { ...theirs, comments: [] };
+
+  const names = new Set([...Object.keys(base), ...Object.keys(mine), ...Object.keys(theirs)]);
+  names.delete("comments");
+  for (const name of names) {
+    const [b, m, t] = [base[name], mine[name], theirs[name]];
+    let v = t;
+    if (same(t, b)) v = m;
+    else if (!same(m, b) && !same(m, t))
+      conflicts.push({ kind: "field", name, mine: m, theirs: t });
+    if (v === undefined) delete review[name];
+    else review[name] = v;
+  }
+
+  const byKey = (cs: LocalComment[]) => new Map(cs.map((c) => [c[KEY], c]));
+  const [b, m, t] = [byKey(base.comments), byKey(mine.comments), byKey(theirs.comments)];
+  const comment = (
+    key: number,
+    bc: LocalComment,
+    mc: LocalComment | null,
+    tc: LocalComment | null,
+  ) => {
+    if (mc !== null && same(mc, bc)) return tc;
+    if (tc !== null && same(tc, bc)) return mc;
+    if (mc === null && tc === null) return null;
+    if (mc !== null && tc !== null && same(mc, tc)) return tc;
+    conflicts.push({ kind: "comment", key, mine: mc, theirs: tc });
+    return tc;
+  };
+  for (const tc of theirs.comments) {
+    const bc = b.get(tc[KEY]);
+    const out = bc === undefined ? tc : comment(tc[KEY], bc, m.get(tc[KEY]) ?? null, tc);
+    if (out !== null) review.comments.push(out);
+  }
+  for (const bc of base.comments) {
+    if (t.has(bc[KEY])) continue;
+    const out = comment(bc[KEY], bc, m.get(bc[KEY]) ?? null, null);
+    if (out !== null) review.comments.push(out);
+  }
+  for (const mc of mine.comments) if (!b.has(mc[KEY])) review.comments.push(mc);
+  return { review, base: theirs, conflicts };
+}
+
+/** `r` with a conflict settled one way. Picking again settles it the other way. */
+export function resolve(r: LocalReview, c: Conflict, pick: "mine" | "theirs"): LocalReview {
+  if (c.kind === "field") {
+    const out: LocalReview = { ...r };
+    const v = pick === "mine" ? c.mine : c.theirs;
+    if (v === undefined) delete out[c.name];
+    else out[c.name] = v;
+    return out;
+  }
+  const v = pick === "mine" ? c.mine : c.theirs;
+  const rest = r.comments.filter((x) => x[KEY] !== c.key);
+  if (v === null) return { ...r, comments: rest };
+  const at = r.comments.findIndex((x) => x[KEY] === c.key);
+  const comments = [...rest];
+  comments.splice(at < 0 ? comments.length : at, 0, v);
+  return { ...r, comments };
+}
+
+/** A local review as JSON can hold it: the keys beside the review, not in it. */
+export interface Frozen {
+  review: Review;
+  keys: number[];
+}
+
+export function freeze(r: LocalReview): Frozen {
+  return { review: toReview(r), keys: r.comments.map((c) => c[KEY]) };
+}
+
+export function thaw(f: unknown): LocalReview | null {
+  if (typeof f !== "object" || f === null) return null;
+  const { review, keys } = f as { review?: unknown; keys?: unknown };
+  const r = parseReview(JSON.stringify(review ?? null), false);
+  if (typeof r === "string" || !Array.isArray(keys) || keys.length !== r.comments.length)
+    return null;
+  if (!keys.every((k) => Number.isInteger(k))) return null;
+  return toLocal(r, keys as number[]);
 }
 
 /** Why the server would refuse `c`, or `null`; mirrors `Review.validate` in Lean. */
@@ -70,8 +262,11 @@ export function reviewProblem(r: Review): string | null {
 
 const decisions: readonly string[] = ["comment", "approve", "request_changes"];
 
-/** Read a review someone typed as JSON; answers why it is not one, as a string, if it is not. */
-export function parseReview(text: string): Review | string {
+/**
+ * Read a review someone typed as JSON; answers why it is not one, as a string, if it is not.
+ * Fields it does not know are kept. `validate` checks it as the server will.
+ */
+export function parseReview(text: string, validate = true): Review | string {
   let j: unknown;
   try {
     j = JSON.parse(text);
@@ -94,16 +289,18 @@ export function parseReview(text: string): Review | string {
     if (c.suggestion !== undefined && c.suggestion !== null && typeof c.suggestion !== "string")
       return `${at}: "suggestion" must be a string.`;
     const out: InlineComment = {
+      ...c,
       file: c.file,
       start_line: c.start_line,
       end_line: c.end_line,
       body: c.body,
     };
-    if (typeof c.suggestion === "string") out.suggestion = c.suggestion;
+    // `null` is how some writers say "none"; the server reads it so too.
+    if (typeof c.suggestion !== "string") delete out.suggestion;
     comments.push(out);
   }
-  const review: Review = { decision: j.decision as Decision, body: j.body, comments };
-  return reviewProblem(review) ?? review;
+  const review: Review = { ...j, decision: j.decision as Decision, body: j.body, comments };
+  return (validate ? reviewProblem(review) : null) ?? review;
 }
 
 function isObject(v: unknown): v is Record<string, unknown> {
@@ -145,7 +342,7 @@ export function placeComments(files: DiffFile[], comments: LocalComment[]): Plac
       p.outside.push(c);
       continue;
     }
-    if (lines.get(c.start_line) !== endHunk) p.split.add(c.key);
+    if (lines.get(c.start_line) !== endHunk) p.split.add(c[KEY]);
     let byLine = p.anchored.get(c.file);
     if (byLine === undefined) p.anchored.set(c.file, (byLine = new Map()));
     const at = byLine.get(c.end_line);

@@ -1,6 +1,35 @@
-import { useId, useState, type FormEvent } from "react";
+import {
+  createContext,
+  useContext,
+  useEffect,
+  useId,
+  useRef,
+  useState,
+  type FormEvent,
+} from "react";
 import type { InlineComment } from "../api";
-import { commentProblem, rangeLabel, type LocalComment } from "../review";
+import { commentProblem, KEY, rangeLabel, type LocalComment } from "../review";
+
+/**
+ * Where an open comment form says whether it holds text not yet in the review: typed text is
+ * an unsaved edit too, and the page counts it as one.
+ */
+export const FormsContext = createContext<(id: string, dirty: boolean) => void>(() => {});
+
+/**
+ * Where focus goes when `el`, a comment, leaves: the comment next to it, else the line it was
+ * on, else the heading of its section. Never the page's body.
+ */
+function focusAfterLeaving(el: HTMLElement | null): HTMLElement | null {
+  if (el === null) return null;
+  for (const sib of [el.nextElementSibling, el.previousElementSibling])
+    if (sib instanceof HTMLElement && sib.matches(".comment"))
+      return sib.querySelector<HTMLElement>("button") ?? sib;
+  const line = el
+    .closest("tr.anchor")
+    ?.previousElementSibling?.querySelector<HTMLElement>("button.lnum");
+  return line ?? document.getElementById("outside-h") ?? document.getElementById("diff-h");
+}
 
 /** What a comment card may do to the review; stable across renders so files need not redraw. */
 export interface CommentActions {
@@ -33,6 +62,20 @@ export function CommentCard({
   suggestionSeed?: (file: string, start: number, end: number) => string | null;
 }) {
   const [editing, setEditing] = useState(false);
+  const card = useRef<HTMLElement>(null);
+  const edit = useRef<HTMLButtonElement>(null);
+  // Set when the form closes, so that focus returns to the Edit button it was opened from.
+  const refocus = useRef(false);
+  useEffect(() => {
+    if (editing || !refocus.current) return;
+    refocus.current = false;
+    edit.current?.focus();
+  }, [editing]);
+
+  const close = () => {
+    refocus.current = true;
+    setEditing(false);
+  };
 
   if (editing)
     return (
@@ -42,17 +85,21 @@ export function CommentCard({
           showFile={showFile}
           submitLabel="Apply"
           onSubmit={(c) => {
-            actions.update(comment.key, c);
-            setEditing(false);
+            actions.update(comment[KEY], c);
+            close();
           }}
-          onCancel={() => setEditing(false)}
+          onCancel={close}
           {...(suggestionSeed === undefined ? {} : { suggestionSeed })}
         />
       </div>
     );
 
   return (
-    <article className="comment" aria-label={`Comment on ${comment.file} ${rangeLabel(comment)}`}>
+    <article
+      ref={card}
+      className="comment"
+      aria-label={`Comment on ${comment.file} ${rangeLabel(comment)}`}
+    >
       <header>
         <span className="where data">
           {showFile && `${comment.file}, `}
@@ -60,13 +107,22 @@ export function CommentCard({
         </span>
         {editable && (
           <span className="tools">
-            <button type="button" className="ghost small" onClick={() => setEditing(true)}>
+            <button
+              ref={edit}
+              type="button"
+              className="ghost small"
+              onClick={() => setEditing(true)}
+            >
               Edit
             </button>
             <button
               type="button"
               className="ghost small danger"
-              onClick={() => actions.remove(comment.key)}
+              onClick={() => {
+                const next = focusAfterLeaving(card.current);
+                actions.remove(comment[KEY]);
+                requestAnimationFrame(() => next?.focus());
+              }}
               aria-label={`Delete the comment on ${comment.file} ${rangeLabel(comment)}`}
             >
               Delete
@@ -118,6 +174,17 @@ export function CommentForm({
   const [suggesting, setSuggesting] = useState(initial.suggestion !== undefined);
   const [suggestion, setSuggestion] = useState(initial.suggestion ?? "");
   const [problem, setProblem] = useState<string | null>(null);
+
+  const report = useContext(FormsContext);
+  const dirty =
+    file.trim() !== initial.file ||
+    start !== String(initial.start_line) ||
+    end !== String(initial.end_line) ||
+    body !== initial.body ||
+    suggesting !== (initial.suggestion !== undefined) ||
+    (suggesting && suggestion !== (initial.suggestion ?? ""));
+  useEffect(() => report(id, dirty), [report, id, dirty]);
+  useEffect(() => () => report(id, false), [report, id]);
 
   // The form's range follows a shift-click in the diff while it is open.
   const [seen, setSeen] = useState([initial.start_line, initial.end_line]);

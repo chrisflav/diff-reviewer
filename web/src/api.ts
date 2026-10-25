@@ -45,18 +45,25 @@ export interface Repo {
   createdAt: string;
 }
 
+/**
+ * Fields this build does not know (a newer one's `category`, `severity`, …) are kept on every
+ * round trip through the page, hence the index signatures: an edit changes what it edits and
+ * passes the rest through.
+ */
 export interface InlineComment {
   file: string;
   start_line: number;
   end_line: number;
   body: string;
   suggestion?: string;
+  [field: string]: unknown;
 }
 
 export interface Review {
   decision: Decision;
   body: string;
   comments: InlineComment[];
+  [field: string]: unknown;
 }
 
 export interface Job {

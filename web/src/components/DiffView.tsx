@@ -8,7 +8,7 @@ import {
   type ReactNode,
 } from "react";
 import { displayPath, lineCount, type DiffFile, type DiffLine } from "../diff";
-import { commentsIn, type LocalComment, type Placement } from "../review";
+import { commentsIn, KEY, type LocalComment, type Placement } from "../review";
 import { CommentCard, CommentForm, type CommentActions } from "./Comments";
 
 /** Lines over which a file starts folded, so that a large diff opens on its outline. */
@@ -44,19 +44,24 @@ export function DiffView({
   suggestionSeed: (file: string, start: number, end: number) => string | null;
 }) {
   const total = files.reduce((n, f) => n + lineCount(f), 0);
-  const [open, setOpen] = useState<Map<number, boolean>>(() => new Map());
+  // By file, not by position, so that a fold stays with its file when the diff is reloaded.
+  const [open, setOpen] = useState<Map<string, boolean>>(() => new Map());
   const [wrap, setWrap] = useState(true);
 
-  const isOpen = (f: DiffFile, i: number): boolean => {
-    const set = open.get(i);
+  const isOpen = (f: DiffFile): boolean => {
+    const set = open.get(fileId(f));
     if (set !== undefined) return set;
+    if (f.problems.length > 0) return true;
     if (f.binary || f.hunks.length === 0) return false;
     if (lineCount(f) > FOLD_LINES) return false;
     return total <= FOLD_TOTAL || commentsIn(placement, f) > 0;
   };
 
-  const setAll = (to: boolean) => setOpen(new Map(files.map((_, i) => [i, to])));
-  const toggle = useCallback((i: number, to: boolean) => setOpen((m) => new Map(m).set(i, to)), []);
+  const setAll = (to: boolean) => setOpen(new Map(files.map((f) => [fileId(f), to])));
+  const toggle = useCallback(
+    (id: string, to: boolean) => setOpen((m) => new Map(m).set(id, to)),
+    [],
+  );
 
   if (files.length === 0) return <p className="mute">The diff is empty.</p>;
 
@@ -84,15 +89,15 @@ export function DiffView({
           picks one.
         </p>
       )}
-      {files.map((f, i) => {
+      {files.map((f) => {
         const path = displayPath(f);
         const sel = selection !== null && selection.file === f.newPath ? selection : null;
         return (
           <FileView
-            key={i}
-            index={i}
+            key={fileId(f)}
+            id={fileId(f)}
             file={f}
-            open={isOpen(f, i)}
+            open={isOpen(f)}
             onToggle={toggle}
             wrap={wrap}
             byLine={f.newPath === null ? undefined : placement.anchored.get(path)}
@@ -120,11 +125,16 @@ const changeLabel = {
   copied: "copied",
 } as const;
 
+/** A file's identity in the view: both paths, since a diff may delete one and add another. */
+function fileId(f: DiffFile): string {
+  return `${f.oldPath ?? ""}\u0000${f.newPath ?? ""}`;
+}
+
 interface FileProps {
-  index: number;
+  id: string;
   file: DiffFile;
   open: boolean;
-  onToggle: (index: number, open: boolean) => void;
+  onToggle: (id: string, open: boolean) => void;
   wrap: boolean;
   byLine: Map<number, LocalComment[]> | undefined;
   covered: Set<number> | undefined;
@@ -140,7 +150,7 @@ interface FileProps {
 
 // Memoised: a keystroke or a pick in one file must not redraw every other file of a long diff.
 const FileView = memo(function FileView(props: FileProps) {
-  const { index, file, open, onToggle, wrap, commentCount } = props;
+  const { id, file, open, onToggle, wrap, commentCount } = props;
   const path = displayPath(file);
   const adds = file.hunks.reduce((n, h) => n + h.lines.filter((l) => l.kind === "add").length, 0);
   const dels = file.hunks.reduce((n, h) => n + h.lines.filter((l) => l.kind === "del").length, 0);
@@ -155,7 +165,7 @@ const FileView = memo(function FileView(props: FileProps) {
       open={open}
       onToggle={(e) => {
         // `toggle` also fires when React sets `open`; only a change is news.
-        if (e.currentTarget.open !== open) onToggle(index, e.currentTarget.open);
+        if (e.currentTarget.open !== open) onToggle(id, e.currentTarget.open);
       }}
     >
       <summary>
@@ -170,7 +180,15 @@ const FileView = memo(function FileView(props: FileProps) {
             {commentCount} {commentCount === 1 ? "comment" : "comments"}
           </span>
         )}
+        {file.problems.length > 0 && <span className="tag warn">not fully read</span>}
       </summary>
+      {open && file.problems.length > 0 && (
+        <ul className="file-note warn" role="alert">
+          {file.problems.map((p, i) => (
+            <li key={i}>{p}</li>
+          ))}
+        </ul>
+      )}
       {open &&
         (file.binary ? (
           <p className="mute file-note">Binary file; not shown.</p>
@@ -267,11 +285,11 @@ function FileTable({
             <td colSpan={3}>
               {here.map((c) => (
                 <CommentCard
-                  key={c.key}
+                  key={c[KEY]}
                   comment={c}
                   editable={editable}
                   actions={actions}
-                  split={split.has(c.key)}
+                  split={split.has(c[KEY])}
                   suggestionSeed={suggestionSeed}
                 />
               ))}
@@ -312,7 +330,7 @@ function FileTable({
   });
 
   return (
-    <table className="lines">
+    <table className={`lines digits-${digits(file)}`}>
       <colgroup>
         <col className="num" />
         <col className="num" />
@@ -323,6 +341,13 @@ function FileTable({
       </tbody>
     </table>
   );
+}
+
+/** How wide the line numbers of `f` are, for the width of their columns (a class: no inline styles). */
+function digits(f: DiffFile): number {
+  let max = 1;
+  for (const h of f.hunks) max = Math.max(max, h.oldStart + h.oldCount, h.newStart + h.newCount);
+  return Math.min(7, Math.max(3, String(max).length));
 }
 
 const sign = { context: " ", add: "+", del: "-" } as const;

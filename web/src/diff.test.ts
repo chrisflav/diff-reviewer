@@ -159,6 +159,46 @@ diff --git "a/caf\\303\\251.txt" "b/caf\\303\\251.txt"
   });
 });
 
+describe("parseDiff, odd text", () => {
+  const one = (header: string) => `diff --git a/f b/f
+--- a/f
++++ b/f
+${header}
+-a
++b
+`;
+
+  it("reads a hunk whose function context holds line separators or a lone CR", () => {
+    for (const ctx of ["\u2028", "\u2029", "x\ry"]) {
+      const f = parseDiff(one(`@@ -1 +1 @@ function f() {${ctx}`))[0];
+      expect(f?.problems).toEqual([]);
+      expect(f?.hunks[0]?.lines.map((l) => l.kind)).toEqual(["del", "add"]);
+    }
+  });
+
+  it("strips the CR of a CRLF diff, and keeps a CR inside a line of an LF one", () => {
+    const crlf = parseDiff(one("@@ -1 +1 @@").replace(/\n/g, "\r\n"))[0];
+    expect(crlf?.newPath).toBe("f");
+    expect(crlf?.hunks[0]?.lines.map((l) => l.text)).toEqual(["a", "b"]);
+    const lf = parseDiff(one("@@ -1 +1 @@").replace("+b", "+b\r"))[0];
+    expect(lf?.hunks[0]?.lines.map((l) => l.text)).toEqual(["a", "b\r"]);
+  });
+
+  it("says so when a hunk header cannot be read, instead of dropping the hunk", () => {
+    const f = parseDiff(one("@@ -1,x +1 @@"))[0];
+    expect(f?.problems).toEqual(["Unreadable hunk header: @@ -1,x +1 @@"]);
+    expect(f?.meta).not.toContain("@@ -1,x +1 @@");
+    const orphan = parseDiff("@@ -1 +1 @@\n-a\n+b\n")[0];
+    expect(orphan?.problems).toHaveLength(1);
+  });
+
+  it("says so when a hunk holds fewer lines than its header promises", () => {
+    const f = parseDiff(one("@@ -1,3 +1,3 @@"))[0];
+    expect(f?.problems).toHaveLength(1);
+    expect(f?.hunks[0]?.lines).toHaveLength(2);
+  });
+});
+
 describe("unquote", () => {
   it("decodes C escapes as UTF-8 bytes and leaves plain strings alone", () => {
     expect(unquote('"a\\tb\\"c\\\\"')).toBe('a\tb"c\\');

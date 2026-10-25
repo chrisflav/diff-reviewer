@@ -41,6 +41,8 @@ export interface DiffFile {
   hunks: Hunk[];
   /** Extended header lines (`index …`, `new file mode …`, `similarity index …`), as written. */
   meta: string[];
+  /** What could not be read, shown with the file: a diff never loses lines without saying so. */
+  problems: string[];
 }
 
 /** The path a file is known by in the view: its new path, or its old one once deleted. */
@@ -53,11 +55,17 @@ export function lineCount(f: DiffFile): number {
   return f.hunks.reduce((n, h) => n + h.lines.length, 0);
 }
 
-const hunkHeader = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$/;
+// `s`: the function context after the second `@@` is source text, and may hold U+2028, U+2029
+// or a lone CR, which `.` would not match without it.
+const hunkHeader = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$/s;
 
 export function parseDiff(text: string): DiffFile[] {
   const lines = text.split("\n");
   if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+  // A diff saved with CRLF line ends: one CR per line belongs to the line end, not the text.
+  // Only when every line has one, since a CR inside a line of an LF diff is content.
+  if (lines.length > 0 && lines.every((l) => l.endsWith("\r")))
+    for (let k = 0; k < lines.length; k++) lines[k] = (lines[k] ?? "").slice(0, -1);
   const files: DiffFile[] = [];
   let file: DiffFile | null = null;
   let i = 0;
@@ -70,6 +78,7 @@ export function parseDiff(text: string): DiffFile[] {
       binary: false,
       hunks: [],
       meta: [],
+      problems: [],
     };
     files.push(f);
     return f;
@@ -102,6 +111,15 @@ export function parseDiff(text: string): DiffFile[] {
     }
 
     const m = hunkHeader.exec(line);
+    if (line.startsWith("@@ -") && (m === null || file === null)) {
+      // Never metadata: an unreadable hunk header is a hunk the view would otherwise drop.
+      if (file === null) file = startFile();
+      file.problems.push(
+        m === null ? `Unreadable hunk header: ${line}` : `A hunk before any file header: ${line}`,
+      );
+      i++;
+      continue;
+    }
     if (m !== null && file !== null) {
       const hunk: Hunk = {
         header: line,
@@ -112,7 +130,10 @@ export function parseDiff(text: string): DiffFile[] {
         lines: [],
       };
       file.hunks.push(hunk);
-      i = readHunk(lines, i + 1, hunk);
+      const [next, left] = readHunk(lines, i + 1, hunk);
+      if (left > 0)
+        file.problems.push(`The hunk ${line} ends ${left} lines before its header says it does.`);
+      i = next;
       continue;
     }
 
@@ -149,8 +170,11 @@ function sawMarkers(f: DiffFile): boolean {
   return f.meta.some((l) => l.startsWith("--- "));
 }
 
-/** Read a hunk's lines from `start`, by its counts; answers the index after the hunk. */
-function readHunk(lines: string[], start: number, hunk: Hunk): number {
+/**
+ * Read a hunk's lines from `start`, by its counts; answers the index after the hunk and how many
+ * lines the counts promised that the text did not hold.
+ */
+function readHunk(lines: string[], start: number, hunk: Hunk): [number, number] {
   let oldLeft = hunk.oldCount;
   let newLeft = hunk.newCount;
   let oldLine = hunk.oldStart;
@@ -199,7 +223,7 @@ function readHunk(lines: string[], start: number, hunk: Hunk): number {
     markNoNewline(hunk);
     i++;
   }
-  return i;
+  return [i, Math.max(oldLeft, newLeft)];
 }
 
 function markNoNewline(hunk: Hunk) {
