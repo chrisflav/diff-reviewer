@@ -67,22 +67,29 @@ export function CommentList({
         </fieldset>
         <label>
           Category{" "}
+          {/* Options by position, not by name: any name is a category's, none stands for another. */}
           <select
-            value={filter.category === null ? "\u0000none" : filter.category}
-            onChange={(e) =>
-              setFilter((f) => ({
-                ...f,
-                category: e.target.value === "\u0000none" ? null : e.target.value,
-              }))
+            value={
+              filter.category === null
+                ? "none"
+                : filter.category === ""
+                  ? "all"
+                  : String(categories.indexOf(filter.category))
             }
+            onChange={(e) => {
+              const v = e.target.value;
+              const category =
+                v === "none" ? null : v === "all" ? "" : (categories[Number(v)] ?? "");
+              setFilter((f) => ({ ...f, category }));
+            }}
           >
-            <option value="">all</option>
-            {categories.map((c) => (
-              <option key={c} value={c}>
+            <option value="all">all</option>
+            {categories.map((c, i) => (
+              <option key={c} value={String(i)}>
                 {c}
               </option>
             ))}
-            {uncategorised && <option value={"\u0000none"}>(no category)</option>}
+            {uncategorised && <option value="none">(no category)</option>}
           </select>
         </label>
         <label>

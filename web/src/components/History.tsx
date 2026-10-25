@@ -340,7 +340,8 @@ function RevisionDiff({
   onClose: () => void;
 }) {
   const heading = useRef<HTMLHeadingElement>(null);
-  useEffect(() => heading.current?.focus(), [from, to]);
+  // On the pair compared, not on the revision objects: a reload of the history makes new ones.
+  useEffect(() => heading.current?.focus(), [from.version, to.version]);
   const a = readRevision(from);
   const b = readRevision(to);
   return (

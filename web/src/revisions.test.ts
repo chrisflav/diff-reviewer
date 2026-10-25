@@ -88,6 +88,15 @@ describe("diffReviews", () => {
     expect(diffReviews(two, other).added).toHaveLength(2);
   });
 
+  it("pairs a comment stored without an id with the one that got an id on the next write", () => {
+    const a = { ...draft, comments: [c(undefined, 1, "One."), c(undefined, 5, "Five.")] };
+    const b = { ...draft, comments: [c("i1", 1, "One."), c("i2", 5, "Five, edited.")] };
+    const d = diffReviews(a, b);
+    expect([d.added.length, d.removed.length, d.changed.length, d.unchanged]).toEqual([0, 0, 1, 1]);
+    expect(d.changed[0]!.fields).toEqual(["body"]);
+    expect(d.guessed).toBe(2);
+  });
+
   it("names other fields that changed, and finds nothing between equal reviews", () => {
     const d = diffReviews(draft, { ...draft, event: "COMMENT" });
     expect(d.other).toEqual(["event"]);

@@ -437,6 +437,8 @@ createServer(async (req, res) => {
     const vs = rubrics.get("chrisflav/diff-reviewer");
     const last = structuredClone(vs[vs.length - 1].doc);
     last.defaultRubric += "\nSomeone else's line.";
+    const feature = last.prTypes.find((t) => t.name === "feature");
+    if (feature !== undefined) feature.description += " (Someone else's words.)";
     vs.push({ createdAt: now(), doc: last });
     return send(res, 200, {});
   }
@@ -458,7 +460,7 @@ createServer(async (req, res) => {
   if (req.method !== "GET" && delay > 0) await new Promise((r) => setTimeout(r, delay));
   if (url.pathname === "/api/v1/repos") return send(res, 200, { items: [...repos.values()] });
   if (parts[2] === "repos" && parts[5] === "rubrics") {
-    const [owner, name] = [parts[3], parts[4]];
+    const [owner, name] = [parts[3].toLowerCase(), parts[4].toLowerCase()];
     if (!repos.has(`${owner}/${name}`))
       return send(res, 404, { error: `${owner}/${name} is not registered` });
     const vs = rubrics.get(`${owner}/${name}`) ?? [];

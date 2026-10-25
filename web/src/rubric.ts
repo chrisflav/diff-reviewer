@@ -7,7 +7,7 @@
  * reviews, documents keep the fields this client does not know: every edit spreads what was read.
  */
 
-import type { Category, PrType, RubricDocument } from "./api";
+import type { Category, InlineComment, PrType, Review, RubricDocument } from "./api";
 import { MAX_CATEGORY_LENGTH, same } from "./review";
 import { blankAscii, charLength, utf8Bytes } from "./text";
 
@@ -245,31 +245,81 @@ export function rubricVersionOfJob(rubricVersion: number | null): "none" | "curr
 }
 
 /**
- * Why the server would refuse category `cat` on a comment, or `null`. `allowed` is
- * `categoriesFor`'s answer (empty: free text); `was` the category the comment had when stored,
- * which the server does not check again — the agent gave it under the rubric it reviewed by.
+ * Why the server would refuse category `cat` on a comment it checks, or `null`. `allowed` is
+ * `categoriesFor`'s answer (empty: free text).
  */
-export function categoryProblem(
-  cat: string | undefined,
-  allowed: string[],
-  was?: string,
-): string | null {
+export function categoryProblem(cat: string | undefined, allowed: string[]): string | null {
   if (cat === undefined) return null;
   if (blankAscii(cat) || charLength(cat) > MAX_CATEGORY_LENGTH)
     return `The category must be 1 to ${MAX_CATEGORY_LENGTH} characters.`;
-  if (allowed.length > 0 && !allowed.includes(cat) && cat !== was)
+  if (allowed.length > 0 && !allowed.includes(cat))
     return `"${cat}" is not a category of the rubric; it is one of ${allowed.join(", ")}.`;
+  return null;
+}
+
+/**
+ * The categories the stored review's comments have, by comment id: what the server takes a
+ * comment's category to be unchanged from. A comment without an id is always checked.
+ */
+export function storedCategories(r: Review | null): Map<string, string | undefined> {
+  const out = new Map<string, string | undefined>();
+  for (const c of r?.comments ?? []) if (typeof c.id === "string") out.set(c.id, c.category);
+  return out;
+}
+
+/** Why the server would refuse comment `c`'s category, checked as `putReview` checks it. */
+export function commentCategoryProblem(
+  c: InlineComment,
+  allowed: string[],
+  stored: Map<string, string | undefined>,
+): string | null {
+  const unchanged = typeof c.id === "string" && stored.has(c.id) && stored.get(c.id) === c.category;
+  return unchanged ? null : categoryProblem(c.category, allowed);
+}
+
+/** The first comment of `r` whose category the server would refuse, said as it would say it. */
+export function reviewCategoryProblem(
+  r: Review,
+  allowed: string[],
+  stored: Map<string, string | undefined>,
+): string | null {
+  for (const [i, c] of r.comments.entries()) {
+    const p = commentCategoryProblem(c, allowed, stored);
+    if (p !== null) return `Comment ${i + 1}: ${p}`;
+  }
   return null;
 }
 
 // Merging. A save refused because the document moved on (409) moves the edits onto the newer
 // version: what only one side changed takes that change; what both changed differently is a
 // conflict, left at the newer version until the person picks.
+//
+// Types and categories are matched by name only. A rename is a deletion and an addition: there is
+// no guessing which item another is, so an edit never lands on an item it was not made to.
+
+type Keyed = { [RKEY]: number };
 
 export type RubricConflict =
   | { kind: "field"; name: string; mine: unknown; theirs: unknown }
   | { kind: "typeField"; type: number; label: string; name: string; mine: unknown; theirs: unknown }
-  | { kind: "type"; type: number; label: string; mine: LocalType | null; theirs: LocalType | null }
+  | {
+      kind: "type";
+      type: number;
+      label: string;
+      mine: LocalType | null;
+      theirs: LocalType | null;
+      /** The merged order of the types, for putting one back where it was. */
+      order: number[];
+    }
+  | {
+      kind: "categoryField";
+      type: number;
+      category: number;
+      label: string;
+      name: string;
+      mine: unknown;
+      theirs: unknown;
+    }
   | {
       kind: "category";
       type: number;
@@ -277,6 +327,17 @@ export type RubricConflict =
       label: string;
       mine: LocalCategory | null;
       theirs: LocalCategory | null;
+      order: number[];
+    }
+  | {
+      /** Both sides reordered the same items differently; `type` null is the types themselves. */
+      kind: "order";
+      type: number | null;
+      label: string;
+      mine: number[];
+      theirs: number[];
+      mineNames: string[];
+      theirsNames: string[];
     };
 
 export function rubricConflictId(c: RubricConflict): string {
@@ -287,8 +348,12 @@ export function rubricConflictId(c: RubricConflict): string {
       return `type:${c.type}:${c.name}`;
     case "type":
       return `type:${c.type}`;
+    case "categoryField":
+      return `cat:${c.type}:${c.category}:${c.name}`;
     case "category":
       return `cat:${c.type}:${c.category}`;
+    case "order":
+      return c.type === null ? "order" : `order:${c.type}`;
   }
 }
 
@@ -305,40 +370,19 @@ function strip(x: object): Record<string, unknown> {
   return out;
 }
 
-/** Key `other`'s items by the items of `known` they are: by name, then a rename at one place. */
-function alignNamed<T extends { name: string }, L extends T & { [RKEY]: number }>(
-  known: L[],
+/** Key `other`'s items by the items of `known` with their names; the rest are new. */
+function alignNamed<T extends { name: string }>(
+  known: (T & Keyed)[],
   other: T[],
   fresh: () => number,
-  sameRest: (k: L, o: T) => boolean,
-): (T & { [RKEY]: number })[] {
-  const keys: (number | undefined)[] = other.map(() => undefined);
+): (T & Keyed)[] {
   const used = new Set<number>();
-  other.forEach((o, i) => {
+  return other.map((o) => {
     const k = known.find((x) => !used.has(x[RKEY]) && x.name === o.name);
-    if (k !== undefined) {
-      keys[i] = k[RKEY];
-      used.add(k[RKEY]);
-    }
-  });
-  // A rename: the one unpaired item that says the same as an unpaired one of the other side.
-  other.forEach((o, i) => {
-    if (keys[i] !== undefined) return;
-    const ks = known.filter((x) => !used.has(x[RKEY]) && sameRest(x, o));
-    const k = ks[0];
-    if (ks.length !== 1 || k === undefined) return;
-    if (other.filter((x, j) => keys[j] === undefined && sameRest(k, x)).length !== 1) return;
-    keys[i] = k[RKEY];
+    if (k === undefined) return { ...o, [RKEY]: fresh() };
     used.add(k[RKEY]);
+    return { ...o, [RKEY]: k[RKEY] };
   });
-  return other.map((o, i) => ({ ...o, [RKEY]: keys[i] ?? fresh() }));
-}
-
-function withoutName(x: object): Record<string, unknown> {
-  const out = strip(x);
-  delete out.name;
-  delete out.categories;
-  return out;
 }
 
 /** Three-way merge of the fields of an object; answers the merge and the names both changed. */
@@ -363,24 +407,11 @@ function mergeFields(
   return [out, clashes];
 }
 
-/**
- * The order of the merged items: this person's, when they reordered (the other side's new items
- * after it), else the other side's. Either way, an item new on the side whose order is not taken
- * goes in after the item it follows there, so that a type added and moved stays where it was put;
- * so does one deleted there, which a conflict may bring back. Keys only.
- */
-function mergeOrder(base: number[], mine: number[], theirs: number[]): number[] {
-  const inBase = new Set(base);
-  const keptMine = mine.filter((k) => inBase.has(k));
-  const reordered = !same(
-    keptMine,
-    base.filter((k) => keptMine.includes(k)),
-  );
-  const [first, second] = reordered ? [mine, theirs] : [theirs, mine];
+/** `first`, with each key of `second` it lacks put in after the nearest key before it there. */
+function interleave(first: number[], second: number[]): number[] {
   const out = [...first];
   second.forEach((k, i) => {
     if (out.includes(k)) return;
-    // After the nearest item before it that the merge has; at the start if none.
     let at = 0;
     for (let j = i - 1; j >= 0; j--) {
       const p = out.indexOf(second[j] as number);
@@ -395,32 +426,110 @@ function mergeOrder(base: number[], mine: number[], theirs: number[]): number[] 
 }
 
 /**
- * Key `d`'s types and categories by those of `base` they are: by name, or a rename where all
- * else is the same. New ones get keys from `fresh`.
+ * The order of the merged items, and whether both sides reordered the same items differently:
+ * then the other side's order is taken and the person is asked. Otherwise the order of the side
+ * that reordered (the other side's when neither did), with the items new or deleted on the other
+ * side put in after the item they follow there. Keys only.
+ */
+function mergeOrder(
+  base: number[],
+  mine: number[],
+  theirs: number[],
+): { order: number[]; clash: boolean } {
+  const reordered = (xs: number[]) => {
+    const kept = xs.filter((k) => base.includes(k));
+    return !same(
+      kept,
+      base.filter((k) => kept.includes(k)),
+    );
+  };
+  const [rm, rt] = [reordered(mine), reordered(theirs)];
+  const shared = (xs: number[]) =>
+    xs.filter((k) => base.includes(k) && mine.includes(k) && theirs.includes(k));
+  const clash = rm && rt && !same(shared(mine), shared(theirs));
+  const [first, second] = rm && !rt ? [mine, theirs] : [theirs, mine];
+  return { order: interleave(first, second), clash };
+}
+
+/** `xs` in `order`; items it does not name keep their place after the item they followed. */
+export function applyOrder<T extends Keyed>(xs: T[], order: number[]): T[] {
+  const keys = interleave(
+    order.filter((k) => xs.some((x) => x[RKEY] === k)),
+    xs.map((x) => x[RKEY]),
+  );
+  return keys.flatMap((k) => xs.filter((x) => x[RKEY] === k));
+}
+
+/** `xs` with `item` put back where `order` says it goes, among the items there are. */
+function putBack<T extends Keyed>(xs: T[], item: T, order: number[]): T[] {
+  const out = xs.filter((x) => x[RKEY] !== item[RKEY]);
+  const at = order.indexOf(item[RKEY]);
+  let i = 0;
+  for (let j = at - 1; j >= 0; j--) {
+    const p = out.findIndex((x) => x[RKEY] === order[j]);
+    if (p >= 0) {
+      i = p + 1;
+      break;
+    }
+  }
+  out.splice(i, 0, item);
+  return out;
+}
+
+/**
+ * Three-way merge of a list of keyed items. Items both sides added alike are one. `item` merges
+ * one item that is in the base (`b`) and on either side; a new one is taken as it is.
+ */
+function mergeList<T extends Keyed & { name: string }>(
+  base: T[],
+  mineIn: T[],
+  theirs: T[],
+  item: (key: number, b: T, m: T | null, t: T | null, order: number[]) => T | null,
+  onOrderClash: (mine: T[], theirs: T[]) => void,
+): T[] {
+  const inBase = new Set(base.map((x) => x[RKEY]));
+  const theirNew = theirs.filter((x) => !inBase.has(x[RKEY]));
+  const taken = new Set<number>();
+  const mine = mineIn.flatMap((m) => {
+    if (inBase.has(m[RKEY])) return [m];
+    const twin = theirNew.find((t) => !taken.has(t[RKEY]) && same(strip(t), strip(m)));
+    if (twin === undefined) return [m];
+    taken.add(twin[RKEY]);
+    return [twin];
+  });
+  const keys = (xs: T[]) => xs.map((x) => x[RKEY]);
+  const { order, clash } = mergeOrder(keys(base), keys(mine), keys(theirs));
+  if (clash) onOrderClash(mine, theirs);
+  const by = (xs: T[]) => new Map(xs.map((x) => [x[RKEY], x]));
+  const [bm, mm, tm] = [by(base), by(mine), by(theirs)];
+  return order.flatMap((k) => {
+    const [b, m, t] = [bm.get(k), mm.get(k) ?? null, tm.get(k) ?? null];
+    const out = b === undefined ? (t ?? m) : item(k, b, m, t, order);
+    return out === null ? [] : [out];
+  });
+}
+
+/**
+ * Key `d`'s types and categories by those of `base` with the same names. New ones get keys from
+ * `fresh`.
  */
 export function alignRubric(base: LocalRubric, d: RubricDoc, fresh: () => number): LocalRubric {
-  const types = alignNamed<PrType, LocalType>(base.prTypes, d.prTypes, fresh, (k, o) =>
-    same(withoutName(k), withoutName(o)),
-  ).map((t) => {
+  const types = alignNamed<PrType>(base.prTypes, d.prTypes, fresh).map((t) => {
     const bt = base.prTypes.find((x) => x[RKEY] === t[RKEY]);
     return {
       ...t,
-      categories: alignNamed<Category, LocalCategory>(
-        bt?.categories ?? [],
-        t.categories ?? [],
-        fresh,
-        (k, o) => same(withoutName(k), withoutName(o)),
-      ),
+      categories: alignNamed<Category>(bt?.categories ?? [], t.categories ?? [], fresh),
     } as LocalType;
   });
   return { ...d, prTypes: types };
 }
 
 /**
- * Move this person's edits (`mine`, made to `base`) onto a newer version (`theirs`). Types and
- * categories are matched by name (a rename by everything else being the same); a type's fields
- * and its categories merge on their own, and a type or category one side deleted and the other
- * changed is a conflict. Nothing the other side did is undone without the person choosing.
+ * Move this person's edits (`mine`, made to `base`) onto a newer version (`theirs`). A type's
+ * fields and its categories merge on their own, a category's fields too; a type or category one
+ * side deleted and the other changed, a field both changed differently and an order both changed
+ * differently are conflicts, left at their version until the person picks. Nothing the other side
+ * did is undone without the person choosing.
  */
 export function rebaseRubric(
   base: LocalRubric,
@@ -432,119 +541,144 @@ export function rebaseRubric(
   const [fields, clashes] = mergeFields(base, mine, theirs, ["prTypes"]);
   for (const name of clashes)
     conflicts.push({ kind: "field", name, mine: mine[name], theirs: theirs[name] });
+  const names = (xs: { name: string }[]) => xs.map((x) => x.name);
+  const keys = (xs: Keyed[]) => xs.map((x) => x[RKEY]);
 
-  const byKey = <X extends { [RKEY]: number }>(xs: X[]) => new Map(xs.map((x) => [x[RKEY], x]));
-  const [bT, mT, tT] = [byKey(base.prTypes), byKey(mine.prTypes), byKey(theirs.prTypes)];
-  const types = new Map<number, LocalType>();
-  const order = mergeOrder(
-    base.prTypes.map((t) => t[RKEY]),
-    mine.prTypes.map((t) => t[RKEY]),
-    theirs.prTypes.map((t) => t[RKEY]),
-  );
-  for (const key of order) {
-    const [b, m, t] = [bT.get(key), mT.get(key) ?? null, tT.get(key) ?? null];
-    const label = (m ?? t ?? b)?.name ?? "a type";
-    if (b === undefined) {
-      // New on one side only: keys are fresh per side.
-      const x = m ?? t;
-      if (x !== null) types.set(key, x);
-      continue;
-    }
-    if (m !== null && same(m, b)) {
-      if (t !== null) types.set(key, t);
-      continue;
-    }
-    if (t !== null && same(t, b)) {
-      if (m !== null) types.set(key, m);
-      continue;
-    }
-    if (m === null && t === null) continue;
-    if (m === null || t === null) {
-      conflicts.push({ kind: "type", type: key, label, mine: m, theirs: t });
-      if (t !== null) types.set(key, t);
-      continue;
-    }
-    // Both changed it: field by field, and its categories as the types are.
-    const [tf, tclash] = mergeFields(b, m, t, ["categories"]);
-    for (const name of tclash)
-      conflicts.push({ kind: "typeField", type: key, label, name, mine: m[name], theirs: t[name] });
-    const [bC, mC, tC] = [byKey(b.categories), byKey(m.categories), byKey(t.categories)];
-    const cats: LocalCategory[] = [];
-    for (const ck of mergeOrder(
-      b.categories.map((c) => c[RKEY]),
-      m.categories.map((c) => c[RKEY]),
-      t.categories.map((c) => c[RKEY]),
-    )) {
-      const [bc, mc, tc] = [bC.get(ck), mC.get(ck) ?? null, tC.get(ck) ?? null];
-      if (bc === undefined || (mc !== null && same(mc, bc))) {
-        const x = bc === undefined ? (mc ?? tc) : tc;
-        if (x !== null) cats.push(x);
-        continue;
+  const prTypes = mergeList<LocalType>(
+    base.prTypes,
+    mine.prTypes,
+    theirs.prTypes,
+    (key, b, m, t, order) => {
+      if (m !== null && same(m, b)) return t;
+      if (t !== null && same(t, b)) return m;
+      if (m === null && t === null) return null;
+      const label = (m ?? t ?? b).name;
+      if (m === null || t === null) {
+        conflicts.push({ kind: "type", type: key, label, mine: m, theirs: t, order });
+        return t;
       }
-      if (tc !== null && same(tc, bc)) {
-        if (mc !== null) cats.push(mc);
-        continue;
-      }
-      if (mc === null && tc === null) continue;
-      if (mc !== null && tc !== null) {
-        const [cf, cclash] = mergeFields(bc, mc, tc, []);
-        if (cclash.length === 0) {
-          cats.push({ ...cf, [RKEY]: ck } as LocalCategory);
-          continue;
-        }
-      }
+      const [tf, tclash] = mergeFields(b, m, t, ["categories"]);
+      for (const name of tclash)
+        conflicts.push({
+          kind: "typeField",
+          type: key,
+          label,
+          name,
+          mine: m[name],
+          theirs: t[name],
+        });
+      const categories = mergeList<LocalCategory>(
+        b.categories,
+        m.categories,
+        t.categories,
+        (ck, bc, mc, tc, corder) => {
+          if (mc !== null && same(mc, bc)) return tc;
+          if (tc !== null && same(tc, bc)) return mc;
+          if (mc === null && tc === null) return null;
+          const clabel = `${label}: ${(mc ?? tc ?? bc).name}`;
+          if (mc === null || tc === null) {
+            conflicts.push({
+              kind: "category",
+              type: key,
+              category: ck,
+              label: clabel,
+              mine: mc,
+              theirs: tc,
+              order: corder,
+            });
+            return tc;
+          }
+          const [cf, cclash] = mergeFields(bc, mc, tc, []);
+          for (const name of cclash)
+            conflicts.push({
+              kind: "categoryField",
+              type: key,
+              category: ck,
+              label: clabel,
+              name,
+              mine: mc[name],
+              theirs: tc[name],
+            });
+          return { ...cf, [RKEY]: ck } as LocalCategory;
+        },
+        (mc, tc) =>
+          conflicts.push({
+            kind: "order",
+            type: key,
+            label: `the categories of ${label}`,
+            mine: keys(mc),
+            theirs: keys(tc),
+            mineNames: names(mc),
+            theirsNames: names(tc),
+          }),
+      );
+      return { ...tf, categories, [RKEY]: key } as LocalType;
+    },
+    (mt, tt) =>
       conflicts.push({
-        kind: "category",
-        type: key,
-        category: ck,
-        label: `${label}: ${(mc ?? tc ?? bc).name}`,
-        mine: mc,
-        theirs: tc,
-      });
-      if (tc !== null) cats.push(tc);
-    }
-    types.set(key, { ...tf, categories: cats, [RKEY]: key } as LocalType);
-  }
-  const prTypes = order.flatMap((k) => {
-    const t = types.get(k);
-    return t === undefined ? [] : [t];
-  });
+        kind: "order",
+        type: null,
+        label: "the order of the types",
+        mine: keys(mt),
+        theirs: keys(tt),
+        mineNames: names(mt),
+        theirsNames: names(tt),
+      }),
+  );
   return { review: { ...fields, prTypes } as LocalRubric, base: theirs, conflicts };
 }
 
 export type RubricPick = "mine" | "theirs";
 
+/** Field `name` of `x` set to `v`, or removed when `v` is undefined. */
+function setField<T extends object>(x: T, name: string, v: unknown): T {
+  const out = { ...x } as Record<string, unknown>;
+  if (v === undefined) delete out[name];
+  else out[name] = v;
+  return out as T;
+}
+
 /** `r` with a conflict settled one way. Picking again settles it the other way. */
 export function resolveRubric(r: LocalRubric, c: RubricConflict, pick: RubricPick): LocalRubric {
-  const v = pick === "mine" ? c.mine : c.theirs;
-  if (c.kind === "field") {
-    const out: LocalRubric = { ...r };
-    if (v === undefined) delete out[c.name];
-    else out[c.name] = v;
-    return out;
-  }
+  if (c.kind === "field") return setField(r, c.name, pick === "mine" ? c.mine : c.theirs);
+  if (c.kind === "order" && c.type === null)
+    return { ...r, prTypes: applyOrder(r.prTypes, pick === "mine" ? c.mine : c.theirs) };
   if (c.kind === "type") {
-    const keep = v as LocalType | null;
+    const keep = pick === "mine" ? c.mine : c.theirs;
+    if (keep === null) return { ...r, prTypes: r.prTypes.filter((t) => t[RKEY] !== c.type) };
     const at = r.prTypes.findIndex((t) => t[RKEY] === c.type);
-    const prTypes = r.prTypes.filter((t) => t[RKEY] !== c.type);
-    if (keep !== null) prTypes.splice(at < 0 ? prTypes.length : at, 0, keep);
-    return { ...r, prTypes };
+    if (at >= 0) return { ...r, prTypes: r.prTypes.map((t, i) => (i === at ? keep : t)) };
+    return { ...r, prTypes: putBack(r.prTypes, keep, c.order) };
   }
   return {
     ...r,
     prTypes: r.prTypes.map((t) => {
       if (t[RKEY] !== c.type) return t;
-      if (c.kind === "typeField") {
-        const out: LocalType = { ...t };
-        if (v === undefined) delete out[c.name];
-        else out[c.name] = v;
-        return out;
+      switch (c.kind) {
+        case "typeField":
+          return setField(t, c.name, pick === "mine" ? c.mine : c.theirs);
+        case "order":
+          return {
+            ...t,
+            categories: applyOrder(t.categories, pick === "mine" ? c.mine : c.theirs),
+          };
+        case "categoryField":
+          return {
+            ...t,
+            categories: t.categories.map((x) =>
+              x[RKEY] === c.category ? setField(x, c.name, pick === "mine" ? c.mine : c.theirs) : x,
+            ),
+          };
+        case "category": {
+          const keep = pick === "mine" ? c.mine : c.theirs;
+          if (keep === null)
+            return { ...t, categories: t.categories.filter((x) => x[RKEY] !== c.category) };
+          const at = t.categories.findIndex((x) => x[RKEY] === c.category);
+          if (at >= 0)
+            return { ...t, categories: t.categories.map((x, i) => (i === at ? keep : x)) };
+          return { ...t, categories: putBack(t.categories, keep, c.order) };
+        }
       }
-      const keep = v as LocalCategory | null;
-      const at = t.categories.findIndex((x) => x[RKEY] === c.category);
-      const categories = t.categories.filter((x) => x[RKEY] !== c.category);
-      if (keep !== null) categories.splice(at < 0 ? categories.length : at, 0, keep);
-      return { ...t, categories };
     }),
   };
 }

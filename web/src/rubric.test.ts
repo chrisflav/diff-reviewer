@@ -3,6 +3,9 @@ import type { RubricDocument } from "./api";
 import {
   categoriesFor,
   categoryProblem,
+  commentCategoryProblem,
+  reviewCategoryProblem,
+  storedCategories,
   documentOf,
   freezeRubric,
   MAX_RUBRIC_BYTES,
@@ -11,13 +14,18 @@ import {
   rebaseRubric,
   resolveRubric,
   rubricProblems,
+  rubricConflictId,
   rubricVersionOfJob,
   sameRubric,
   thawRubric,
   toLocalRubric,
   toRubricDoc,
+  type LocalRubric,
+  type LocalType,
   type RubricDoc,
 } from "./rubric";
+
+const names = (r: LocalRubric) => r.prTypes.map((t) => t.name);
 
 const doc: RubricDoc = {
   defaultRubric: "No `sorry`.",
@@ -164,8 +172,22 @@ describe("categoryProblem", () => {
     expect(categoryProblem("x".repeat(101), [])).toMatch(/1 to 100/);
   });
 
-  it("lets a category the comment already had stand, as the server does", () => {
-    expect(categoryProblem("style", allowed, "style")).toBeNull();
+  it("lets a category stand that the stored comment with the same id has, as the server does", () => {
+    const stored = storedCategories({
+      decision: "comment",
+      body: "",
+      comments: [
+        { file: "a", start_line: 1, end_line: 1, body: "x", id: "c1", category: "style" },
+        { file: "a", start_line: 2, end_line: 2, body: "y", category: "style" },
+      ],
+    });
+    const c = { file: "a", start_line: 1, end_line: 1, body: "x", category: "style" };
+    expect(commentCategoryProblem({ ...c, id: "c1" }, allowed, stored)).toBeNull();
+    // Another id, or none at all, is checked: the server checks it too.
+    expect(commentCategoryProblem({ ...c, id: "c2" }, allowed, stored)).toMatch(/not a category/);
+    expect(commentCategoryProblem(c, allowed, stored)).toMatch(/not a category/);
+    const review = { decision: "comment" as const, body: "", comments: [{ ...c, id: "c1" }, c] };
+    expect(reviewCategoryProblem(review, allowed, stored)).toMatch(/^Comment 2: /);
   });
 });
 
@@ -225,7 +247,7 @@ describe("rebaseRubric", () => {
     expect(out.future).toEqual({ kept: true });
   });
 
-  it("follows a type renamed on their side, by everything else being the same", () => {
+  it("takes a rename as a deletion and an addition: never a guess", () => {
     const mine = {
       ...base,
       prTypes: base.prTypes.map((t, i) => (i === 1 ? { ...t, rubric: "Mine." } : t)),
@@ -233,11 +255,102 @@ describe("rebaseRubric", () => {
     const theirs = structuredClone(doc);
     theirs.prTypes[1]!.name = "cleanup";
     const r = rebaseRubric(base, mine, theirs);
-    expect(r.conflicts).toEqual([]);
-    expect(toRubricDoc(r.review).prTypes.map((t) => [t.name, t.rubric])).toEqual([
+    expect(r.conflicts.map((c) => [c.kind, rubricConflictId(c)])).toEqual([["type", "type:1"]]);
+    expect(names(r.review)).toEqual(["feature", "cleanup"]);
+    // Keeping mine keeps the type I edited, in its place, and their new one too.
+    const kept = resolveRubric(r.review, r.conflicts[0]!, "mine");
+    expect(toRubricDoc(kept).prTypes.map((t) => [t.name, t.rubric])).toEqual([
       ["feature", "Check names."],
-      ["cleanup", "Mine."],
+      ["refactor", "Mine."],
+      ["cleanup", "Nothing lost."],
     ]);
+    expect(names(resolveRubric(kept, r.conflicts[0]!, "theirs"))).toEqual(["feature", "cleanup"]);
+  });
+
+  it("does not take an unrelated item, however blank, for the one deleted", () => {
+    const blank: RubricDoc = {
+      defaultRubric: "",
+      prTypes: [
+        {
+          name: "A",
+          description: "",
+          rubric: "",
+          categories: [
+            { name: "Perf", description: "" },
+            { name: "Docs", description: "d" },
+          ],
+        },
+      ],
+    };
+    const b = toLocalRubric(blank);
+    const mine = {
+      ...b,
+      prTypes: b.prTypes.map((t) => ({
+        ...t,
+        categories: t.categories.map((c) =>
+          c.name === "Perf" ? { ...c, description: "mine" } : c,
+        ),
+      })),
+    };
+    const theirs = structuredClone(blank);
+    theirs.prTypes[0]!.categories = [
+      { name: "Docs", description: "d" },
+      { name: "Security", description: "" },
+    ];
+    const r = rebaseRubric(b, mine, theirs);
+    expect(r.conflicts.map((c) => c.kind)).toEqual(["category"]);
+    const cats = (x: typeof r.review) => toRubricDoc(x).prTypes[0]!.categories;
+    expect(cats(r.review).map((c) => [c.name, c.description])).toEqual([
+      ["Docs", "d"],
+      ["Security", ""],
+    ]);
+    expect(cats(resolveRubric(r.review, r.conflicts[0]!, "mine")).map((c) => c.name)).toEqual([
+      "Perf",
+      "Docs",
+      "Security",
+    ]);
+    // A type deleted there and a blank one added: the same, one level up.
+    const t2 = {
+      defaultRubric: "",
+      prTypes: [{ ...blank.prTypes[0]!, name: "Z", categories: [] }],
+    };
+    const r2 = rebaseRubric(
+      b,
+      { ...b, prTypes: b.prTypes.map((t) => ({ ...t, rubric: "m" })) },
+      t2,
+    );
+    expect(r2.conflicts.map((c) => c.kind)).toEqual(["type"]);
+    expect(names(r2.review)).toEqual(["Z"]);
+  });
+
+  it("takes what both added alike once", () => {
+    const added = { name: "perf", description: "", rubric: "", categories: [] };
+    const mine = { ...base, prTypes: [...base.prTypes, { ...added, categories: [], [RKEY]: 9 }] };
+    const r = rebaseRubric(base, mine, { ...doc, prTypes: [...doc.prTypes, added] });
+    expect(r.conflicts).toEqual([]);
+    expect(names(r.review)).toEqual(["feature", "refactor", "perf"]);
+  });
+
+  it("asks when both reordered the same items differently", () => {
+    const three: RubricDoc = {
+      ...doc,
+      prTypes: [...doc.prTypes, { name: "c", description: "", rubric: "", categories: [] }],
+    };
+    const b = toLocalRubric(three);
+    const [f, rf, c] = b.prTypes as [LocalType, LocalType, LocalType];
+    const theirs = { ...three, prTypes: [three.prTypes[1]!, three.prTypes[0]!, three.prTypes[2]!] };
+    const r = rebaseRubric(b, { ...b, prTypes: [c, f, rf] }, theirs);
+    expect(r.conflicts.map((x) => x.kind)).toEqual(["order"]);
+    expect(names(r.review)).toEqual(["refactor", "feature", "c"]);
+    expect(names(resolveRubric(r.review, r.conflicts[0]!, "mine"))).toEqual([
+      "c",
+      "feature",
+      "refactor",
+    ]);
+    // One side reordering is no conflict: its order is taken.
+    const one = rebaseRubric(b, { ...b, prTypes: [c, f, rf] }, three);
+    expect(one.conflicts).toEqual([]);
+    expect(names(one.review)).toEqual(["c", "feature", "refactor"]);
   });
 
   it("asks where both changed the same field, and settles it either way", () => {
@@ -296,16 +409,23 @@ describe("rebaseRubric", () => {
     expect(s.review.prTypes.map((t) => t.name).sort()).toEqual(["feature", "refactor"]);
   });
 
-  it("asks about a category both changed differently", () => {
+  it("asks about each field of a category both changed, keeping the rest of theirs", () => {
     const mine = edit((d) => {
-      d.prTypes[0]!.categories[0]!.description = "Mine.";
+      d.prTypes[0]!.categories[1]!.description = "Mine.";
       return d;
     });
     const theirs = structuredClone(doc);
-    theirs.prTypes[0]!.categories[0]!.description = "Theirs.";
+    theirs.prTypes[0]!.categories[1]!.description = "Theirs.";
+    theirs.prTypes[0]!.categories[1]!.colour = "red";
     const r = rebaseRubric(base, mine, theirs);
-    expect(r.conflicts.map((c) => c.kind)).toEqual(["category"]);
-    const settled = resolveRubric(r.review, r.conflicts[0]!, "mine");
-    expect(toRubricDoc(settled).prTypes[0]!.categories[0]!.description).toBe("Mine.");
+    expect(r.conflicts.map((c) => [c.kind, rubricConflictId(c)])).toEqual([
+      ["categoryField", "cat:0:1:description"],
+    ]);
+    const settled = toRubricDoc(resolveRubric(r.review, r.conflicts[0]!, "mine"));
+    expect(settled.prTypes[0]!.categories[1]).toEqual({
+      name: "naming",
+      description: "Mine.",
+      colour: "red",
+    });
   });
 });

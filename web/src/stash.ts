@@ -6,8 +6,16 @@
  * them once saved or discarded, and offers them back when it is opened again.
  */
 
-import { freeze, thaw, type LocalReview } from "./review";
-import { freezeRubric, thawRubric, type LocalRubric } from "./rubric";
+import { freeze, same, thaw, type LocalReview } from "./review";
+import {
+  freezeRubric,
+  rebaseRubric,
+  thawRubric,
+  toRubricDoc,
+  type LocalRubric,
+  type RubricConflict,
+  type RubricPick,
+} from "./rubric";
 
 /** Edits as the job page holds them: made to `base`, the review at `version` of job `jobId`. */
 export interface Edits {
@@ -23,22 +31,34 @@ export interface Stashed extends Edits {
 
 const prefix = "diff-reviewer:edits:";
 
-// Storage can be missing or refuse (a private window, a full quota): the page works without it.
-export function stash(e: Edits) {
+/**
+ * Write `value` under `key`; false when storage is missing or refuses (a private window, a full
+ * quota). Then an older copy is removed rather than left to be offered back as if it were these
+ * edits, and the page says that the edits are held in memory only.
+ */
+function put(key: string, value: () => unknown): boolean {
   try {
-    sessionStorage.setItem(
-      prefix + e.jobId,
-      JSON.stringify({
-        jobId: e.jobId,
-        version: e.version,
-        base: freeze(e.base),
-        review: freeze(e.review),
-        savedAt: new Date().toISOString(),
-      }),
-    );
+    sessionStorage.setItem(key, JSON.stringify(value()));
+    return true;
   } catch {
-    /* kept in memory only */
+    try {
+      sessionStorage.removeItem(key);
+    } catch {
+      /* no storage at all */
+    }
+    return false;
   }
+}
+
+/** Keep the edits in this tab's storage; false when they are held in memory only. */
+export function stash(e: Edits): boolean {
+  return put(prefix + e.jobId, () => ({
+    jobId: e.jobId,
+    version: e.version,
+    base: freeze(e.base),
+    review: freeze(e.review),
+    savedAt: new Date().toISOString(),
+  }));
 }
 
 export function unstash(jobId: string): Stashed | null {
@@ -78,27 +98,72 @@ export interface RubricEdits {
   doc: LocalRubric;
 }
 
+/**
+ * The conflicts a move onto a newer version left open: the edits from before the move and the
+ * sides picked so far. The conflicts themselves are worked out again from these, since moving the
+ * same edits onto the same version always gives the same ones.
+ */
+export interface PendingRubric {
+  from: number;
+  source: RubricEdits;
+  picks: Record<string, RubricPick>;
+}
+
 export interface StashedRubric extends RubricEdits {
   savedAt: string;
+  pending: PendingRubric | null;
 }
 
 const rubricPrefix = "diff-reviewer:rubric:";
 
-export function stashRubric(e: RubricEdits) {
-  try {
-    sessionStorage.setItem(
-      rubricPrefix + e.repo,
-      JSON.stringify({
-        repo: e.repo,
-        version: e.version,
-        base: freezeRubric(e.base),
-        doc: freezeRubric(e.doc),
-        savedAt: new Date().toISOString(),
-      }),
-    );
-  } catch {
-    /* kept in memory only */
-  }
+/** Owner and name as the server keys them: GitHub's names are not case-sensitive. */
+export function rubricStashKey(owner: string, name: string): string {
+  return `${owner}/${name}`.toLowerCase();
+}
+
+/** Keep the edits, and any conflicts still open; false when they are held in memory only. */
+export function stashRubric(e: RubricEdits, pending: PendingRubric | null = null): boolean {
+  return put(rubricPrefix + e.repo, () => ({
+    repo: e.repo,
+    version: e.version,
+    base: freezeRubric(e.base),
+    doc: freezeRubric(e.doc),
+    savedAt: new Date().toISOString(),
+    pending:
+      pending === null
+        ? null
+        : {
+            from: pending.from,
+            version: pending.source.version,
+            base: freezeRubric(pending.source.base),
+            doc: freezeRubric(pending.source.doc),
+            picks: pending.picks,
+          },
+  }));
+}
+
+function thawPending(repo: string, j: unknown): PendingRubric | null | undefined {
+  if (j === null || j === undefined) return null;
+  if (typeof j !== "object") return undefined;
+  const p = j as Record<string, unknown>;
+  const base = thawRubric(p.base);
+  const doc = thawRubric(p.doc);
+  const picks = p.picks;
+  if (
+    typeof p.from !== "number" ||
+    typeof p.version !== "number" ||
+    base === null ||
+    doc === null ||
+    typeof picks !== "object" ||
+    picks === null ||
+    !Object.values(picks).every((v) => v === "mine" || v === "theirs")
+  )
+    return undefined;
+  return {
+    from: p.from,
+    source: { repo, version: p.version, base, doc },
+    picks: picks as Record<string, RubricPick>,
+  };
 }
 
 export function unstashRubric(repo: string): StashedRubric | null {
@@ -108,15 +173,17 @@ export function unstashRubric(repo: string): StashedRubric | null {
     const j = JSON.parse(text) as Record<string, unknown>;
     const base = thawRubric(j.base);
     const doc = thawRubric(j.doc);
+    const pending = thawPending(repo, j.pending);
     if (
       j.repo !== repo ||
       typeof j.version !== "number" ||
       typeof j.savedAt !== "string" ||
       base === null ||
-      doc === null
+      doc === null ||
+      pending === undefined
     )
       return null;
-    return { repo, version: j.version, base, doc, savedAt: j.savedAt };
+    return { repo, version: j.version, base, doc, savedAt: j.savedAt, pending };
   } catch {
     return null;
   }
@@ -128,4 +195,41 @@ export function dropRubricStash(repo: string) {
   } catch {
     /* nothing to drop */
   }
+}
+
+/** Stashed edits back as the page holds them, with the conflicts they had open. */
+export interface Reopened {
+  edits: RubricEdits;
+  /** The open conflicts, worked out again, and the sides picked; null when there were none. */
+  rebased: {
+    from: number;
+    to: number;
+    conflicts: RubricConflict[];
+    picks: Record<string, RubricPick>;
+    source: RubricEdits;
+  } | null;
+}
+
+/**
+ * The edits `s` kept, at the version they were made to, and the conflicts that were open: moving
+ * the edits from before the move onto `s.base` again gives the same conflicts, and the picks and
+ * the edits made since are in `s.doc` already. `null` when that move no longer gives `s.base`
+ * (stored by another build): then the edits from before the move are what is left to restore.
+ */
+export function reopenRubric(s: StashedRubric): Reopened | null {
+  const edits: RubricEdits = { repo: s.repo, version: s.version, base: s.base, doc: s.doc };
+  const p = s.pending;
+  if (p === null) return { edits, rebased: null };
+  const r = rebaseRubric(p.source.base, p.source.doc, toRubricDoc(s.base));
+  if (!same(freezeRubric(r.base), freezeRubric(s.base))) return null;
+  return {
+    edits,
+    rebased: {
+      from: p.from,
+      to: s.version,
+      conflicts: r.conflicts,
+      picks: p.picks,
+      source: p.source,
+    },
+  };
 }

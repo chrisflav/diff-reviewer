@@ -9,7 +9,7 @@ import {
 } from "react";
 import { severities, type InlineComment, type Severity } from "../api";
 import { commentProblem, KEY, rangeLabel, type LocalComment } from "../review";
-import { categoryProblem } from "../rubric";
+import { commentCategoryProblem } from "../rubric";
 import { CategoryTag, SeverityBadge, severityHelp } from "./Severity";
 
 /**
@@ -28,12 +28,15 @@ export interface CategoryRules {
   descriptions: Map<string, string>;
   /** Why the rules are not known, when they are not: the form takes free text, the server checks. */
   note: string | null;
+  /** The stored review's categories by comment id: a category left as stored is not checked. */
+  stored: Map<string, string | undefined>;
 }
 
 export const CategoryContext = createContext<CategoryRules>({
   allowed: [],
   descriptions: new Map(),
   note: null,
+  stored: new Map(),
 });
 
 /**
@@ -234,8 +237,9 @@ export function CommentForm({
       body,
     };
     if (suggesting) c.suggestion = suggestion;
-    // Free text is trimmed; a rubric's category is taken as the rubric spells it.
-    const cat = picked ? category : category.trim();
+    // Free text the person typed is trimmed; a rubric's category, or one left as it was, is taken
+    // as it is spelled.
+    const cat = picked || category === (initial.category ?? "") ? category : category.trim();
     if (cat !== "") c.category = cat;
     if (severity !== "") c.severity = severity;
     return c;
@@ -244,7 +248,8 @@ export function CommentForm({
   const submit = (e: FormEvent) => {
     e.preventDefault();
     const c = build();
-    const p = commentProblem(c) ?? categoryProblem(c.category, rules.allowed, initial.category);
+    const withId = initial.id === undefined ? c : { ...c, id: initial.id };
+    const p = commentProblem(c) ?? commentCategoryProblem(withId, rules.allowed, rules.stored);
     if (p !== null) {
       setProblem(p);
       return;

@@ -28,6 +28,8 @@ import {
 } from "../rubric";
 import {
   dropRubricStash,
+  reopenRubric,
+  rubricStashKey,
   stashRubric,
   unstashRubric,
   type RubricEdits,
@@ -72,7 +74,7 @@ function RubricView({
   name: string;
   onUnauthorized: () => void;
 }) {
-  const repo = `${owner}/${name}`;
+  const repo = rubricStashKey(owner, name);
   const fetchDoc = useCallback(() => api.rubrics(owner, name), [owner, name]);
   const { data: doc, error, reload, setError, setData: setDoc } = useLoad(fetchDoc, onUnauthorized);
 
@@ -84,7 +86,7 @@ function RubricView({
   const [historyNonce, setHistoryNonce] = useState(0);
   const [offer, setOffer] = useState<StashedRubric | null>(() => {
     const s = unstashRubric(repo);
-    return s !== null && !sameRubric(s.base, s.doc) ? s : null;
+    return s !== null && (s.pending !== null || !sameRubric(s.base, s.doc)) ? s : null;
   });
 
   const readable = useMemo(() => (doc === null ? null : documentOf(doc)), [doc]);
@@ -109,11 +111,19 @@ function RubricView({
   const unresolved =
     rebased !== null &&
     rebased.conflicts.some((c) => rebased.picks[rubricConflictId(c)] === undefined);
-  const dirty = edits !== null && !sameRubric(edits.base, edits.doc);
+  // Open conflicts count: what they are left at may be the newer version itself.
+  const dirty = edits !== null && (unresolved || !sameRubric(edits.base, edits.doc));
 
+  // Every change is kept in the tab's storage, with the conflicts still open and the sides picked
+  // so far, so that a 401 or a reload brings back the page as it was.
+  const [memoryOnly, setMemoryOnly] = useState(false);
   useEffect(() => {
     if (edits === null) return;
-    stashRubric(unresolved && rebased !== null ? rebased.source : edits);
+    const pending =
+      unresolved && rebased !== null
+        ? { from: rebased.from, source: rebased.source, picks: rebased.picks }
+        : null;
+    setMemoryOnly(!stashRubric(edits, pending));
   }, [edits, rebased, unresolved]);
 
   const unsaved = useContext(UnsavedContext);
@@ -253,7 +263,22 @@ function RubricView({
   const restoreOffer = () => {
     if (offer === null) return;
     setOffer(null);
-    mergeOnto(doc, offer, offer.version !== doc.version);
+    if (offer.pending === null) {
+      mergeOnto(doc, offer, offer.version !== doc.version);
+      return;
+    }
+    const back = reopenRubric(offer);
+    if (back === null) {
+      // The open conflicts cannot be worked out again: the edits from before them are moved anew.
+      mergeOnto(doc, offer.pending.source, true);
+      return;
+    }
+    setEdits(back.edits);
+    setRebased(back.rebased);
+    if (offer.version !== doc.version)
+      setError(
+        `The rubric is at version ${doc.version} now. Settle the conflicts below first; saving then offers to move your edits onto version ${doc.version}.`,
+      );
   };
 
   const dropOffer = () => {
@@ -387,6 +412,7 @@ function RubricView({
         <div className="savebar" role="region" aria-label="Unsaved changes">
           <span>
             Unsaved changes to the rubric.
+            {memoryOnly && " This tab cannot store them, so they are held in memory only."}
             {unresolved && " Choose a side for each conflict above before saving."}
             {!unresolved && problems.length > 0 && (
               <span className="warn">
@@ -856,8 +882,12 @@ function conflictLabel(c: RubricConflict): string {
       return `The ${c.name} of type ${c.label}`;
     case "type":
       return `The type ${c.label}`;
+    case "categoryField":
+      return `The ${c.name} of category ${c.label}`;
     case "category":
       return `The category ${c.label}`;
+    case "order":
+      return `The order of ${c.type === null ? "the types" : c.label}`;
   }
 }
 
@@ -889,7 +919,9 @@ function ConflictNotice({
             ? [showType(c.mine), showType(c.theirs)]
             : c.kind === "category"
               ? [showCategory(c.mine), showCategory(c.theirs)]
-              : [showValue(c.mine), showValue(c.theirs)];
+              : c.kind === "order"
+                ? [c.mineNames.join(", "), c.theirsNames.join(", ")]
+                : [showValue(c.mine), showValue(c.theirs)];
         return (
           <fieldset key={cid} className="conflict">
             <legend>{conflictLabel(c)}</legend>

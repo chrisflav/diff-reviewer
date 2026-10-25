@@ -49,7 +49,13 @@ import {
   type Pick,
   type Placement,
 } from "../review";
-import { categoriesFor, documentOf, rubricVersionOfJob } from "../rubric";
+import {
+  categoriesFor,
+  documentOf,
+  reviewCategoryProblem,
+  rubricVersionOfJob,
+  storedCategories,
+} from "../rubric";
 import { dropStash, stash, unstash, type Edits, type Stashed } from "../stash";
 import { UnsavedContext } from "../unsaved";
 import { useLoad } from "../useLoad";
@@ -191,9 +197,10 @@ function JobView({ id, onUnauthorized }: { id: string; onUnauthorized: () => voi
   // Every change is kept in the tab's storage, so that a 401, a reload or leaving loses nothing.
   // While conflicts are open, what is kept is the edits from before the move, which restoring
   // moves again: the conflicts come back rather than being settled for the person.
+  const [memoryOnly, setMemoryOnly] = useState(false);
   useEffect(() => {
     if (edits === null) return;
-    stash(unresolved && rebased !== null ? rebased.source : edits);
+    setMemoryOnly(!stash(unresolved && rebased !== null ? rebased.source : edits));
   }, [edits, rebased, unresolved]);
 
   const unsaved = useContext(UnsavedContext);
@@ -240,8 +247,9 @@ function JobView({ id, onUnauthorized }: { id: string; onUnauthorized: () => voi
     return api.rubricAt(owner, repoName, rubricWanted);
   }, [owner, repoName, rubricWanted]);
   const { data: rubric, error: rubricError } = useLoad(fetchRubric, onUnauthorized);
+  const stored = useMemo(() => storedCategories(job?.review ?? null), [job?.review]);
   const rules = useMemo<CategoryRules>(() => {
-    const none = { allowed: [], descriptions: new Map<string, string>() };
+    const none = { allowed: [], descriptions: new Map<string, string>(), stored };
     if (rubricWanted === "none")
       return {
         ...none,
@@ -266,8 +274,8 @@ function JobView({ id, onUnauthorized }: { id: string; onUnauthorized: () => voi
     for (const x of t === undefined ? doc.prTypes : [t])
       for (const c of x.categories)
         if (!descriptions.has(c.name)) descriptions.set(c.name, c.description);
-    return { allowed, descriptions, note: null };
-  }, [rubricWanted, rubric, rubricError, job?.prType]);
+    return { allowed, descriptions, note: null, stored };
+  }, [rubricWanted, rubric, rubricError, job?.prType, stored]);
 
   // A comment picked in the list: its file is unfolded, and focus goes to it once it is drawn.
   const [reveal, setReveal] = useState<{ file: string } | null>(null);
@@ -349,7 +357,10 @@ function JobView({ id, onUnauthorized }: { id: string; onUnauthorized: () => voi
       return;
     }
     const review = toReview(sent.review);
-    const problem = reviewProblem(review);
+    // The categories too, as the server checks them, when the rubric they are checked by is known.
+    const problem =
+      reviewProblem(review) ??
+      (rules.note === null ? reviewCategoryProblem(review, rules.allowed, rules.stored) : null);
     if (problem !== null) {
       setError(problem);
       return;
@@ -680,6 +691,9 @@ function JobView({ id, onUnauthorized }: { id: string; onUnauthorized: () => voi
         <div className="savebar" role="region" aria-label="Unsaved changes">
           <span>
             {edits !== null ? "Unsaved changes." : "A comment form holds text not yet added."}
+            {edits !== null &&
+              memoryOnly &&
+              " This tab cannot store them, so they are held in memory only."}
             {edits !== null && formsDirty && " A comment form holds text not yet added."}
             {edits !== null &&
               (!editable

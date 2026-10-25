@@ -50,6 +50,8 @@ export function commentFields(a: InlineComment, b: InlineComment): string[] {
   const names = new Set([...Object.keys(a), ...Object.keys(b)]);
   for (const k of names) {
     if (k === "file" || k === "start_line" || k === "end_line") continue;
+    // An id given on the next write is not a change the comment's writer made.
+    if (k === "id" && (a.id === undefined || a.id === null)) continue;
     if (!same(a[k], b[k])) out.push(k);
   }
   return out;
@@ -57,9 +59,10 @@ export function commentFields(a: InlineComment, b: InlineComment): string[] {
 
 /**
  * Pair the comments of `a` and `b`: by id where both carry one, which is how the platform follows
- * a comment from draft to post. A comment without an id (stored before ids existed) pairs with a
- * comment without one that is the very same, else with the one at the same place, when only one
- * is there; anything else is an addition or a removal.
+ * a comment from draft to post. A comment without an id (stored before ids existed; the next write
+ * gives it one) pairs with a comment the very same but for the id, else with the one at the same
+ * place, when only one is there. Two comments that both carry ids are never paired by a guess.
+ * Anything else is an addition or a removal.
  */
 export function pairComments(
   a: InlineComment[],
@@ -80,22 +83,22 @@ export function pairComments(
     of.set(i, j);
   });
   let guessed = 0;
+  const guessable = (x: InlineComment, y: InlineComment) => !(hasId(x) && hasId(y));
   const guess = (fits: (x: InlineComment, y: InlineComment) => boolean, unique: boolean) =>
     a.forEach((c, i) => {
-      if (of.has(i) || hasId(c)) return;
-      const js = b.flatMap((d, j) => (!taken.has(j) && !hasId(d) && fits(c, d) ? [j] : []));
+      if (of.has(i)) return;
+      const ok = (x: InlineComment, y: InlineComment) => guessable(x, y) && fits(x, y);
+      const js = b.flatMap((d, j) => (!taken.has(j) && ok(c, d) ? [j] : []));
       const j = js[0];
       if (j === undefined || (unique && js.length !== 1)) return;
-      if (
-        unique &&
-        a.filter((x, k) => !of.has(k) && !hasId(x) && fits(x, b[j] as InlineComment)).length !== 1
-      )
+      if (unique && a.filter((x, k) => !of.has(k) && ok(x, b[j] as InlineComment)).length !== 1)
         return;
       taken.add(j);
       of.set(i, j);
       guessed++;
     });
-  guess((x, y) => same(x, y), false);
+  const withoutId = (x: InlineComment) => ({ ...x, id: undefined });
+  guess((x, y) => same(withoutId(x), withoutId(y)), false);
   guess(
     (x, y) => x.file === y.file && x.start_line === y.start_line && x.end_line === y.end_line,
     true,
