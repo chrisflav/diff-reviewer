@@ -7,20 +7,31 @@ import {
   formProblem,
   MAX_TRUSTED_REVIEWERS,
   mergeRepoSettings,
+  openConflicts,
   putBody,
   resolveRepoConflict,
   sameForm,
   type RepoConflict,
   type RepoForm,
+  type RepoPicks,
 } from "../repoSettings";
 import {
   dropRepoStash,
+  reopenRepo,
   rubricStashKey,
   stashRepo,
   unstashRepo,
   type RepoEdits,
   type StashedRepo,
 } from "../stash";
+
+/** A move onto a newer version that met conflicts: what it moved, and the sides picked. */
+interface Rebased {
+  from: number;
+  source: RepoEdits;
+  picks: RepoPicks;
+  conflicts: RepoConflict[];
+}
 import { UnsavedContext } from "../unsaved";
 import { useLoad } from "../useLoad";
 import { repoPath } from "./Calibration";
@@ -64,7 +75,9 @@ function RepoSettingsView({
   const fetch = useCallback(() => findRepo(owner, name), [owner, name]);
   const { data: repo, error, setError, setData: setRepo } = useLoad(fetch, onUnauthorized);
   const [edits, setEdits] = useState<RepoEdits | null>(null);
-  const [conflicts, setConflicts] = useState<RepoConflict[]>([]);
+  // Where a move onto a newer version met a setting both sides changed: the edits from before the
+  // move (kept, so that the conflicts can be worked out again after a reload) and the sides picked.
+  const [rebased, setRebased] = useState<Rebased | null>(null);
   const [moved, setMoved] = useState<string | null>(null);
   const [saved, setSaved] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -73,18 +86,24 @@ function RepoSettingsView({
   const [memoryOnly, setMemoryOnly] = useState(false);
   const [offer, setOffer] = useState<StashedRepo | null>(() => {
     const s = unstashRepo(key);
-    return s !== null && !sameForm(s.base, s.form) ? s : null;
+    return s !== null && (s.pending !== null || !sameForm(s.base, s.form)) ? s : null;
   });
 
   const base = useMemo(() => (repo === null ? null : formOf(repo)), [repo]);
   const form = edits?.form ?? base;
-  const dirty = edits !== null && (conflicts.length > 0 || !sameForm(edits.base, edits.form));
+  const open = rebased === null ? [] : openConflicts(rebased.conflicts, rebased.picks);
+  const dirty = edits !== null && (open.length > 0 || !sameForm(edits.base, edits.form));
 
-  // Kept in the tab's storage on every change, so that a 401 or a reload loses nothing.
+  // Kept in the tab's storage on every change, with the conflicts still open and the sides picked
+  // so far, so that a 401 or a reload loses nothing.
   useEffect(() => {
     if (edits === null) return;
-    setMemoryOnly(!stashRepo(edits));
-  }, [edits]);
+    const pending =
+      rebased !== null && openConflicts(rebased.conflicts, rebased.picks).length > 0
+        ? { from: rebased.from, source: rebased.source, picks: rebased.picks }
+        : null;
+    setMemoryOnly(!stashRepo(edits, pending));
+  }, [edits, rebased]);
 
   const unsaved = useContext(UnsavedContext);
   useEffect(() => {
@@ -136,7 +155,11 @@ function RepoSettingsView({
     setRepo(theirs);
     const t = formOf(theirs);
     const m = mergeRepoSettings(e.base, e.form, t);
-    setConflicts(m.conflicts);
+    setRebased(
+      m.conflicts.length > 0
+        ? { from: e.version, source: e, picks: {}, conflicts: m.conflicts }
+        : null,
+    );
     if (m.conflicts.length === 0 && sameForm(m.form, t)) {
       setEdits(null);
       dropRepoStash(key);
@@ -153,7 +176,7 @@ function RepoSettingsView({
 
   const save = () => {
     const sent = edits;
-    if (sent === null || conflicts.length > 0 || formProblem(sent.form) !== null) return;
+    if (sent === null || open.length > 0 || formProblem(sent.form) !== null) return;
     setBusy(true);
     setError(null);
     setMoved(null);
@@ -164,6 +187,7 @@ function RepoSettingsView({
       .then((r) => {
         setRepo(r);
         setEdits(null);
+        setRebased(null);
         dropRepoStash(key);
         setSaved(`Saved as version ${r.version}.`);
       })
@@ -186,24 +210,37 @@ function RepoSettingsView({
 
   const discard = () => {
     setEdits(null);
-    setConflicts([]);
+    setRebased(null);
     setMoved(null);
     dropRepoStash(key);
   };
 
   const pick = (c: RepoConflict, which: "mine" | "theirs") => {
     change((f) => resolveRepoConflict(f, c, which));
-    setConflicts((cs) => cs.filter((x) => x.field !== c.field));
+    setRebased((rb) => (rb === null ? rb : { ...rb, picks: { ...rb.picks, [c.field]: which } }));
   };
 
   const restore = () => {
     if (offer === null) return;
     setOffer(null);
-    if (offer.version === repo.version) {
-      setEdits({ repo: key, version: offer.version, base: offer.base, form: offer.form });
+    if (offer.pending === null) {
+      if (offer.version === repo.version)
+        setEdits({ repo: key, version: offer.version, base: offer.base, form: offer.form });
+      else mergeOnto(repo, offer);
       return;
     }
-    mergeOnto(repo, offer);
+    const back = reopenRepo(offer);
+    if (back === null || back.pending === null) {
+      // The open conflicts cannot be worked out again: the edits from before them are moved anew.
+      mergeOnto(repo, offer.pending.source);
+      return;
+    }
+    setEdits(back.edits);
+    setRebased({ ...back.pending, conflicts: back.conflicts });
+    if (offer.version !== repo.version)
+      setMoved(
+        `The settings are at version ${repo.version} now. Settle the conflicts below first; saving then moves your changes onto version ${repo.version}.`,
+      );
   };
 
   const add = (e: FormEvent) => {
@@ -281,15 +318,25 @@ function RepoSettingsView({
           {saved}
         </p>
       )}
-      {conflicts.map((c) => (
+      {(rebased?.conflicts ?? []).map((c) => (
         <fieldset key={c.field} className="conflict">
           <legend>{fieldLabel[c.field]}: changed here and elsewhere</legend>
           <label className="side">
-            <input type="radio" name={`pick-${c.field}`} onChange={() => pick(c, "mine")} />
+            <input
+              type="radio"
+              name={`pick-${c.field}`}
+              checked={rebased?.picks[c.field] === "mine"}
+              onChange={() => pick(c, "mine")}
+            />
             Keep mine: <span className="value data">{show(c, c.mine)}</span>
           </label>
           <label className="side">
-            <input type="radio" name={`pick-${c.field}`} onChange={() => pick(c, "theirs")} />
+            <input
+              type="radio"
+              name={`pick-${c.field}`}
+              checked={rebased?.picks[c.field] === "theirs"}
+              onChange={() => pick(c, "theirs")}
+            />
             Keep the other change: <span className="value data">{show(c, c.theirs)}</span>
           </label>
         </fieldset>
@@ -377,14 +424,14 @@ function RepoSettingsView({
           <span>
             Unsaved changes to the settings.
             {memoryOnly && " This tab cannot store them, so they are held in memory only."}
-            {conflicts.length > 0 && " Choose a side for each conflict above before saving."}
+            {open.length > 0 && " Choose a side for each conflict above before saving."}
             {problem !== null && <span className="warn"> {problem}</span>}
           </span>
           <span className="actions">
             <button
               type="button"
               onClick={save}
-              disabled={busy || conflicts.length > 0 || problem !== null}
+              disabled={busy || open.length > 0 || problem !== null}
             >
               Save settings
             </button>

@@ -1,6 +1,15 @@
 import { describe, expect, it } from "vitest";
 import type { AgentComment, HumanComment } from "./api";
-import { FEW, formatRatio, groupPairs, importState, isScore } from "./calibration";
+import {
+  decisionTable,
+  FEW,
+  formatRatio,
+  groupPairs,
+  importState,
+  isScore,
+  scoreScope,
+} from "./calibration";
+import { directLabel, runPoints } from "./components/RunChart";
 
 describe("formatRatio", () => {
   it("shows the denominator beside the percentage", () => {
@@ -141,5 +150,96 @@ describe("importState", () => {
     expect(importState({ status: "running", error: "reading #4: timeout" }).kind).toBe("retrying");
     expect(importState({ status: "running", error: null }).kind).toBe("active");
     expect(importState({ status: "failed", error: "rate limit" }).kind).toBe("ended");
+  });
+});
+
+describe("scoreScope", () => {
+  it("reads a score written without a scope as full, as Score.lean does", () => {
+    expect(scoreScope({})).toBe("full");
+    expect(scoreScope({ scope: null })).toBe("full");
+    expect(scoreScope({ scope: "partial" })).toBe("partial");
+  });
+});
+
+describe("decisionTable", () => {
+  const t = decisionTable([
+    { agent: "approve", human: "APPROVED", count: 3 },
+    { agent: "request_changes", human: "DISMISSED", count: 2 },
+    { agent: "approve", human: "CHANGES_REQUESTED", count: 1 },
+    { agent: "request_changes", human: "APPROVED", count: 1 },
+  ]);
+
+  it("puts the compared states first and marks the rest", () => {
+    expect(t.humans).toEqual([
+      { state: "APPROVED", compared: true },
+      { state: "CHANGES_REQUESTED", compared: true },
+      { state: "DISMISSED", compared: false },
+    ]);
+    expect(t.agents).toEqual(["approve", "request_changes"]);
+  });
+
+  it("counts compared cells apart from the rest: they add up to decisions.compared", () => {
+    expect(t.compared).toBe(5);
+    expect(t.notCompared).toBe(2);
+    expect(t.count("request_changes", "DISMISSED")).toBe(2);
+    expect(t.count("approve", "DISMISSED")).toBe(0);
+  });
+});
+
+describe("the chart's direct labels", () => {
+  const run = (
+    agg: Partial<{
+      matched: number;
+      agentComments: number;
+      humanComments: number;
+      precision: number | null;
+      recall: number | null;
+    }>,
+  ) => ({
+    id: "r",
+    owner: "o",
+    name: "n",
+    createdAt: "2026-10-01T00:00:00Z",
+    samples: 1,
+    jobs: {},
+    aggregate: {
+      matcherVersion: 1,
+      scored: 1,
+      commentsScored: 1,
+      staleScores: 0,
+      staleIncluded: false,
+      agentComments: 0,
+      humanComments: 0,
+      matched: 0,
+      precision: null,
+      recall: null,
+      byCategory: [],
+      bySeverity: [],
+      decisions: { compared: 0, agreed: 0, agreement: null, matrix: [] },
+      ...agg,
+    },
+  });
+
+  it("say 100% of a run whose every comment paired, from its own counts", () => {
+    const [p] = runPoints([
+      run({ matched: 4, agentComments: 4, humanComments: 5, precision: 1, recall: 0.8 }),
+    ]);
+    if (p === undefined) throw new Error("no point");
+    expect(directLabel(p, "precision")).toBe("precision 100%");
+    expect(directLabel(p, "recall")).toBe("recall 80%");
+  });
+
+  it("never say 0% of a run where something paired", () => {
+    const [p] = runPoints([
+      run({ matched: 1, agentComments: 3000, humanComments: 1, precision: 0.0003, recall: 1 }),
+    ]);
+    if (p === undefined) throw new Error("no point");
+    expect(directLabel(p, "precision")).toBe("precision 0.1%");
+  });
+
+  it("order the runs oldest first", () => {
+    const a = { ...run({}), id: "new", createdAt: "2026-10-02T00:00:00Z" };
+    const b = { ...run({}), id: "old", createdAt: "2026-09-01T00:00:00Z" };
+    expect(runPoints([a, b]).map((p) => p.id)).toEqual(["old", "new"]);
   });
 });

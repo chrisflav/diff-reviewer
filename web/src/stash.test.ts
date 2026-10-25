@@ -23,6 +23,9 @@ import {
 import {
   dropStash,
   reopen,
+  reopenRepo,
+  stashRepo,
+  unstashRepo,
   reopenRubric,
   rubricStashKey,
   stash,
@@ -222,5 +225,44 @@ describe("rubric stash", () => {
     const back = unstashRubric("o/n");
     expect(back?.pending).toBeNull();
     expect(reopenRubric(back!)?.rebased).toBeNull();
+  });
+});
+
+describe("repo settings stash", () => {
+  beforeEach(() => store.clear());
+  const base = { mode: "staged" as const, autoReview: false, trustedReviewers: ["alice"] };
+  const edits = {
+    repo: "o/n",
+    version: 4,
+    base: { ...base, mode: "direct" as const },
+    form: { ...base, mode: "direct" as const, trustedReviewers: ["alice", "bob"] },
+  };
+
+  it("gives back the edits, and none pending", () => {
+    expect(stashRepo(edits)).toBe(true);
+    const s = unstashRepo("o/n");
+    expect(s?.form).toEqual(edits.form);
+    expect(s?.pending).toBeNull();
+    expect(s === null ? null : reopenRepo(s)).toEqual({ edits, pending: null, conflicts: [] });
+  });
+
+  it("keeps the edits from before a move and the sides picked, with the edits", () => {
+    const source = { repo: "o/n", version: 3, base, form: { ...base, autoReview: true } };
+    expect(stashRepo(edits, { from: 3, source, picks: { mode: "theirs" } })).toBe(true);
+    const s = unstashRepo("o/n");
+    expect(s?.pending).toEqual({ from: 3, source, picks: { mode: "theirs" } });
+  });
+
+  it("restores the edits from before the move when its conflicts cannot be worked out again", () => {
+    // Moving `source` onto `edits.base` gives no conflict: the stash is not what this build makes.
+    const source = { repo: "o/n", version: 3, base, form: { ...base, autoReview: true } };
+    stashRepo(edits, { from: 3, source, picks: {} });
+    const s = unstashRepo("o/n");
+    expect(s === null ? "none" : reopenRepo(s)).toBeNull();
+  });
+
+  it("refuses a stash it cannot read", () => {
+    store.set("diff-reviewer:repo:o/n", JSON.stringify({ ...edits, savedAt: "t", pending: 3 }));
+    expect(unstashRepo("o/n")).toBeNull();
   });
 });

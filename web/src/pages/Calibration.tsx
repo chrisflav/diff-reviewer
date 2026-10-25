@@ -208,7 +208,7 @@ function Summary({
               <h3>By rubric version</h3>
               <p className="mute small-text">
                 The rubric version each job was reviewed against, newest first: whether a rubric
-                change moved the numbers.
+                change moved the numbers. Stale scores are {stale ? "counted" : "left out"}.
               </p>
               <div className="table-scroll">
                 <table>
@@ -409,7 +409,11 @@ function Runs({
         <p className="mute">No runs yet.</p>
       ) : (
         <>
-          {data.items.length > 1 && <RunChart runs={data.items} />}
+          {data.items.length > 1 && <RunChart runs={data.items} stale={stale} />}
+          <p className="mute small-text">
+            Each run's figures are of its own scores, deleted samples left out; stale scores are{" "}
+            {stale ? "counted" : "left out"}.
+          </p>
           <div className="table-scroll">
             <table>
               <thead>

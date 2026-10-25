@@ -1,4 +1,4 @@
-import { useId, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import type { CalibrationRun } from "../api";
 import { formatRatio } from "../calibration";
 import { Ratio } from "./Ratio";
@@ -29,7 +29,15 @@ export function runPoints(runs: CalibrationRun[]): RunPoint[] {
     }));
 }
 
-const W = 640;
+/** The label at a series' last point: its ratio, from the run's own counts. */
+export function directLabel(p: RunPoint, k: "precision" | "recall"): string {
+  const den = k === "precision" ? p.agentComments : p.humanComments;
+  return `${k} ${formatRatio(p.matched, den, p[k]).percent}`;
+}
+
+/** The widest the chart is drawn; narrower, it is drawn at the width it has, so text stays legible. */
+const MAX_W = 720;
+const MIN_W = 280;
 const H = 220;
 const PAD = { left: 44, right: 104, top: 12, bottom: 28 };
 
@@ -39,11 +47,24 @@ const PAD = { left: 44, right: 104, top: 12, bottom: 28 };
  * labelled at its last point, so that neither is told by its colour alone; a table beside it says
  * the same, with the denominators.
  */
-export function RunChart({ runs }: { runs: CalibrationRun[] }) {
+export function RunChart({ runs, stale }: { runs: CalibrationRun[]; stale: boolean }) {
   const pts = runPoints(runs);
   const titleId = useId();
   const descId = useId();
   const [hover, setHover] = useState<number | null>(null);
+  // Drawn at the width it is shown at, one unit a pixel: scaled down instead, its text would shrink
+  // past reading at phone width.
+  const box = useRef<HTMLElement>(null);
+  const [W, setW] = useState(640);
+  useEffect(() => {
+    const el = box.current;
+    if (el === null || typeof ResizeObserver === "undefined") return;
+    const fit = () => setW(Math.max(MIN_W, Math.min(MAX_W, Math.floor(el.clientWidth))));
+    fit();
+    const o = new ResizeObserver(fit);
+    o.observe(el);
+    return () => o.disconnect();
+  }, []);
   if (pts.length === 0) return null;
   const iw = W - PAD.left - PAD.right;
   const ih = H - PAD.top - PAD.bottom;
@@ -89,7 +110,7 @@ export function RunChart({ runs }: { runs: CalibrationRun[] }) {
   const step = pts.length > 1 ? iw / (pts.length - 1) : iw;
 
   return (
-    <figure className="run-chart">
+    <figure className="run-chart" ref={box}>
       <div className="legend" aria-hidden="true">
         <span className="key key-precision">
           <svg width="28" height="10" viewBox="0 0 28 10">
@@ -116,8 +137,8 @@ export function RunChart({ runs }: { runs: CalibrationRun[] }) {
       >
         <title id={titleId}>Precision and recall per run, oldest run first</title>
         <desc id={descId}>
-          {pts.length} {pts.length === 1 ? "run" : "runs"}. The table below gives every value with
-          its denominator.
+          {pts.length} {pts.length === 1 ? "run" : "runs"}, in the order they were started, evenly
+          spaced. The table below gives every value with its denominator.
         </desc>
         {[0, 0.25, 0.5, 0.75, 1].map((t) => (
           <g key={t}>
@@ -128,10 +149,10 @@ export function RunChart({ runs }: { runs: CalibrationRun[] }) {
           </g>
         ))}
         <text x={PAD.left} y={H - 8} className="axis">
-          oldest
+          first run
         </text>
         <text x={W - PAD.right} y={H - 8} className="axis" textAnchor="end">
-          newest
+          last run
         </text>
         {hover !== null && (
           <line x1={x(hover)} x2={x(hover)} y1={PAD.top} y2={PAD.top + ih} className="cross" />
@@ -158,15 +179,19 @@ export function RunChart({ runs }: { runs: CalibrationRun[] }) {
         ))}
         {lp !== null && (
           <text x={x(lp.i) + 8} y={lpY + 4} className="direct">
-            precision {formatRatio(0, 1, lp.v).percent}
+            {directLabel(pts[lp.i] as RunPoint, "precision")}
           </text>
         )}
         {lr !== null && (
           <text x={x(lr.i) + 8} y={lrY + 4} className="direct">
-            recall {formatRatio(0, 1, lr.v).percent}
+            {directLabel(pts[lr.i] as RunPoint, "recall")}
           </text>
         )}
       </svg>
+      <figcaption className="mute small-text">
+        The runs on this page of the list, oldest first, one step apart whatever the time between
+        them. Stale scores are {stale ? "counted" : "left out"}.
+      </figcaption>
       <p className="chart-tip small-text" aria-live="polite">
         {h === null ? (
           <span className="mute">Point at a run for its figures.</span>

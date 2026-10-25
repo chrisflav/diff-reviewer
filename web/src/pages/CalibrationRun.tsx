@@ -1,7 +1,7 @@
 import { useCallback } from "react";
 import { Link, useParams } from "react-router-dom";
 import { api, type CalibrationRunResult } from "../api";
-import { isScore, scopeMeans } from "../calibration";
+import { isScore, scopeMeans, scoreScope } from "../calibration";
 import {
   AggregateBreakdown,
   AggregateFigures,
@@ -119,10 +119,22 @@ function Flags({ r }: { r: CalibrationRunResult }) {
   );
 }
 
+function ScopeTag({ scope }: { scope: string | null }) {
+  if (scope === null) return null;
+  return (
+    <span className={`tag scope-${scope}`} title={scopeMeans[scope] ?? undefined}>
+      {scope}
+    </span>
+  );
+}
+
 function ResultRow({ owner, name, r }: { owner: string; name: string; r: CalibrationRunResult }) {
   const s = r.sample;
   const score = r.score;
-  const full = isScore(score) && score.scope === "full";
+  const full = isScore(score) && scoreScope(score) === "full";
+  // The scope the score was made with, and the sample's now when a later import changed it.
+  const scored = isScore(score) ? scoreScope(score) : null;
+  const now = s?.scope ?? null;
   return (
     <tr className={s?.deleted === true || r.scoreStale ? "dimmed" : undefined}>
       <td>
@@ -146,10 +158,11 @@ function ResultRow({ owner, name, r }: { owner: string; name: string; r: Calibra
         {r.error !== null && <div className="error small-text body">{r.error}</div>}
       </td>
       <td>
-        {s !== null && (
-          <span className={`tag scope-${s.scope}`} title={scopeMeans[s.scope] ?? undefined}>
-            {s.scope}
-          </span>
+        <ScopeTag scope={scored ?? now} />
+        {scored !== null && now !== null && now !== scored && (
+          <div className="small-text mute">
+            scored as {scored}; the sample is <ScopeTag scope={now} /> now
+          </div>
         )}
       </td>
       {score === null ? (
@@ -206,11 +219,11 @@ function ResultPairs({ r }: { r: CalibrationRunResult }) {
         <p className="mute">No score to show.</p>
       ) : (
         <>
-          {score.scope !== "full" && (
+          {scoreScope(score) !== "full" && (
             <p className="notice warn-notice small-text">
-              A <code>{score.scope}</code> sample:{" "}
-              {scopeMeans[score.scope] ?? "scored for its decision only."} The comments below are
-              shown, and not counted.
+              Scored as a <code>{scoreScope(score)}</code> sample:{" "}
+              {scopeMeans[scoreScope(score)] ?? "scored for its decision only."} The comments below
+              are shown, and not counted.
             </p>
           )}
           <p className="mute small-text">

@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 import type { AgentComment, CalibrationAggregate, CalibrationScore, HumanComment } from "../api";
-import { groupPairs, lines } from "../calibration";
+import { decisionTable, groupPairs, lines } from "../calibration";
 import { severityRank } from "../review";
 import { Ratio } from "./Ratio";
 import { CategoryTag, SeverityBadge } from "./Severity";
@@ -138,37 +138,42 @@ function Tally({
   );
 }
 
-/** The agent's decisions against the person's, as counts. */
+/**
+ * The agent's decisions against the person's, as counts. A state that stands for no decision
+ * (`DISMISSED`) is in the matrix but not compared: its column is marked, and left out of the
+ * agreement.
+ */
 function Matrix({ a }: { a: CalibrationAggregate }) {
-  const m = a.decisions.matrix;
-  const agents = [...new Set(m.map((c) => c.agent))].sort();
-  const humans = [...new Set(m.map((c) => c.human))].sort();
-  if (m.length === 0) return <p className="mute small-text">No decisions compared yet.</p>;
-  const count = (ag: string, h: string) =>
-    m.filter((c) => c.agent === ag && c.human === h).reduce((n, c) => n + c.count, 0);
+  const t = decisionTable(a.decisions.matrix);
+  if (t.agents.length === 0) return <p className="mute small-text">No decisions compared yet.</p>;
   return (
     <div className="table-scroll">
       <table className="tally">
-        <caption>Decisions: the agent's (rows) against the person's (columns)</caption>
+        <caption>
+          Decisions: the agent's (rows) against the person's (columns); {t.compared} compared
+          {t.notCompared > 0 &&
+            `, ${t.notCompared} not (the person's review stood for no decision)`}
+        </caption>
         <thead>
           <tr>
             <th scope="col">Agent \ person</th>
-            {humans.map((h) => (
-              <th key={h} scope="col" className="data">
-                {h}
+            {t.humans.map((h) => (
+              <th key={h.state} scope="col" className={h.compared ? "data" : "data mute"}>
+                {h.state}
+                {!h.compared && <span className="small-text"> (not compared)</span>}
               </th>
             ))}
           </tr>
         </thead>
         <tbody>
-          {agents.map((ag) => (
+          {t.agents.map((ag) => (
             <tr key={ag}>
               <th scope="row" className="data">
                 {ag}
               </th>
-              {humans.map((h) => (
-                <td key={h} className="data">
-                  {count(ag, h)}
+              {t.humans.map((h) => (
+                <td key={h.state} className={h.compared ? "data" : "data mute"}>
+                  {t.count(ag, h.state)}
                 </td>
               ))}
             </tr>

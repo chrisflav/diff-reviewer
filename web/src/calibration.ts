@@ -148,6 +148,11 @@ export function isScore(s: CalibrationScore | CalibrationUnscorable | null): s i
   return s !== null && !("unscorable" in s) && Array.isArray((s as CalibrationScore).pairs);
 }
 
+/** Whether a score's comments count: its scope is `full`, or it has none (written before scopes). */
+export function countsComments(s: CalibrationScore): boolean {
+  return scoreScope(s) === "full";
+}
+
 /** What an import is doing, for its status line. */
 export type ImportState =
   | { kind: "paused"; until: string | null; why: string }
@@ -169,6 +174,51 @@ export function importState(i: Pick<CalibrationImport, "status" | "error">): Imp
   if (paused !== null) return { kind: "paused", until: paused[1] ?? null, why };
   if (/rate limit/i.test(why)) return { kind: "rateLimited", why };
   return { kind: "retrying", why };
+}
+
+/** The scope a score was made with: one written without a scope is `full`, as `Score.lean` reads it. */
+export function scoreScope(s: { scope?: unknown }): string {
+  return typeof s.scope === "string" ? s.scope : "full";
+}
+
+/** The person's review states that stand for a decision: the others (`DISMISSED`) are not compared. */
+export const comparedStates = ["APPROVED", "CHANGES_REQUESTED", "COMMENTED"];
+
+/** The decision matrix as a table: rows the agent's decisions, columns the person's states. */
+export interface DecisionTable {
+  agents: string[];
+  /** Compared states first, in `comparedStates` order; the rest after, marked. */
+  humans: { state: string; compared: boolean }[];
+  count: (agent: string, human: string) => number;
+  /** The counts of compared cells, which add up to `decisions.compared`. */
+  compared: number;
+  /** The counts of the cells not compared. */
+  notCompared: number;
+}
+
+export function decisionTable(
+  matrix: { agent: string; human: string; count: number }[],
+): DecisionTable {
+  const agents = [...new Set(matrix.map((c) => c.agent))].sort();
+  const states = [...new Set(matrix.map((c) => c.human))];
+  const known = comparedStates.filter((h) => states.includes(h));
+  const other = states.filter((h) => !comparedStates.includes(h)).sort();
+  const count = (a: string, h: string) =>
+    matrix.filter((c) => c.agent === a && c.human === h).reduce((n, c) => n + c.count, 0);
+  const total = (compared: boolean) =>
+    matrix
+      .filter((c) => comparedStates.includes(c.human) === compared)
+      .reduce((n, c) => n + c.count, 0);
+  return {
+    agents,
+    humans: [
+      ...known.map((state) => ({ state, compared: true })),
+      ...other.map((state) => ({ state, compared: false })),
+    ],
+    count,
+    compared: total(true),
+    notCompared: total(false),
+  };
 }
 
 /** Whether an import is still going on (queued or running), and so can be cancelled. */

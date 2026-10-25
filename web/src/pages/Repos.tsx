@@ -1,7 +1,7 @@
 import { useEffect, useState, type FormEvent } from "react";
 import { Link } from "react-router-dom";
 import { api, ApiError, UnauthorizedError, type PostingMode, type Repo } from "../api";
-import { formOf, putBody, registerBody } from "../repoSettings";
+import { formOf, onlyAutoReviewChanged, putBody, registerBody } from "../repoSettings";
 import { rubricStashKey } from "../stash";
 import { useLoad } from "../useLoad";
 import { repoPath } from "./Calibration";
@@ -11,6 +11,7 @@ export function ReposPage({ onUnauthorized }: { onUnauthorized: () => void }) {
   const [slug, setSlug] = useState("");
   const [mode, setMode] = useState<PostingMode>("staged");
   const [autoReview, setAutoReview] = useState(false);
+  const [toggleError, setToggleError] = useState<string | null>(null);
 
   const fail = (err: unknown) => {
     if (err instanceof UnauthorizedError) onUnauthorized();
@@ -53,6 +54,11 @@ export function ReposPage({ onUnauthorized }: { onUnauthorized: () => void }) {
     <>
       <h1>Repositories</h1>
       {error !== null && <p className="error">{error}</p>}
+      {toggleError !== null && (
+        <p className="notice warn-notice" role="alert">
+          {toggleError}
+        </p>
+      )}
       <form className="inline" onSubmit={submit}>
         <input
           aria-label="Repository"
@@ -108,7 +114,20 @@ export function ReposPage({ onUnauthorized }: { onUnauthorized: () => void }) {
                   </td>
                   <td>{r.mode}</td>
                   <td>
-                    <AutoReviewToggle repo={r} onChanged={reload} onError={fail} />
+                    <AutoReviewToggle
+                      repo={r}
+                      onChanged={() => {
+                        setToggleError(null);
+                        reload();
+                      }}
+                      onError={(err) => {
+                        if (err instanceof ApiError && err.status === 409) {
+                          // Shown apart from the list's own error, which a reload clears.
+                          setToggleError(err.message);
+                          reload();
+                        } else fail(err);
+                      }}
+                    />
                   </td>
                   <td className="data">{(r.trustedReviewers ?? []).length}</td>
                   <td>
@@ -198,9 +217,11 @@ function AutoReviewToggle({
 
 /**
  * Turn `autoReview` to `want`, over the version listed. A 409 means the settings changed
- * elsewhere: they are read again, and the toggle is written over the new version, every other
- * setting as the other change left it, unless that change already set it to `want`. A second 409
- * is reported.
+ * elsewhere: they are read again. When only `autoReview` changed, the toggle is written over the
+ * new version (or not at all, when the other change already set it to `want`). When anything else
+ * changed (the mode, the trusted reviewers, a setting this version does not know), nothing is
+ * written: turning automatic reviews on may not be what the person wants of the settings as they
+ * are now, say in a repository that became `direct`. The 409 is reported, and the list reloaded.
  */
 async function toggleAutoReview(repo: Repo, want: boolean): Promise<void> {
   try {
@@ -214,6 +235,11 @@ async function toggleAutoReview(repo: Repo, want: boolean): Promise<void> {
     const key = rubricStashKey(repo.owner, repo.name);
     const now = (await api.repos()).find((r) => rubricStashKey(r.owner, r.name) === key);
     if (now === undefined) throw new ApiError(404, `${repo.owner}/${repo.name} is not registered`);
+    if (!onlyAutoReviewChanged(repo, now))
+      throw new ApiError(
+        409,
+        `The settings of ${repo.owner}/${repo.name} changed elsewhere since this page loaded them (now version ${now.version}), so automatic reviews were not turned ${want ? "on" : "off"}. The list is reloaded; look at the settings and try again.`,
+      );
     if (now.autoReview === want) return;
     await api.putRepoSettings(
       now.owner,

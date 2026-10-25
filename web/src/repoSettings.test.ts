@@ -5,6 +5,8 @@ import {
   formProblem,
   loginProblem,
   mergeRepoSettings,
+  onlyAutoReviewChanged,
+  openConflicts,
   putBody,
   resolveRepoConflict,
   type RepoForm,
@@ -121,5 +123,42 @@ describe("logins", () => {
     expect("problem" in addLogins(fifty, "one-more")).toBe(true);
     expect(formProblem(form({ trustedReviewers: [...fifty, "x"] }))).not.toBeNull();
     expect(formProblem(form({ trustedReviewers: fifty }))).toBeNull();
+  });
+});
+
+describe("onlyAutoReviewChanged", () => {
+  const read: Repo = {
+    owner: "o",
+    name: "n",
+    mode: "staged",
+    autoReview: false,
+    trustedReviewers: ["alice"],
+    version: 3,
+    createdAt: "x",
+    reviewHours: [9, 17],
+  };
+
+  it("allows the toggle over a write that changed autoReview alone", () => {
+    expect(onlyAutoReviewChanged(read, { ...read, autoReview: true, version: 4 })).toBe(true);
+    expect(onlyAutoReviewChanged(read, { ...read, version: 4 })).toBe(true);
+  });
+
+  it("refuses it over a write that changed the mode", () => {
+    expect(onlyAutoReviewChanged(read, { ...read, mode: "direct", version: 4 })).toBe(false);
+  });
+
+  it("refuses it over a write that changed the trusted reviewers or an unknown setting", () => {
+    expect(onlyAutoReviewChanged(read, { ...read, trustedReviewers: ["bob"], version: 4 })).toBe(
+      false,
+    );
+    expect(onlyAutoReviewChanged(read, { ...read, reviewHours: [8, 17], version: 4 })).toBe(false);
+  });
+});
+
+describe("openConflicts", () => {
+  it("leaves out the conflicts given a side", () => {
+    const cs = [{ field: "mode" as const, mine: "direct" as const, theirs: "staged" as const }];
+    expect(openConflicts(cs, {})).toEqual(cs);
+    expect(openConflicts(cs, { mode: "mine" })).toEqual([]);
   });
 });

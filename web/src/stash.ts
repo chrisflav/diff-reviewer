@@ -25,7 +25,12 @@ import {
   type RubricConflict,
   type RubricPick,
 } from "./rubric";
-import type { RepoForm } from "./repoSettings";
+import {
+  mergeRepoSettings,
+  type RepoConflict,
+  type RepoForm,
+  type RepoPicks,
+} from "./repoSettings";
 
 /** Edits as the job page holds them: made to `base`, the review at `version` of job `jobId`. */
 export interface Edits {
@@ -335,15 +340,40 @@ export interface RepoEdits {
   form: RepoForm;
 }
 
+/**
+ * The conflicts a move onto a newer version left open: the edits from before the move and the
+ * sides picked so far. The conflicts themselves are worked out again from these, since moving the
+ * same edits onto the same version always gives the same ones.
+ */
+export interface PendingRepo {
+  from: number;
+  source: RepoEdits;
+  picks: RepoPicks;
+}
+
 export interface StashedRepo extends RepoEdits {
   savedAt: string;
+  pending: PendingRepo | null;
 }
 
 const repoPrefix = "diff-reviewer:repo:";
 
-/** Keep the settings edits; false when they are held in memory only. */
-export function stashRepo(e: RepoEdits): boolean {
-  return put(repoPrefix + e.repo, () => ({ ...e, savedAt: new Date().toISOString() }));
+/** Keep the settings edits, and any conflicts still open; false when they are held in memory only. */
+export function stashRepo(e: RepoEdits, pending: PendingRepo | null = null): boolean {
+  return put(repoPrefix + e.repo, () => ({
+    ...e,
+    savedAt: new Date().toISOString(),
+    pending:
+      pending === null
+        ? null
+        : {
+            from: pending.from,
+            version: pending.source.version,
+            base: pending.source.base,
+            form: pending.source.form,
+            picks: pending.picks,
+          },
+  }));
 }
 
 function thawForm(j: unknown): RepoForm | null {
@@ -356,6 +386,30 @@ function thawForm(j: unknown): RepoForm | null {
   return { mode: f.mode, autoReview: f.autoReview, trustedReviewers: t as string[] };
 }
 
+function thawRepoPending(repo: string, j: unknown): PendingRepo | null | undefined {
+  if (j === null || j === undefined) return null;
+  if (typeof j !== "object") return undefined;
+  const p = j as Record<string, unknown>;
+  const base = thawForm(p.base);
+  const form = thawForm(p.form);
+  const picks = p.picks;
+  if (
+    typeof p.from !== "number" ||
+    typeof p.version !== "number" ||
+    base === null ||
+    form === null ||
+    typeof picks !== "object" ||
+    picks === null ||
+    !Object.values(picks).every((v) => v === "mine" || v === "theirs")
+  )
+    return undefined;
+  return {
+    from: p.from,
+    source: { repo, version: p.version, base, form },
+    picks: picks as RepoPicks,
+  };
+}
+
 export function unstashRepo(repo: string): StashedRepo | null {
   try {
     const text = sessionStorage.getItem(repoPrefix + repo);
@@ -363,18 +417,37 @@ export function unstashRepo(repo: string): StashedRepo | null {
     const j = JSON.parse(text) as Record<string, unknown>;
     const base = thawForm(j.base);
     const form = thawForm(j.form);
+    const pending = thawRepoPending(repo, j.pending);
     if (
       j.repo !== repo ||
       typeof j.version !== "number" ||
       typeof j.savedAt !== "string" ||
       base === null ||
-      form === null
+      form === null ||
+      pending === undefined
     )
       return null;
-    return { repo, version: j.version, base, form, savedAt: j.savedAt };
+    return { repo, version: j.version, base, form, savedAt: j.savedAt, pending };
   } catch {
     return null;
   }
+}
+
+/**
+ * The edits `s` kept, and the conflicts that were open: moving the edits from before the move onto
+ * `s.base` again gives the same conflicts, and the sides picked are in `s.form` already. `null`
+ * when that move no longer gives them (stored by another build): then the edits from before the
+ * move are what is left to restore.
+ */
+export function reopenRepo(
+  s: StashedRepo,
+): { edits: RepoEdits; pending: PendingRepo | null; conflicts: RepoConflict[] } | null {
+  const edits: RepoEdits = { repo: s.repo, version: s.version, base: s.base, form: s.form };
+  const p = s.pending;
+  if (p === null) return { edits, pending: null, conflicts: [] };
+  const m = mergeRepoSettings(p.source.base, p.source.form, s.base);
+  if (m.conflicts.length === 0) return null;
+  return { edits, pending: p, conflicts: m.conflicts };
 }
 
 export function dropRepoStash(repo: string) {

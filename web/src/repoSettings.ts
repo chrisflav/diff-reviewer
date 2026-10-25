@@ -8,6 +8,7 @@
  */
 
 import type { PostingMode, Repo, RepoSettings } from "./api";
+import { same } from "./review";
 
 /** The most trusted reviewers a repository names (`maxTrustedReviewers`). */
 export const MAX_TRUSTED_REVIEWERS = 50;
@@ -142,7 +143,9 @@ export interface RepoMerged {
  * added are added, those it removed are removed, and every other change of the other write is
  * kept, so that neither side's additions or removals are lost. A mode or `autoReview` both
  * changed to different values is a conflict, left at theirs until a side is picked: nothing is
- * overwritten unasked.
+ * overwritten unasked. With today's two-valued settings no conflict arises (two sides that both
+ * changed a setting from its base changed it to the same value); the page still asks, and keeps
+ * the sides picked across a reload, so that a setting of more values cannot be overwritten.
  */
 export function mergeRepoSettings(base: RepoForm, mine: RepoForm, theirs: RepoForm): RepoMerged {
   const conflicts: RepoConflict[] = [];
@@ -173,4 +176,29 @@ export function resolveRepoConflict(
   pick: "mine" | "theirs",
 ): RepoForm {
   return { ...form, [c.field]: pick === "mine" ? c.mine : c.theirs };
+}
+
+/** Which side of each conflict was picked, by field. */
+export type RepoPicks = Partial<Record<RepoConflict["field"], "mine" | "theirs">>;
+
+/** The conflicts of a merge not yet given a side. */
+export function openConflicts(conflicts: RepoConflict[], picks: RepoPicks): RepoConflict[] {
+  return conflicts.filter((c) => picks[c.field] === undefined);
+}
+
+/**
+ * Whether `now`, the settings read after a 409, differ from `read`, what the person saw, in
+ * `autoReview` alone (or not at all): the mode, the trusted reviewers and every other setting, a
+ * newer build's among them, as they were. Only then may a toggle of `autoReview` be written over
+ * `now` without asking: turning automatic reviews on is a different decision for a repository
+ * whose mode became `direct` meanwhile.
+ */
+export function onlyAutoReviewChanged(read: Repo, now: Repo): boolean {
+  const settings = (r: Repo) => {
+    const b: Record<string, unknown> = { ...putBody(r, formOf(r)) };
+    delete b.autoReview;
+    delete b.version;
+    return b;
+  };
+  return same(settings(read), settings(now));
 }
