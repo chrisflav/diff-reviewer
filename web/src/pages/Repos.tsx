@@ -1,7 +1,10 @@
 import { useEffect, useState, type FormEvent } from "react";
 import { Link } from "react-router-dom";
-import { api, UnauthorizedError, type PostingMode, type Repo } from "../api";
+import { api, ApiError, UnauthorizedError, type PostingMode, type Repo } from "../api";
+import { formOf, putBody, registerBody } from "../repoSettings";
+import { rubricStashKey } from "../stash";
 import { useLoad } from "../useLoad";
+import { repoPath } from "./Calibration";
 
 export function ReposPage({ onUnauthorized }: { onUnauthorized: () => void }) {
   const { data: repos, error, reload, setError } = useLoad(api.repos, onUnauthorized);
@@ -21,13 +24,29 @@ export function ReposPage({ onUnauthorized }: { onUnauthorized: () => void }) {
       setError("Name the repository as owner/name.");
       return;
     }
+    // Registering one listed already writes over the version listed, keeping what this form
+    // does not set; one registered meanwhile is a 409, not overwritten.
+    const listed = (repos ?? []).find(
+      (r) => rubricStashKey(r.owner, r.name) === rubricStashKey(owner, name),
+    );
+    const body =
+      listed === undefined
+        ? registerBody(mode, autoReview)
+        : putBody(listed, { ...formOf(listed), mode, autoReview });
     api
-      .putRepo(owner, name, mode, autoReview)
+      .putRepoSettings(owner, name, body)
       .then(() => {
         setSlug("");
         reload();
       })
-      .catch(fail);
+      .catch((err: unknown) => {
+        if (err instanceof ApiError && err.status === 409) {
+          setError(
+            `${owner}/${name} was registered or changed elsewhere since this page loaded it, so nothing was written: ${err.message}. The list is reloaded; register again to write over it.`,
+          );
+          reload();
+        } else fail(err);
+      });
   };
 
   return (
@@ -75,7 +94,8 @@ export function ReposPage({ onUnauthorized }: { onUnauthorized: () => void }) {
                 <th>Repository</th>
                 <th>Posting</th>
                 <th>Automatic</th>
-                <th>Rubric</th>
+                <th>Trusted reviewers</th>
+                <th>Pages</th>
                 <th>Registered</th>
                 <th />
               </tr>
@@ -90,13 +110,28 @@ export function ReposPage({ onUnauthorized }: { onUnauthorized: () => void }) {
                   <td>
                     <AutoReviewToggle repo={r} onChanged={reload} onError={fail} />
                   </td>
+                  <td className="data">{(r.trustedReviewers ?? []).length}</td>
                   <td>
-                    <Link
-                      to={`/repos/${encodeURIComponent(r.owner)}/${encodeURIComponent(r.name)}/rubric`}
-                      aria-label={`Rubric of ${r.owner}/${r.name}`}
-                    >
-                      Rubric
-                    </Link>
+                    <span className="links">
+                      <Link
+                        to={repoPath(r.owner, r.name)}
+                        aria-label={`Settings of ${r.owner}/${r.name}`}
+                      >
+                        Settings
+                      </Link>
+                      <Link
+                        to={`${repoPath(r.owner, r.name)}/rubric`}
+                        aria-label={`Rubric of ${r.owner}/${r.name}`}
+                      >
+                        Rubric
+                      </Link>
+                      <Link
+                        to={`${repoPath(r.owner, r.name)}/calibration`}
+                        aria-label={`Calibration of ${r.owner}/${r.name}`}
+                      >
+                        Calibration
+                      </Link>
+                    </span>
                   </td>
                   <td className="data mute">{r.createdAt}</td>
                   <td className="right">
@@ -143,9 +178,9 @@ function AutoReviewToggle({
         checked={on}
         disabled={asked !== null}
         onChange={(e) => {
-          setAsked(e.target.checked);
-          api
-            .putRepo(repo.owner, repo.name, repo.mode, e.target.checked)
+          const want = e.target.checked;
+          setAsked(want);
+          toggleAutoReview(repo, want)
             .then(onChanged)
             .catch((err: unknown) => {
               setAsked(null);
@@ -159,4 +194,31 @@ function AutoReviewToggle({
       {on ? "on" : "off"}
     </label>
   );
+}
+
+/**
+ * Turn `autoReview` to `want`, over the version listed. A 409 means the settings changed
+ * elsewhere: they are read again, and the toggle is written over the new version, every other
+ * setting as the other change left it, unless that change already set it to `want`. A second 409
+ * is reported.
+ */
+async function toggleAutoReview(repo: Repo, want: boolean): Promise<void> {
+  try {
+    await api.putRepoSettings(
+      repo.owner,
+      repo.name,
+      putBody(repo, { ...formOf(repo), autoReview: want }),
+    );
+  } catch (err) {
+    if (!(err instanceof ApiError && err.status === 409)) throw err;
+    const key = rubricStashKey(repo.owner, repo.name);
+    const now = (await api.repos()).find((r) => rubricStashKey(r.owner, r.name) === key);
+    if (now === undefined) throw new ApiError(404, `${repo.owner}/${repo.name} is not registered`);
+    if (now.autoReview === want) return;
+    await api.putRepoSettings(
+      now.owner,
+      now.name,
+      putBody(now, { ...formOf(now), autoReview: want }),
+    );
+  }
 }

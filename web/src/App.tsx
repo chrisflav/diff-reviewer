@@ -1,8 +1,12 @@
 import { useCallback, useContext, useEffect, useRef, useState, type FormEvent } from "react";
 import { createBrowserRouter, NavLink, Outlet, RouterProvider } from "react-router-dom";
 import { api, ApiError, NetworkError, UnauthorizedError } from "./api";
+import { CalibrationPage } from "./pages/Calibration";
+import { CalibrationRunPage } from "./pages/CalibrationRun";
+import { CalibrationSamplePage } from "./pages/CalibrationSample";
 import { JobsPage } from "./pages/Jobs";
 import { JobPage } from "./pages/Job";
+import { RepoSettingsPage } from "./pages/RepoSettings";
 import { ReposPage } from "./pages/Repos";
 import { RubricPage } from "./pages/Rubric";
 import { UnsavedContext } from "./unsaved";
@@ -52,6 +56,22 @@ function SignedIn({
           {
             path: "/repos/:owner/:name/rubric",
             element: <RubricPage onUnauthorized={onUnauthorized} />,
+          },
+          {
+            path: "/repos/:owner/:name",
+            element: <RepoSettingsPage onUnauthorized={onUnauthorized} />,
+          },
+          {
+            path: "/repos/:owner/:name/calibration",
+            element: <CalibrationPage onUnauthorized={onUnauthorized} />,
+          },
+          {
+            path: "/repos/:owner/:name/calibration/runs/:id",
+            element: <CalibrationRunPage onUnauthorized={onUnauthorized} />,
+          },
+          {
+            path: "/repos/:owner/:name/calibration/samples/:id",
+            element: <CalibrationSamplePage onUnauthorized={onUnauthorized} />,
           },
           { path: "*", element: <p className="mute">Nothing here.</p> },
         ],

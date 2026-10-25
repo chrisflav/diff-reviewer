@@ -25,6 +25,7 @@ import {
   type RubricConflict,
   type RubricPick,
 } from "./rubric";
+import type { RepoForm } from "./repoSettings";
 
 /** Edits as the job page holds them: made to `base`, the review at `version` of job `jobId`. */
 export interface Edits {
@@ -324,4 +325,62 @@ export function reopenRubric(s: StashedRubric): Reopened | null {
       source: p.source,
     },
   };
+}
+
+/** Unsaved settings of repository `repo` (`owner/name`): made to `base`, at `version`. */
+export interface RepoEdits {
+  repo: string;
+  version: number;
+  base: RepoForm;
+  form: RepoForm;
+}
+
+export interface StashedRepo extends RepoEdits {
+  savedAt: string;
+}
+
+const repoPrefix = "diff-reviewer:repo:";
+
+/** Keep the settings edits; false when they are held in memory only. */
+export function stashRepo(e: RepoEdits): boolean {
+  return put(repoPrefix + e.repo, () => ({ ...e, savedAt: new Date().toISOString() }));
+}
+
+function thawForm(j: unknown): RepoForm | null {
+  if (typeof j !== "object" || j === null) return null;
+  const f = j as Record<string, unknown>;
+  if (f.mode !== "staged" && f.mode !== "direct") return null;
+  if (typeof f.autoReview !== "boolean") return null;
+  const t = f.trustedReviewers;
+  if (!Array.isArray(t) || !t.every((l) => typeof l === "string")) return null;
+  return { mode: f.mode, autoReview: f.autoReview, trustedReviewers: t as string[] };
+}
+
+export function unstashRepo(repo: string): StashedRepo | null {
+  try {
+    const text = sessionStorage.getItem(repoPrefix + repo);
+    if (text === null) return null;
+    const j = JSON.parse(text) as Record<string, unknown>;
+    const base = thawForm(j.base);
+    const form = thawForm(j.form);
+    if (
+      j.repo !== repo ||
+      typeof j.version !== "number" ||
+      typeof j.savedAt !== "string" ||
+      base === null ||
+      form === null
+    )
+      return null;
+    return { repo, version: j.version, base, form, savedAt: j.savedAt };
+  } catch {
+    return null;
+  }
+}
+
+export function dropRepoStash(repo: string) {
+  try {
+    sessionStorage.removeItem(repoPrefix + repo);
+  } catch {
+    /* nothing to drop */
+  }
 }
