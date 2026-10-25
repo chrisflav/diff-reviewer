@@ -23,6 +23,10 @@ What `serve` does without being asked, on a loop every `--interval` seconds (`st
   * **following** — read each queued or running job's entry (and whatever entry continues it) and
     move the job to `running` when the run starts, or to `failed` when it ends without the agent
     having submitted a review.
+  * **settling** — every claim to post older than its window is settled as
+    `POST /api/v1/jobs/{id}/reconcile` would settle it (`settleClaims`): a post whose outcome was
+    unknown is not left holding its job until a person looks, which in a `direct` repository
+    nobody may do.
 
 And it drops the kept diffs no live job needs. On request: fetching a diff (`diffOf`, cached per
 commit) and posting an approved review (`postJob`), which a person asks for, or the agent's
@@ -121,9 +125,14 @@ review; follow them.
 names (`git fetch origin pull/{job.prNumber}/head && git checkout <headSha>`) and read the change \
 in context. `diff-reviewer agent diff {slug} {job.prNumber} --job {job.id}` prints the diff under \
 review.
-3. Write the review as a JSON file `\{\"headSha\": …, \"prType\": null, \"review\": …}` and \
-submit it with `diff-reviewer agent submit {slug} {job.prNumber} <file> --job {job.id}`. Fix what \
-it reports and submit again until it is accepted.
+3. Pick the pull request type, of the `prTypes` it printed, whose description fits the change, \
+and review the change by that type's `rubric` together with the `instructions` (with no `prTypes`, \
+by the `instructions` alone). Give every inline comment a `severity` (`nit`, `minor`, `major` or \
+`blocker`) and a `category`, one of that type's `categories` when it lists any.
+4. Write the review as a JSON file `\{\"headSha\": …, \"prType\": …, \"review\": …}`, with \
+`prType` the name of the type you picked (or null when there are no `prTypes`), and submit it with \
+`diff-reviewer agent submit {slug} {job.prNumber} <file> --job {job.id}`. Fix what it reports and \
+submit again until it is accepted.
 
 A review may carry at most {maxInlineComments} inline comments; merge or drop the least \
 important rather than exceed it.
@@ -136,8 +145,8 @@ def goal (job : Job) : String :=
   s!"`diff-reviewer agent submit {job.owner}/{job.name} {job.prNumber}` accepted a review of the \
 pull request."
 
-/-- How to review, in markdown: the `instructions` of `GET /api/agent/v1/…/pulls/{pr}`. M2 adds
-    the repository's rubrics. -/
+/-- How to review and how to write the review, in markdown: what every repository's
+    `instructions` start with (`instructionsFor`). -/
 def instructions : String :=
 "# Reviewing a pull request
 
@@ -153,24 +162,42 @@ not comment on what is fine.
 ```json
 {
   \"headSha\": \"<the headSha agent show printed>\",
-  \"prType\": null,
+  \"prType\": \"<the name of the pull request type you picked, or null>\",
   \"review\": {
     \"decision\": \"comment\",
     \"body\": \"The summary: what matters most, in a few sentences.\",
     \"comments\": [
       {\"file\": \"path/in/repo.lean\", \"start_line\": 10, \"end_line\": 12,
-       \"body\": \"Why this is a problem.\", \"suggestion\": \"optional replacement lines\"}
+       \"body\": \"Why this is a problem.\", \"suggestion\": \"optional replacement lines\",
+       \"category\": \"correctness\", \"severity\": \"major\"}
     ]
   }
 }
 ```
 
+- `prType` is the name of one of the `prTypes` listed with these instructions: the one whose
+  description fits the pull request. Review it by that type's `rubric` as well as by this text.
+  With no `prTypes` listed, it is `null`.
+- Every comment has a `severity`: `nit` (take it or leave it), `minor` (worth fixing), `major`
+  (should be fixed before merging) or `blocker` (must be). And a `category`: one of the picked
+  type's `categories` when it lists any, otherwise a word or two of your own for what the comment
+  is about.
 - `decision` is `comment`, `approve` or `request_changes`.
 - A comment's lines are line numbers of the file at the head commit (the right-hand side of the
   diff), and must lie in a hunk of the diff. `suggestion`, when given, replaces lines
   `start_line`..`end_line` exactly.
 - At most 200 inline comments: if you have more, merge related ones or drop the least important.
 - A review is posted only after the platform accepts it; a person may edit it first."
+
+/-- The `instructions` of `GET /api/agent/v1/…/pulls/{pr}`: how to review, then the repository's
+    default rubric, when it has one. The pull request types, each with its own rubric, are beside
+    them in `prTypes`. -/
+def instructionsFor (doc : Option Rubric) : String :=
+  match doc with
+  | some d =>
+    if d.defaultRubric.trimAscii.isEmpty then instructions
+    else instructions ++ "\n\n# The repository's rubric\n\n" ++ d.defaultRubric
+  | none => instructions
 
 /-! ## Pull request metadata and diffs -/
 
@@ -263,12 +290,30 @@ changes")
 does not let its author approve it or request changes")
   else (decision, none)
 
-/-- Mark `job` posted as `r`, GitHub's record of it. The job's own review is left as it is, which
-    the claim kept from being edited meanwhile. -/
+/-- What GitHub holds of job `job`'s review once posted as `r`, for the job's history: the job's
+    review with GitHub's body, without the marker, and the event it was posted as when that is
+    known. The comments are the job's: the claim kept them from being edited meanwhile. -/
+def postedRevision (job : Job) (r : GitHub.PostedReview) (event : Option Decision) : String :=
+  let m := marker job.id
+  let body :=
+    if r.body.endsWith ("\n\n" ++ m) then (r.body.dropEnd (m.length + 2)).toString
+    else if r.body.endsWith m then (r.body.dropEnd m.length).toString
+    else r.body
+  let base := (job.reviewRaw.bind (Json.parse · |>.toOption)).getD (.mkObj [])
+  let base := if base.getObj?.isOk then base else .mkObj []
+  let base := base.setObjVal! "body" body
+  (match event with
+    | some e => base.setObjVal! "decision" e.toJson
+    | none => base).compress
+
+/-- Mark `job` posted as `r`, GitHub's record of it, posted as `event` when that is known. The
+    job's own review is left as it is, which the claim kept from being edited meanwhile; what
+    GitHub holds is appended to its history. -/
 private def recordPosted (s : Services) (job : Job) (r : GitHub.PostedReview)
-    (note : Option String) : IO (Except PostError Job) := do
+    (note : Option String) (event : Option Decision := none) : IO (Except PostError Job) := do
   s.log s!"posted the review of {job.owner}/{job.name}#{job.prNumber} (job {job.id}): {r.url}"
-  match ← Platform.updateJob job.id fun j =>
+  let revision (j : Job) : Option (Author × String) := some (.github, postedRevision j r event)
+  match ← Platform.updateJob job.id (revision := revision) fun j =>
       return { j with statusRaw := JobStatus.posted.toString, error := none
                       postStartedAt := none, postedUrl := some r.url
                       postedReview := some r.toJson.compress, postNote := note }
@@ -309,7 +354,9 @@ def postJob (s : Services) (id : String) (version : Option Nat := none) (direct 
     if let .ok (_, d) ← diffOf s job then
       if let .error e := Diff.check review d then
         return .error (.conflict s!"job {id}'s review would be refused by GitHub: {e}")
-    let markPosted := recordPosted s job
+    let markPosted (r : GitHub.PostedReview) (note : Option String)
+        (event : Option Decision := none) : IO (Except PostError Job) :=
+      recordPosted s job r note event
     -- Leave the job to be posted again, with why; `keepClaim` while whether it was posted is
     -- still unknown, so that the next attempt waits out the claim and looks before it posts.
     let failed (why : String) (keepClaim : Bool) : IO (Except PostError Job) := do
@@ -350,13 +397,13 @@ could not be read to tell ({e.message})" true
         | .conflict why | .invalid why => .conflict why)
     match ← gh.postReview job.owner job.name job.prNumber (withMarker id review) (some head)
         (some event) with
-    | .ok r => markPosted r note
+    | .ok r => markPosted r note (some event)
     | .error (.definite why) => failed s!"posting failed: {why}" false
     | .error e =>
       -- No answer, or a 5xx: the review may yet appear. The claim is kept either way, until it is
       -- found or a later attempt, past the claim's window, has looked and not found it.
       match ← findPosted s gh job with
-      | .ok (some r) => markPosted r note
+      | .ok (some r) => markPosted r note (some event)
       | .ok none =>
         failed s!"posting may have failed ({e.message}); it is looked for again before the next \
 attempt" true
@@ -403,6 +450,8 @@ way; try again in a few minutes")
     | .error e =>
       let why := s!"GitHub's reviews could not be read to tell whether the post reached it \
 ({e.message}); the claim stands"
+      -- Written once: settling runs on every pass, and must not bump the version every pass.
+      if job.error == some why then return .error (.github why job)
       let recorded ← Platform.updateJob id fun j => return { j with error := some why }
       return .error (.github why (match recorded with | .ok j => j | .error _ => job))
   finally
@@ -582,6 +631,28 @@ def follow (s : Services) : IO Unit := do
         | some st => return { j with statusRaw := st.toString }
         | none => return j
 
+/-- Settling: every claim to post older than its window, settled as a person's
+    `POST /api/v1/jobs/{id}/reconcile` settles it — found on GitHub, the job is `posted`; not
+    found, the claim is cleared — and logged. A claim within its window may be a post under way,
+    and is left to it. -/
+def settleClaims (s : Services) : IO Unit := do
+  let some _ := s.github | return
+  let recent := isoOfEpoch ((← nowEpoch) - s.limits.postClaimSeconds)
+  for job in ← Platform.jobsWithStatus [.approved] do
+    let some started := job.postStartedAt | continue
+    if started > recent then continue
+    let what := s!"the post of job {job.id} ({job.owner}/{job.name}#{job.prNumber}, begun \
+{started})"
+    match ← reconcileJob s job.id job.version with
+    | .ok j =>
+      if j.status? == some .posted then
+        s.log s!"settled {what}: it reached GitHub, {j.postedUrl.getD "?"}; the job is posted"
+      else
+        s.log s!"settled {what}: it did not reach GitHub; the job is approved and free again"
+    | .error (.github why _) => s.logOnce s!"settle-{job.id}-{why}" s!"settling {what}: {why}"
+    -- Moved meanwhile, or being posted right now: nothing to settle on this pass.
+    | .error _ => pure ()
+
 /-- One pass of the loop. A step that throws is logged, and the next step still runs. -/
 def tick (s : Services) : IO Unit := do
   let prune : IO Unit := do
@@ -589,7 +660,8 @@ def tick (s : Services) : IO Unit := do
     let n ← Platform.pruneDiffs before
     if n > 0 then s.log s!"dropped {n} kept diff(s)"
   for (what, step) in [("discovery", discover s), ("queueing", queuePending s),
-                       ("following", follow s), ("pruning diffs", prune)] do
+                       ("following", follow s), ("settling claims", settleClaims s),
+                       ("pruning diffs", prune)] do
     try step catch e => s.log s!"{what}: {e}"
 
 /-- Run `tick` every `interval` seconds, on a thread of its own, for as long as the process. A pass

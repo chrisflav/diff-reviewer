@@ -134,8 +134,10 @@ def agentReq (method : Std.Http.Method) (suffix : String) (body : String := "")
     (pr : Nat := 7) : Req :=
   req method s!"/api/agent/v1/repos/acme/widgets/pulls/{pr}{suffix}" body (token := agentToken)
 
-def submission (head : String) (review : String := fine) : String :=
-  s!"\{\"headSha\": \"{head}\", \"prType\": \"feature\", \"review\": {review}}"
+/-- A submission of `review` at `head`; `prType` is JSON, `null` for a repository without pull
+    request types. -/
+def submission (head : String) (review : String := fine) (prType : String := "null") : String :=
+  s!"\{\"headSha\": \"{head}\", \"prType\": {prType}, \"review\": {review}}"
 
 private def putRepo (st : State) (body : String) : IO Unit := do
   let _ ← route st (req .put "/api/v1/repos/acme/widgets" body)
@@ -196,6 +198,8 @@ def anAgentReviewsAndItIsPosted : Test := withTempDb do
   let svc ← services gh orch logs
   let st ← State.new cfg svc
   putRepo st "{\"mode\": \"staged\"}"
+  let _ ← route st (req .put "/api/v1/repos/acme/widgets/rubrics"
+    "{\"version\": 0, \"prTypes\": [{\"name\": \"feature\"}]}")
   -- A job asked for without a head: queueing reads it from GitHub.
   let created ← route st (req .post "/api/v1/jobs"
     "{\"owner\": \"acme\", \"name\": \"widgets\", \"prNumber\": 7}")
@@ -204,16 +208,17 @@ def anAgentReviewsAndItIsPosted : Test := withTempDb do
   Workers.queuePending svc
   let queued ← orch.queued.get
   let some q := queued[0]? | return #["nothing was queued"]
-  let early ← route st (agentReq .post "/review" (submission headA))
+  let feature := "\"feature\""
+  let early ← route st (agentReq .post "/review" (submission headA (prType := feature)))
   let shown ← route st (agentReq .get "")
   let diff ← route st (agentReq .get "/diff")
   let diff2 ← route st (agentReq .get "/diff")
   let other ← route st (agentReq .get "" (pr := 8))
-  let wrongHead ← route st (agentReq .post "/review" (submission headB))
+  let wrongHead ← route st (agentReq .post "/review" (submission headB (prType := feature)))
   let invalid ← route st (agentReq .post "/review" (submission headA
     "{\"decision\": \"comment\", \"body\": \"\", \"comments\": [{\"file\": \"A.lean\", \"start_line\": 0, \"end_line\": 0, \"body\": \"x\"}]}"))
-  let submitted ← route st (agentReq .post "/review" (submission headA))
-  let again ← route st (agentReq .post "/review" (submission headA))
+  let submitted ← route st (agentReq .post "/review" (submission headA (prType := feature)))
+  let again ← route st (agentReq .post "/review" (submission headA (prType := feature)))
   let afterSubmit ← route st (agentReq .get "")
   let job ← route st (req .get s!"/api/v1/jobs/{id}")
   let approved ← route st (req .post s!"/api/v1/jobs/{id}/status"

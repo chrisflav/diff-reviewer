@@ -415,8 +415,23 @@ it is left as it is")
 {job.version}); reload it")
   return st
 
+/-- The rubric a job's review is checked against: the version it was reviewed against, if it was,
+    and otherwise the repository's current one; `none` when there is none. An error when that
+    version cannot be read by this build. -/
+private def rubricOfJob (job : Job) : IO (Except String (Option Rubric)) := do
+  let version? ← match job.rubricVersion with
+    | some v => Platform.rubricAt job.owner job.name v
+    | none => Platform.currentRubric job.owner job.name
+  match version? with
+  | none => return .ok none
+  | some v => return (v.rubric?.map some).mapError fun e =>
+    s!"the rubric of {job.owner}/{job.name} (version {v.version}) cannot be read by this build \
+({e})"
+
 /-- Replace a job's review. The body is `{"version": n, "review": {...}}`. Editing makes the job a
-    draft again — an approval was of the review as it was. -/
+    draft again — an approval was of the review as it was. The categories are checked against the
+    rubric the job was reviewed against, comments without an id are given one, and the review is
+    appended to the job's history as a person's. -/
 private def putReview (id body : String) : IO Reply := do
   let j ← match parseBody body with
     | .ok j => pure j
@@ -428,7 +443,15 @@ private def putReview (id body : String) : IO Reply := do
     | .ok r => pure r
     | .error e => return .error s!"'review' is not a review: {e}" .badRequest
   if let .error e := review.validate then return .error s!"'review': {e}" .badRequest
-  updateReply <$> Platform.updateJob id fun job => do
+  let some job ← Platform.findJob id | return .error "not found" .notFound
+  match ← rubricOfJob job with
+  | .error e => return .error e .conflict
+  | .ok doc =>
+    let allowed := (doc.map (·.categoriesFor job.prType)).getD []
+    if let .error e := review.checkCategories allowed then
+      return .error s!"'review': {e}" .badRequest
+  let review ← review.assignIds
+  updateReply <$> Platform.updateJob id (revision := Job.revisionBy .person) fun job => do
     let st ← current job version
     if let some why := job.claimBlocks then throw (.conflict why)
     unless st.personCanEdit do
@@ -511,6 +534,27 @@ private def diffReply (st : State) (job : Job) (text : Bool) : IO Reply := do
   | .error (.tooLarge why) => return .error why .payloadTooLarge
   | .error (.github why) => return .error s!"the diff could not be read: {why}" .badGateway
 
+/-- Replace a repository's rubric document. The body is the whole document, `{"version": n,
+    "defaultRubric": …, "prTypes": [...]}`, with `version` the one last read (0 when there was
+    none); it becomes version `n + 1`, and version `n` stays in the history. -/
+private def putRubric (owner name body : String) : IO Reply := do
+  if (← Platform.findRepo owner name).isNone then return .error "not found" .notFound
+  let j ← match parseBody body with
+    | .ok j => pure j
+    | .error e => return .error e .badRequest
+  let some version := (j.getObjValAs? Nat "version").toOption
+    | return .error "the body must carry the rubric's 'version', as last read (0 for none)"
+        .badRequest
+  let doc ← match Rubric.ofJson j with
+    | .ok d => pure d
+    | .error e => return .error e .badRequest
+  if let .error e := doc.validate then return .error e .badRequest
+  match ← Platform.putRubric owner name version doc with
+  | .ok v => return .json v.toJson
+  | .error .notFound => return .error "not found" .notFound
+  | .error (.conflict why) => return .error why .conflict
+  | .error (.invalid why) => return .error why .badRequest
+
 /-- Every route under `/api/v1/`, with the methods it answers. `DiffReviewerTest.Server` checks
     this against `docs/openapi.json`, so a route without a spec entry fails the suite. -/
 def apiRoutes : Array (String × Array String) :=
@@ -522,7 +566,10 @@ def apiRoutes : Array (String × Array String) :=
     ("jobs/{id}/status",         #["post"]),
     ("jobs/{id}/post",           #["post"]),
     ("jobs/{id}/reconcile",      #["post"]),
-    ("jobs/{id}/diff",           #["get"])]
+    ("jobs/{id}/diff",           #["get"]),
+    ("jobs/{id}/revisions",      #["get"]),
+    ("repos/{owner}/{name}/rubrics",         #["get", "put"]),
+    ("repos/{owner}/{name}/rubrics/history", #["get"])]
 
 private def apiRoute (st : State) (r : Req) (segs : List String) : IO Reply := do
   match segs, r.method with
@@ -547,9 +594,24 @@ private def apiRoute (st : State) (r : Req) (segs : List String) : IO Reply := d
     match ← Platform.findJob id with
     | some j => diffReply st j (text := false)
     | none   => return .error "not found" .notFound
+  | ["jobs", id, "revisions"], .get =>
+    if (← Platform.findJob id).isNone then return .error "not found" .notFound
+    return .json (items ((← Platform.revisions id).map (·.toJson)))
+  | ["repos", owner, name, "rubrics"], .get =>
+    let (owner, name) := (owner.toLower, name.toLower)
+    if (← Platform.findRepo owner name).isNone then return .error "not found" .notFound
+    match ← Platform.currentRubric owner name with
+    | some v => return .json v.toJson
+    | none => return .json (RubricVersion.none owner name)
+  | ["repos", owner, name, "rubrics"], .put => putRubric owner.toLower name.toLower r.body
+  | ["repos", owner, name, "rubrics", "history"], .get =>
+    let (owner, name) := (owner.toLower, name.toLower)
+    if (← Platform.findRepo owner name).isNone then return .error "not found" .notFound
+    return .json (items ((← Platform.rubricHistory owner name).map (·.toJson)))
   | ["repos"], _ | ["repos", _, _], _ | ["jobs"], _ | ["jobs", _], _
   | ["jobs", _, "review"], _ | ["jobs", _, "status"], _ | ["jobs", _, "post"], _
-  | ["jobs", _, "reconcile"], _
+  | ["jobs", _, "reconcile"], _ | ["jobs", _, "revisions"], _
+  | ["repos", _, _, "rubrics"], _ | ["repos", _, _, "rubrics", "history"], _
   | ["jobs", _, "diff"], _ =>
     return .error "method not allowed" .methodNotAllowed
   | _, _ => return .error "not found" .notFound
@@ -591,27 +653,48 @@ private def activeJob (owner name : String) (pr : Nat) (jobId : Option String) :
     | _ => return .error (Reply.error s!"{active.size} reviews of {owner}/{name}#{pr} are being \
 run; name yours with --job" .conflict)
 
-private def agentJobJson (job : Job) : Json :=
+/-- The repository's current rubric, as its version and document: `none` when it has none, and a
+    `409` reply when this build cannot read it — the agent is not to review by a default the
+    repository never wrote. -/
+private def agentRubric (job : Job) : IO (Except Reply (Option (Nat × Rubric))) := do
+  match ← Platform.currentRubric job.owner job.name with
+  | none => return .ok none
+  | some v => match v.rubric? with
+    | .ok d => return .ok (some (v.version, d))
+    | .error e => return .error (.error s!"the rubric of {job.owner}/{job.name} (version \
+{v.version}) cannot be read by this build ({e}); the review waits for it to be fixed" .conflict)
+
+private def agentJobJson (job : Job) (rubric : Option (Nat × Rubric)) : Json :=
+  let doc := rubric.map (·.2)
   .mkObj [("jobId", job.id), ("owner", job.owner), ("name", job.name), ("prNumber", job.prNumber),
           ("headSha", (job.headSha.map Json.str).getD .null),
           ("baseSha", (job.baseSha.map Json.str).getD .null),
           ("title", job.title.getD ""), ("body", job.prBody.getD ""),
-          ("status", job.statusRaw), ("instructions", Workers.instructions),
-          ("prTypes", .arr #[]), ("examples", .arr #[])]
+          ("status", job.statusRaw), ("instructions", Workers.instructionsFor doc),
+          ("prTypes", .arr (((doc.map (·.prTypes)).getD []).map PrType.toJson).toArray),
+          ("rubricVersion", (rubric.map fun (v, _) => (v : Json)).getD .null),
+          ("examples", .arr #[])]
 
 /-- The first read of a queued job is the run starting: it moves to `running`. -/
 private def agentShow (job : Job) : IO Reply := do
-  if job.status? != some .queued then return .json (agentJobJson job)
+  let rubric ← match ← agentRubric job with
+    | .ok r => pure r
+    | .error reply => return reply
+  if job.status? != some .queued then return .json (agentJobJson job rubric)
   match ← Platform.updateJob job.id fun j => do
       unless j.status? == some .queued do return j
       return { j with statusRaw := JobStatus.running.toString }
   with
-  | .ok j => return .json (agentJobJson j)
+  | .ok j => return .json (agentJobJson j rubric)
   | .error _ => return .error "not found" .notFound
 
 /-- The agent's review. The body is `{"headSha", "prType", "review"}`; the job must be running and
-    at that head. A `direct` repository's review is then posted at once; if that fails the job is
-    left `approved` with the reason, for a person to post again, and the submission still stands. -/
+    at that head. `prType` must be a type of the repository's current rubric (or `null` when it
+    names none) and every comment's category one of that type's; the job records the type and the
+    rubric's version, comments without an id are given one, and the review is the first revision
+    of the job's history. A `direct` repository's review is then posted at once; if that fails the
+    job is left `approved` with the reason, for a person to post again, and the submission still
+    stands. -/
 private def agentSubmit (st : State) (job : Job) (body : String) : IO Reply := do
   let j ← match parseBody body with
     | .ok j => pure j
@@ -626,18 +709,27 @@ private def agentSubmit (st : State) (job : Job) (body : String) : IO Reply := d
     | .ok r => pure r
     | .error e => return .error s!"'review' is not a review: {e}" .badRequest
   if let .error e := review.validate then return .error s!"'review': {e}" .badRequest
+  let rubric ← match ← agentRubric job with
+    | .ok r => pure r
+    | .error reply => return reply
+  let doc := (rubric.map (·.2)).getD {}
+  if let .error e := doc.checkPrType prType then return .error e .badRequest
+  if let .error e := review.checkCategories (doc.categoriesFor prType) then
+    return .error s!"'review': {e}" .badRequest
   -- GitHub refuses a comment off the diff; the agent is told now, while it can still fix it.
   if let .ok (_, d) ← Workers.diffOf st.services job then
     if let .error e := Diff.check review d then return .error s!"'review': {e}" .badRequest
+  let review ← review.assignIds
   let headSha := headSha.toLower
-  let drafted ← Platform.updateJob job.id fun j => do
+  let drafted ← Platform.updateJob job.id (revision := Job.revisionBy .agent) fun j => do
     unless j.status? == some .running do
       throw (.conflict s!"job {j.id} is {j.statusRaw}, not running; run `diff-reviewer agent \
 show` first")
     unless j.headSha == some headSha do
       throw (.conflict s!"the review is of {headSha}, but job {j.id} is of \
 {j.headSha.getD "no commit"}")
-    return { j.setReview review with statusRaw := JobStatus.draft.toString, prType, error := none }
+    return { j.setReview review with statusRaw := JobStatus.draft.toString, prType, error := none
+                                     rubricVersion := rubric.map (·.1) }
   let job ← match drafted with
     | .ok j => pure j
     | .error e => return updateReply (.error e)
