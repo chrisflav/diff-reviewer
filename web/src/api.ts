@@ -52,6 +52,21 @@ export interface Repo {
   autoReview: boolean;
   /** The GitHub logins, in lower case, whose past reviews calibration scores the agent against. */
   trustedReviewers: string[];
+  /**
+   * How the repository's reviews are written, in markdown (at most 16 KiB): the agent's
+   * instructions end with it. Empty for none. Absent from a server older than API 0.6.0.
+   */
+  styleNotes?: string;
+  /**
+   * The percent of new calibration samples held out as `eval` (what runs measure by); the rest
+   * are the `pool` examples and proposals learn from. Absent before API 0.6.0.
+   */
+  evalShare?: number;
+  /**
+   * The version of the style notes, 0 before any; each records what it was derived from. Absent
+   * before API 0.6.0.
+   */
+  styleNotesVersion?: number;
   /** Incremented by every write of the settings; sent back to have a stale write refused (409). */
   version: number;
   createdAt: string;
@@ -68,6 +83,12 @@ export interface RepoSettings {
   mode?: PostingMode;
   autoReview?: boolean;
   trustedReviewers?: string[];
+  /** Kept when left out; an empty string clears them. */
+  styleNotes?: string;
+  /** 0 to 100; kept when left out. Changes only the pull requests split after it. */
+  evalShare?: number;
+  /** The rubric proposal the style notes written were taken from: records its provenance. */
+  fromProposal?: string;
   version?: number;
   [field: string]: unknown;
 }
@@ -129,6 +150,13 @@ export interface RubricDocument {
   defaultRubric: string | null;
   prTypes: PrType[] | null;
   documentError: string | null;
+  /**
+   * The calibration samples this version was derived from (an accepted proposal's context, and
+   * every earlier version's). Absent before API 0.6.0.
+   */
+  derivedFrom?: string[];
+  /** The pull requests (`owner/name#pr`) it was derived from. Absent before API 0.6.0. */
+  derivedFromPulls?: string[];
   [field: string]: unknown;
 }
 
@@ -194,9 +222,12 @@ export interface Job {
   /** The calibration sample and run of a `calibration` job. */
   sampleId?: string | null;
   runId?: string | null;
+  /** The style notes version the agent was given when it read the job (API 0.6.0). */
+  notesVersion?: number | null;
 }
 
-export type JobKind = "review" | "calibration";
+/** `proposal`: a rubric proposal of the repository (`prNumber` 0), never posted (API 0.6.0). */
+export type JobKind = "review" | "calibration" | "proposal";
 
 /** A trusted reviewer's inline comment, on the new side of the diff at the review's commit. */
 export interface HumanComment {
@@ -239,6 +270,14 @@ export interface CalibrationSample {
   importedAt: string;
   /** When a review was last merged into it. */
   updatedAt: string;
+  /** Deleted: listed only when asked (`includeDeleted`). Absent before API 0.6.0. */
+  deleted?: boolean;
+  deletedAt?: string | null;
+  /**
+   * `eval` (held out: what runs measure by) or `pool` (what examples and proposals learn from),
+   * fixed once assigned; null until then. Absent before API 0.6.0.
+   */
+  split?: "eval" | "pool" | null;
 }
 
 export type CalibrationScope = "full" | "partial" | "decision";
@@ -266,6 +305,11 @@ export interface CalibrationImport {
    * resets, an error to retry), or why it failed.
    */
   error: string | null;
+  /**
+   * When GitHub's rate limit resets, while the import waits for it (refused for the limit, or
+   * paused under the reserve); null otherwise. Absent before API 0.6.0.
+   */
+  resetAt?: string | null;
   requestedAt: string;
   updatedAt: string;
 }
@@ -329,6 +373,12 @@ export interface CalibrationAggregate {
   /** Stale scores in scope, and whether they are counted (`?stale=include`). */
   staleScores: number;
   staleIncluded: boolean;
+  /**
+   * Scores of samples the rubric version (or the style notes) were derived from, and whether
+   * they are counted (`?derived=include`). Absent before API 0.6.0.
+   */
+  derivedScores?: number;
+  derivedIncluded?: boolean;
   agentComments: number;
   humanComments: number;
   matched: number;
@@ -366,6 +416,8 @@ export interface CalibrationRunResult {
   score: CalibrationScore | CalibrationUnscorable | null;
   /** A review joined the sample after the score was made; the score is kept as it was. */
   scoreStale: boolean;
+  /** The score is of a sample its rubric version learned from: left out of the aggregate. */
+  scoreDerived?: boolean;
 }
 
 export interface CalibrationRun {
@@ -389,6 +441,71 @@ export interface CalibrationSummary {
   overall: CalibrationAggregate;
   /** Newest rubric version first; 0 is no rubric. */
   byRubricVersion: { rubricVersion: number | null; aggregate: CalibrationAggregate }[];
+}
+
+export type RubricProposalStatus = "pending" | "accepted" | "rejected";
+
+/** `{before, after}` of a text a proposal changes; null when unchanged. */
+export type TextChange = { before: string; after: string } | null;
+
+/** What a proposal changes of the rubric version it was written from. */
+export interface RubricProposalDiff {
+  defaultRubric: TextChange;
+  typesAdded: PrType[];
+  /** Their names. */
+  typesRemoved: string[];
+  typesChanged: {
+    name: string;
+    description: TextChange;
+    rubric: TextChange;
+    categoriesAdded: Category[];
+    categoriesRemoved: string[];
+    /** Categories whose description changed. */
+    categoriesChanged: { name: string; before: string; after: string }[];
+  }[];
+  /** Null when the proposal proposes no style notes, or the same. */
+  styleNotes: TextChange;
+}
+
+/** A rubric document an agent proposed from the calibration data, for a person to decide. */
+export interface RubricProposal {
+  id: string;
+  owner: string;
+  name: string;
+  /** The `proposal` job that wrote it. */
+  jobId: string;
+  status: RubricProposalStatus | string;
+  /** The rubric version it was written from; 0 for none. */
+  baseVersion: number;
+  /** The rubric's version now. */
+  currentVersion: number;
+  /** Pending, and the rubric has moved since its base: accepting is a 409; rebase in the editor. */
+  rebaseNeeded: boolean;
+  /** Why, in markdown. */
+  rationale: string;
+  proposesStyleNotes: boolean;
+  createdAt: string;
+  decidedAt: string | null;
+  /** The rubric version accepting it wrote. */
+  acceptedVersion: number | null;
+  /** Only in the answer for one proposal. */
+  document?: { defaultRubric: string; prTypes: PrType[]; [field: string]: unknown } | null;
+  documentError?: string | null;
+  styleNotes?: string | null;
+  /** The repository's style notes when it was submitted, when it proposes some. */
+  baseStyleNotes?: string | null;
+  diff?: RubricProposalDiff | null;
+  diffError?: string | null;
+}
+
+/**
+ * The body of a 409 from accepting a proposal whose base the rubric has moved on from (or that was
+ * read at an older version): both versions, for a rebase in the editor. On `ApiError.body`.
+ */
+export interface ProposalMoved {
+  error: string;
+  baseVersion: number;
+  currentVersion: number;
 }
 
 export interface JobDiff {
@@ -446,6 +563,9 @@ export const api = {
   logout: () => request<{ authenticated: boolean }>("POST", "/api/logout"),
 
   repos: () => request<{ items: Repo[] }>("GET", "/api/v1/repos").then((r) => r.items),
+  /** One repository, with its settings and their version (API 0.6.0). */
+  repo: (owner: string, name: string) =>
+    request<Repo>("GET", `/api/v1/repos/${seg(owner)}/${seg(name)}`),
   /**
    * Write the settings named; see `RepoSettings` for what an omitted one does. Callers send the
    * `version` they read (0 to register), so that a write over a newer one is a 409; `putBody` in
@@ -456,7 +576,7 @@ export const api = {
   deleteRepo: (owner: string, name: string) =>
     request<void>("DELETE", `/api/v1/repos/${seg(owner)}/${seg(name)}`),
 
-  /** Review jobs, unless `kind` asks for calibration jobs or all. */
+  /** Review jobs, unless `kind` asks for calibration or proposal jobs, or all. */
   jobs: (kind: JobKind | "all" = "review") =>
     request<{ items: Job[] }>("GET", `/api/v1/jobs?kind=${kind}`).then((r) => r.items),
   job: (id: string) => request<Job>("GET", `/api/v1/jobs/${seg(id)}`),
@@ -484,16 +604,22 @@ export const api = {
 
   rubrics: (owner: string, name: string) =>
     request<RubricDocument>("GET", `/api/v1/repos/${seg(owner)}/${seg(name)}/rubrics`),
-  /** Replace the whole document; `version` is the one last read (0 for none). */
+  /**
+   * Replace the whole document; `version` is the one last read (0 for none). `fromProposal` names
+   * the rubric proposal it was rebased from: the version records its provenance, and the
+   * proposal is accepted (API 0.6.0).
+   */
   putRubrics: (
     owner: string,
     name: string,
     version: number,
     doc: { defaultRubric: string; prTypes: PrType[]; [field: string]: unknown },
+    fromProposal?: string,
   ) =>
     request<RubricDocument>("PUT", `/api/v1/repos/${seg(owner)}/${seg(name)}/rubrics`, {
       version,
       ...doc,
+      ...(fromProposal === undefined ? {} : { fromProposal }),
     }),
   /** One page of the versions of the document, newest first. */
   rubricHistory: (owner: string, name: string, limit = 50, offset = 0) =>
@@ -540,11 +666,22 @@ export const api = {
       "GET",
       `${calibration(owner, name)}/import?${pageQuery(limit, offset)}`,
     ),
-  /** One page of the samples, most recently reviewed first. */
-  calibrationSamples: (owner: string, name: string, limit = 50, offset = 0) =>
+  /**
+   * One page of the samples, most recently reviewed first; with `includeDeleted`, the deleted ones
+   * too, marked (API 0.6.0).
+   */
+  calibrationSamples: (
+    owner: string,
+    name: string,
+    limit = 50,
+    offset = 0,
+    includeDeleted = false,
+  ) =>
     request<Page<CalibrationSample>>(
       "GET",
-      `${calibration(owner, name)}/samples?${pageQuery(limit, offset)}`,
+      `${calibration(owner, name)}/samples?${pageQuery(limit, offset)}${
+        includeDeleted ? "&deleted=include" : ""
+      }`,
     ),
   calibrationSample: (owner: string, name: string, id: string) =>
     request<CalibrationSample>("GET", `${calibration(owner, name)}/samples/${seg(id)}`),
@@ -553,12 +690,13 @@ export const api = {
     request<void>("DELETE", `${calibration(owner, name)}/samples/${seg(id)}`),
   /**
    * Run the agent on the samples named, or on `count` of those run least; at most 20. A sample a
-   * live job is reviewing is refused (409); past the daily cap, 429.
+   * live job is reviewing is refused (409); past the daily cap, 429. Of the `eval` samples unless
+   * `split` is `pool` (evidence for proposals, never aggregated; API 0.6.0).
    */
   createCalibrationRun: (
     owner: string,
     name: string,
-    which: { samples: string[] } | { count: number },
+    which: ({ samples: string[] } | { count: number }) & { split?: "eval" | "pool" },
   ) => request<CalibrationRun>("POST", `${calibration(owner, name)}/runs`, which),
   /** One page of the runs, newest first, each with its aggregate. */
   calibrationRuns: (owner: string, name: string, limit = 50, offset = 0, stale = false) =>
@@ -578,7 +716,49 @@ export const api = {
       "GET",
       `${calibration(owner, name)}/summary${staleQuery(stale, "?")}`,
     ),
+
+  /**
+   * Ask an agent for a rubric proposal: answers the `proposal` job. 409 while one is live (a job
+   * running, or a proposal waiting for a decision); 429 past the daily cap.
+   */
+  createProposal: (owner: string, name: string) =>
+    request<Job>("POST", proposals(owner, name), {}),
+  /** One page of the proposals, newest first, without documents and diffs. */
+  proposals: (owner: string, name: string, limit = 50, offset = 0) =>
+    request<Page<RubricProposal>>(
+      "GET",
+      `${proposals(owner, name)}?${pageQuery(limit, offset)}`,
+    ),
+  /** One proposal, with its document, style notes and diff against its base. */
+  proposal: (owner: string, name: string, id: string) =>
+    request<RubricProposal>("GET", `${proposals(owner, name)}/${seg(id)}`),
+  /**
+   * Accept a proposal as the next rubric version; `version` is the rubric version read, and
+   * `applyStyleNotes` writes its style notes too. A 409 whose body is a `ProposalMoved` means the
+   * rubric has moved: rebase in the editor.
+   */
+  acceptProposal: (
+    owner: string,
+    name: string,
+    id: string,
+    version: number,
+    applyStyleNotes = false,
+  ) =>
+    request<{ proposal: RubricProposal; rubric: RubricDocument }>(
+      "POST",
+      `${proposals(owner, name)}/${seg(id)}/accept`,
+      { version, applyStyleNotes },
+    ),
+  /** Cancel a pending, queued or running proposal job: it fails, and its run is cancelled. */
+  cancelProposalJob: (owner: string, name: string, jobId: string) =>
+    request<Job>("POST", `${proposals(owner, name)}/jobs/${seg(jobId)}/cancel`, {}),
+  rejectProposal: (owner: string, name: string, id: string) =>
+    request<RubricProposal>("POST", `${proposals(owner, name)}/${seg(id)}/reject`, {}),
 };
+
+function proposals(owner: string, name: string): string {
+  return `/api/v1/repos/${seg(owner)}/${seg(name)}/proposals`;
+}
 
 function calibration(owner: string, name: string): string {
   return `/api/v1/repos/${seg(owner)}/${seg(name)}/calibration`;

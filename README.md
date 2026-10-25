@@ -4,7 +4,7 @@ A platform for agentic reviews of GitHub pull requests (taxis #588), grown out o
 tool. Agents draft reviews; you read and edit them against the diff, approve them, and they are
 posted to the pull request under your name.
 
-It is built in milestones. The first three are here:
+It is built in milestones. The first four are here:
 
 - **A review format** (`DiffReviewer/Types.lean`): a decision (comment, approve, request changes),
   a summary, and at most 200 inline comments on file line ranges with optional suggestions. Each
@@ -61,13 +61,18 @@ It is built in milestones. The first three are here:
 - **Calibration** (`/api/v1/repos/{owner}/{name}/calibration/…`): the agent's reviews of past
   commits, scored against the reviews the repository's trusted reviewers wrote of the same commits.
   See [Calibration](#calibration).
+- **Learned review style**: the agent is shown inline comments the trusted reviewers wrote, to
+  write in their style, and the operator's `styleNotes`. See [Review style](#review-style).
+- **Rubric proposals** (`/api/v1/repos/{owner}/{name}/proposals`): an agent reads the calibration
+  data and the people's edits of the agent's drafts and proposes a rubric, which a person accepts
+  as the next rubric version or rejects. See [Rubric proposals](#rubric-proposals).
 - **A web front-end** (`web/`): sign in, register repositories, request a review, read a review,
   edit it, approve or reject it. Every write names the version of the job it was made on, so a
   stale page is refused rather than overwriting.
 - **The command-line tools** it started as: `diff-reviewer github` posts a review JSON to a pull
   request, and `diff-reviewer from-git` turns a commit range into one.
 
-Next: learned review style.
+Next: the front-end for style and proposals.
 
 ## Running it
 
@@ -90,8 +95,9 @@ counted per client address — an IPv6 client per /64 — which is the socket's 
 request comes from that proxy, when it is the last address of `X-Forwarded-For`. `--max-jobs-per-day` (default 50) bounds the
 jobs discovery makes per repository, `--max-calibration-jobs-per-day` (default 20) the calibration
 jobs runs make (and their retries) per repository, apart from it, `--github-reserve` (default 500)
-the GitHub requests calibration imports leave for discovery and posting, and `--max-diff-bytes` (default 5242880) the diff
-reviewed.
+the GitHub requests calibration imports leave for discovery and posting, `--max-proposals-per-day`
+(default 2) the rubric proposals a person may ask for per repository, and `--max-diff-bytes`
+(default 5242880) the diff reviewed.
 
 Releases (`v*` tags) attach a Linux x86_64 binary and its sha256 to the GitHub release; it runs on
 Debian bookworm and newer. They also publish the image review tasks run in on orchestra,
@@ -109,22 +115,27 @@ ignored.
 | --- | --- |
 | `DIFF_REVIEWER_PASSWORD` | Required. What you sign in with, at least 12 characters. Accepted only by `POST /api/login`, which is rate-limited: after 5 failures from one address (an IPv6 /64) within 15 minutes every attempt from it is refused (`429`, at once, with `Retry-After`) for 15 seconds, doubling with each further failure; after 100 from all addresses together, every password attempt is refused for a while. Sign in with the API token then. |
 | `DIFF_REVIEWER_API_TOKEN_FILE` | The bearer scripts send to `/api/v1/` (`Authorization: Bearer …`). `POST /api/login` also takes it (`{"token": …}`) and issues a session, with no rate limit: the way in while password attempts are refused. Unset, only a signed-in browser reaches the API. |
-| `DIFF_REVIEWER_AGENT_TOKEN_FILE` | The bearer of `/api/agent/v1/`, and good for nothing else. Unset, the agent API refuses everything. kleis holds it, never the agent. |
+| `DIFF_REVIEWER_AGENT_TOKEN_FILE` | The bearer of `/api/agent/v1/` — every route but a rubric proposal's — and good for nothing else. Unset, those routes refuse everything. kleis holds it, never the agent. |
+| `DIFF_REVIEWER_PROPOSER_AGENT_TOKEN_FILE` | The bearer of a rubric proposal's agent routes (`/api/agent/v1/repos/{owner}/{name}/proposals/…`), and of nothing else: the agent token does not reach them, nor this one a pull request's. Unset, they refuse everything. kleis holds it, under an account of its own (see [Behind kleis](#behind-kleis)). |
 | `DIFF_REVIEWER_GITHUB_TOKEN_FILE` | The token for api.github.com: listing pull requests, reading one and its diff, posting reviews. Unset, there is no discovery, no diff and no posting. In production this is the placeholder `kleis` (see below). Also used by `diff-reviewer github`, which otherwise falls back to `gh auth token`. |
 | `DIFF_REVIEWER_GITHUB_LOGIN` | The GitHub login reviews are posted as. **Set it in production.** When a post's outcome is unknown, only reviews by this login count as the platform's: without it, anyone who writes a job's marker into a review of their own could make the platform record that job as posted (it logs this once). And on a pull request this login wrote, GitHub refuses an approval or a request for changes, so such a review is posted as a comment and the job's `postNote` says so. |
 | `DIFF_REVIEWER_GITHUB_API` | GitHub's API root, `https://api.github.com` by default. |
+| `DIFF_REVIEWER_ORCHESTRA_PROPOSER_TOKEN_FILE` | The platform's second API client token on orchestra, which rubric proposals are queued with (see [On orchestra](#on-orchestra)). Unset, proposal jobs stay `pending`, with why in their `error`. |
 | `DIFF_REVIEWER_ORCHESTRA_URL`, `DIFF_REVIEWER_ORCHESTRA_TOKEN_FILE` | Orchestra, and the platform's API client token on it. Without both, jobs stay `pending` (and the log says so once). Orchestra is always reached directly, never through `HTTPS_PROXY` (its host is curl's `noproxy`): the proxy is kleis, there for GitHub, and the orchestra token is not one kleis should see. Add the host to `NO_PROXY` too, for anything else in the environment. |
 | `HTTPS_PROXY`, `NO_PROXY`, `CURL_CA_BUNDLE`, `SSL_CERT_FILE` | Every outgoing request is made with `curl`, which reads these as usual (and no `~/.curlrc`: it runs with `-q`). Only `https` is used, or `http` to loopback. |
 
 The three secrets must differ, and each token must be at least 32 characters
-(`openssl rand -hex 32`): `serve` refuses to start otherwise.
+(`openssl rand -hex 32`): `serve` refuses to start otherwise. So must the orchestra token for
+proposals: at least 32 characters, and none of the password, the API token, the agent token or
+the orchestra token for reviews.
 
 The agent CLI reads `~/.config/diff-reviewer/agent.json`, `{"url": "https://reviews.example",
 "token": "kleis"}`, and `DIFF_REVIEWER_URL` and `DIFF_REVIEWER_TOKEN` override either field.
 (`DIFF_REVIEWER_URL` is also where `npm run dev` proxies `/api` to.) The prompt gives the agent
-its job id, which it passes as `--job <id>`: with two reviews of one pull request running — an
-old head's, not yet cancelled, and the new one's — a request that names none is refused rather
-than given the wrong one.
+its job id, which it passes as `--job <id>` (`X-Diff-Reviewer-Job`), and must: a request about a
+pull request that names no job is refused (`400`), however many reviews of it are running — an old
+head's, not yet cancelled, beside the new one's must never be given the wrong one — and so is one
+naming a job of another kind (a rubric proposal, `404`).
 
 Head commits are always whole commit ids (40 or 64 hex digits); `POST /api/v1/jobs` refuses an
 abbreviation.
@@ -160,6 +171,39 @@ pull request moves on, the platform cancels the runs of its older heads
 (`POST /api/v1/queue/{id}/cancel`). The
 agent needs `curl` and the `diff-reviewer` binary from a release on its `PATH`: see the next
 section.
+
+**Rubric proposals need a second client.** A proposal task must run under a kleis spec of its
+own, `rubric-proposer` (see [Behind kleis](#behind-kleis)), and orchestra gives every task an API
+client queues the client file's `kleis_spec`: a request cannot name one (`kleis_narrow` can only
+take away). So proposals are queued through a client of their own,
+`<config>/clients/diff-reviewer-proposer.json`:
+
+```json
+{
+  "token": "{{diff_reviewer_proposer_token}}",
+  "backend": "claude",
+  "read_only": true,
+  "kleis_spec": "rubric-proposer",
+  "execution_image": "ghcr.io/chrisflav/diff-reviewer-agent:0.2.0@sha256:…",
+  "queue_policy": {
+    "repos": ["acme/widgets"],
+    "images": ["ghcr.io/chrisflav/diff-reviewer-agent:0.2.0@sha256:…"],
+    "max_budget": 3.0
+  },
+  "max_active": 2
+}
+```
+
+with an image of a release that has `agent proposal` (this one's or later), and its own token —
+orchestra refuses a token two clients share — in `secrets.json` and in the
+platform's `DIFF_REVIEWER_ORCHESTRA_PROPOSER_TOKEN_FILE`. A proposal's request names the prompt,
+a goal, the upstream and the job id as `external_id`, and no `issue_number`: orchestra takes a
+task of a repository with no issue (its `queue_policy` has no rule about one), and the task's
+token then carries `task_upstream` and no `task_issue`. It carries the narrowing
+`"github: only discover, fetch"`, as a calibration job's does. The platform follows and cancels a
+proposal's entry through the same client. (If orchestra one day lets a client's `queue_policy`
+list the specs a request may name — a `kleis_specs` list beside `repos`, and a `kleis_spec`
+request field checked against it — one client would do.)
 
 ### The agent image
 
@@ -221,6 +265,29 @@ The platform holds no real credential of GitHub, and agents hold none of the pla
   (`task_upstream`, `task_issue`). GitHub is read-only to the agent, so an agent can never post
   anything itself. The extension's setup writes `~/.config/diff-reviewer/agent.json` with the
   platform's URL and the placeholder token `kleis`, which kleis strips and replaces.
+- **A proposal agent's side.** A rubric proposal's routes are of the repository and the job, with
+  no pull request, and the extension must add them — repository-bound, emitting
+  `repository($o, $n)` and no `pull` fact:
+
+  | Method | Path | Operation |
+  | --- | --- | --- |
+  | `GET` | `/api/agent/v1/repos/{o}/{n}/proposals/{jobId}` | `read_proposal` |
+  | `POST` | `/api/agent/v1/repos/{o}/{n}/proposals/{jobId}` | `submit_proposal` |
+
+  The `reviewer` spec must not allow `read_proposal` or `submit_proposal`: a review agent has no
+  business reading the calibration data or writing a rubric. A separate `rubric-proposer` spec
+  allows them, bound to the task's repository (`task_upstream`), and nothing of the review routes
+  (`…/pulls/{pr}…`): a proposal task has no `task_issue` to bind them to. The platform binds the
+  request to the job: `{jobId}` must be a proposal job of that repository — for a read, queued or
+  running (a repository has at most one such job); a submission to one that is not running is a
+  `409` — or the answer is `404`. A submission carries a whole rubric document, so allow request
+  bodies up to the platform's own limit, 1 MiB.
+
+  **A second account.** These routes take their own bearer,
+  `DIFF_REVIEWER_PROPOSER_AGENT_TOKEN_FILE`, and the review routes refuse it, as these refuse the agent token: should a grant ever let a
+  request of the one kind through on the other's routes, the platform still refuses it. So kleis
+  needs a second account, `diff-reviewer/proposer`, carrying that token, and the `rubric-proposer`
+  spec injects it (and the `reviewer` spec keeps injecting the agent token).
 - **The platform's side.** Run `serve` with `HTTPS_PROXY` pointing at kleis (and kleis's CA in
   `CURL_CA_BUNDLE`), and `DIFF_REVIEWER_GITHUB_TOKEN_FILE` holding `kleis`. kleis's
   `diff-reviewer-poster` grant injects the operator's PAT for reading pull requests and posting
@@ -280,9 +347,10 @@ A repository's rubric is one document, `GET`/`PUT /api/v1/repos/{owner}/{name}/r
   sent back as the next `PUT` as it is, edited. A version this build cannot read is shown with its
   `documentError` and is not overwritten (`409`). Deleting a repository keeps its rubric versions,
   as it keeps its jobs, which name them: registering it again picks its rubric up where it was.
-- **Not on GitHub.** Categories and severities are for the platform — reading, filtering, and
-  calibration later — and are not part of what is posted: a posted review stays in the operator's
-  plain style. (To be revisited with learned review style, M4.)
+- **Not on GitHub.** Categories and severities are for the platform — reading, filtering,
+  calibration, the categories of style examples — and are not part of what is posted: a posted
+  review stays in the operator's plain style, which [Review style](#review-style) is how the
+  agent learns.
 
 Every inline comment has an `id`, short and random, unique within its review: the platform gives
 one to each comment written without one, when the review is submitted or edited, and keeps the ones
@@ -297,10 +365,13 @@ reviewed, without being shown that review, and the two are compared.
 
 ### How to calibrate
 
-1. **Say whose reviews count.** `PUT /api/v1/repos/{owner}/{name}` with
+1. **Say whose reviews count.** `PUT /api/v1/repos/{owner}/{name}` (and `GET` it to read the
+   settings and their `version`) with
    `{"trustedReviewers": ["alice", "bob"]}` (alongside `mode` and `autoReview`, which the write
    replaces as always). Leaving `trustedReviewers` out of a later write keeps them. The settings
-   are versioned: send the `version` you read, and a write over a newer one is a `409`.
+   are versioned: send the `version` you read, and a write over a newer one is a `409`. Versions
+   never repeat for one repository: deleted and registered again (with `version` 0), it goes on
+   from the version it had, so a page that read the old registration is refused by the new.
 2. **Import.** `POST …/calibration/import` with `{"limit": 50}` (the default; at most 200) queues
    an import of that many of the most recently updated closed pull requests. The workers read it
    on, 25 pull requests a pass (`GET …/calibration/import` shows how far;
@@ -336,13 +407,18 @@ reviewed, without being shown that review, and the two are compared.
    - `unreachable` — reviews of a commit GitHub can no longer compare with the base, typically
      one a force-push left unreferenced; not stored, since its diff cannot be had;
    - `unreadable` — pull requests whose reviews or comments GitHub refused to list, or that
-     failed three times running; the import skips them and goes on.
+     failed three times running; the import skips them and goes on;
+   - `ownPosts` — reviews the platform posted itself, under the operator's login, which may well
+     be trusted: by GitHub's id of a job's `postedReview`, or by the marker in their body. Never a
+     sample: the agent is neither scored against nor taught by itself.
 
    Importing again adds only reviews no import has seen, to the sample of their group when there
    is one; a sample you delete (`DELETE …/calibration/samples/{id}`) stays deleted and gets
-   nothing more. GitHub's budget is shared with discovery and posting: when GitHub says its rate
-   limit is reached, or its `X-RateLimit-Remaining` falls under `--github-reserve` (500 by
-   default), the import pauses where it is until `X-RateLimit-Reset`, and goes on by itself.
+   nothing more; `GET …/calibration/samples?deleted=include` lists the deleted ones too, marked
+   (`deleted`, `deletedAt`). GitHub's budget is shared with discovery and posting: when GitHub
+   says its rate limit is reached, or its `X-RateLimit-Remaining` falls under `--github-reserve` (500 by
+   default), the import pauses where it is until `X-RateLimit-Reset`, and goes on by itself; while
+   it waits, its `resetAt` says until when.
 3. **Run.** `POST …/calibration/runs` with `{"samples": ["<id>", …]}`, or `{"count": 10}` for
    the samples run least so far (at most 20 either way); a sample that a live calibration job is
    reviewing already is refused (`409`), and `count` leaves those out. Each sample gets a
@@ -362,7 +438,10 @@ reviewed, without being shown that review, and the two are compared.
    default, apart from `--max-jobs-per-day`) is charged once for each job a run makes and once
    for each time a person runs a failed one again (`failed → pending`); past it either is a
    `429`. Running a failed job again is refused (`409`) while a newer run's job reviews its
-   sample: one sample is one live job. `GET /api/v1/jobs` lists review jobs unless asked `?kind=calibration` or `?kind=all`.
+   sample: one sample is one live job. `GET /api/v1/jobs` lists review jobs unless asked
+   `?kind=calibration`, `?kind=proposal` or `?kind=all`. Runs are of the `eval` samples (see
+   [Held out](#held-out)); `{"split": "pool"}` asks for a run of the pool instead, whose scores give
+   rubric proposals evidence and are never in an aggregate.
 4. **Read.** When the agent submits, its draft is scored against the sample, and kept with the
    job; a draft that cannot be scored is marked `unscorable`, with why, once.
    `GET …/calibration/runs/{id}` shows each sample's result and the run's aggregate,
@@ -370,6 +449,44 @@ reviewed, without being shown that review, and the two are compared.
    aggregate over all runs, and by the rubric version the jobs were reviewed against — so that a
    rubric change can be judged by whether the numbers moved. A deleted sample's scores are left
    out of every aggregate, and still shown, marked, in its run.
+
+### Held out
+
+What the agent learns from must not be what it is measured by. So every sample is assigned, once,
+to `eval` or to the `pool`: by a stable hash (FNV-1a) of its pull request (`owner/name#pr`)
+against the repository's `evalShare` (`PUT /api/v1/repos/{owner}/{name}`, 0 to 100, 50 by
+default, versioned with the other settings). By pull request, not by review: two reviewers of one
+pull request, or two rounds of it, say much of the same, and one must not teach what the other
+tests. A new sample of a pull request that has a split already takes it. The split is stored on
+the sample (`split`) and never changes: a new share splits only the pull requests that come after
+it. A sample imported before splits existed is given one the first time it is read — for a run,
+an example or a proposal, and for a run, the list of runs or the summary (`GET …/calibration/runs`,
+`…/runs/{id}`, `…/summary`); nothing is written when every sample has one.
+
+- **Runs** are of `eval` samples, and every aggregate is of `eval` samples only. A run of the pool
+  must be asked for (`"split": "pool"`).
+- **What the agent learns from** is the pool and the review jobs, never `eval` — and of the pool,
+  never a sample of a pull request that has an `eval` sample (which samples stored while the split
+  was by review may have): the examples of style ([Review style](#review-style)), a rubric
+  proposal's misses, unmatched comments and pool aggregates, and its people's edits, which are of
+  posted review jobs of pull requests with no `eval` sample ([Rubric proposals](#rubric-proposals)).
+- **Derived scores.** Every rubric version records what it was derived from (`derivedFrom`, the
+  samples, and `derivedFromPulls`, their pull requests): the pull requests the context of the
+  proposal it came from drew on — its misses, its unmatched comments, its people's edits — and
+  every earlier version's, since a person's edit of a derived rubric may keep what it learned.
+  Each version of the style notes records the same (kept by name, so a delete and a registration
+  again keep it), and each job records the notes version its agent was given when it read the job
+  (`notesVersion`), as it records its `rubricVersion`. A score whose sample's pull request is in
+  the set of its job's rubric version or notes version is `derived` (`scoreDerived` in a run's
+  results) — a sample of that pull request imported later too: left out of aggregates unless asked
+  (`?derived=include`), and counted (`derivedScores`), like a stale one. What it guards: the split
+  keeps eval out of what the agent learns from; this keeps what a rubric or the notes learned from
+  out of what measures them, wherever it came from — the pool when an eval sample of its pull
+  request arrives later, a pull request's posted reviews, samples split before the split was by
+  pull request. It holds for every way a proposal reaches the rubric or the notes: accepting it,
+  or saving a rebased version with `fromProposal` ([Rubric proposals](#rubric-proposals)). A
+  rubric or notes a person writes from what they read of a proposal without naming it is beyond
+  what the platform can know.
 
 ### What the numbers mean
 
@@ -432,6 +549,88 @@ to divide by.
   cannot be compared, and its reviews are counted as `unreachable` rather than stored, so a
   repository that force-pushes during review loses those samples.
 
+## Review style
+
+How a repository's reviews are written — how long a comment is, how direct, whether it suggests
+or asks — is easier to show than to describe, so the agent is shown, and told the rest.
+
+- **Examples.** `agent show` gives the agent `examples`: up to 20 inline comments the
+  repository's trusted reviewers wrote, taken from its `pool` calibration samples (import some
+  first; see [Calibration](#calibration)), each its text and the category calibration paired it
+  with when it was paired with one of the agent's comments (otherwise `null`) — no file, no lines,
+  nothing to go and look up. The prompt and the instructions tell the agent to write in their style — their length,
+  their tone, how directly they say what to change — and not to copy them.
+- **Which.** Of the `pool` samples not deleted whose reviewer is still trusted, and whose pull
+  request has no `eval` sample, the `full` and
+  `partial` ones submitted before the review the job is — for a calibration job, before its
+  sample's review; for a review job, before the job was made — and of their comments those of 20
+  to 600 characters. Picked greedily for variety: each
+  pick prefers a file not shown yet, then a category not shown yet, then the scope and the length
+  (under or over 160 characters) shown less, then a sample not used yet, ties going to the most
+  recently reviewed. Deterministic: the same samples give the same examples.
+- **Never the pull request under review.** Every sample of the job's pull request is left out. For
+  a calibration job that is the sample it is scored against and any other review of the same pull
+  request, so the human review it is scored against never reaches the agent.
+- **Style notes.** `PUT /api/v1/repos/{owner}/{name}` takes `styleNotes`, markdown of at most 16
+  KiB the operator writes — what the examples cannot show: "one sentence a comment", "no
+  praise", "suggest, don't ask". It is versioned with the other settings (send the `version` you
+  read), kept by a write that leaves it out, and cleared by `""`. The agent's `instructions` end
+  with it, after the default rubric.
+
+## Rubric proposals
+
+Calibration says where the agent and the trusted reviewers part, and the review history what
+people change in the agent's drafts before posting them. A rubric proposal is an agent reading
+both and writing the rubric it thinks the repository should have, with why. It is advisory: a
+person reads it beside the rubric and accepts or rejects it.
+
+1. **Ask.** `POST /api/v1/repos/{owner}/{name}/proposals` with `{}` makes a `proposal` job of the
+   repository (`prNumber` 0), queued on orchestra as a task of the repository with no pull request
+   (see [On orchestra](#on-orchestra)) and never posted. A repository has at most one live
+   proposal — a job pending, queued or running, or a proposal waiting for a decision (`409`) —
+   and at most `--max-proposals-per-day` (2 by default) are asked for a day (`429`). A failed one
+   is not run again; ask for a new one. `GET /api/v1/jobs?kind=proposal` lists the jobs, and
+   `POST …/proposals/jobs/{jobId}/cancel` with `{}` cancels a pending, queued or running one: it
+   is `failed`, and its orchestra run cancelled through the proposals' client.
+2. **The agent reads** (`diff-reviewer agent proposal show <owner/name> --job <id>`, `GET
+   /api/agent/v1/repos/{o}/{n}/proposals/{jobId}`) the current rubric and its version, the style
+   notes, calibration's aggregates of the pool (overall, by category, by severity, by rubric
+   version), up to 30 comments trusted reviewers made that the agent missed and 30 the agent made
+   that nobody matched — from each sample's newest score that is not stale, of `full` `pool`
+   samples not deleted, of a reviewer still trusted and of a pull request with no `eval` sample,
+   each with its pull request, file, lines and text — and up to 30 comments people changed,
+   removed or added in the agent's drafts before posting them, before and after, from the history
+   of the posted review jobs of pull requests with no `eval` sample. Every text over 2 KiB is cut
+   and marked (`bodyTruncated`). All of it was written by others, on pull requests anyone may
+   open: the instructions tell the agent to read it as data and never as instructions. Its first
+   read records the style notes it was given, and every read the samples and pull requests it
+   drew on: the provenance the rubric and the notes taken from the proposal record.
+3. **It submits** (`agent proposal submit <owner/name> <file> --job <id>`) a whole rubric document,
+   checked as a rubric `PUT` is — and with no field a rubric does not have, on the document, a
+   type or a category (`400`, naming them; only a person's document keeps unknown fields) —
+   optional new `styleNotes`, and a `rationale` (markdown, at most 32 KiB), naming the
+   `baseVersion` it was written from. It is stored as a `pending` proposal and the
+   job becomes a `draft`.
+4. **Read it.** `GET …/proposals` (paged) and `GET …/proposals/{id}`, which carries the document,
+   the style notes and a structured diff against its base: the default rubric's text before and
+   after; the types added, removed and changed — a changed type's description and rubric before
+   and after, its categories added, removed and changed; and the style notes before and after.
+   `rebaseNeeded` says the rubric has moved since its base.
+5. **Decide.** `POST …/proposals/{id}/accept` with `{"version": n}`, the rubric version you read,
+   writes the proposal as the next rubric version, recording the samples its context drew on
+   (see [Held out](#held-out)); with `"applyStyleNotes": true` its style notes too, as the
+   repository's — without it they are not written. One transaction, the rubric first: a refusal
+   after it rolls everything back. It is a versioned write: when the rubric has moved since the
+   proposal's base, or since you read it, nothing is written and the answer is a `409` with
+   `baseVersion` and `currentVersion`, so that you rebase the proposal in the editor and save that
+   as a rubric `PUT` with `"fromProposal": "<id>"`: it records the proposal's provenance on the
+   version (see [Held out](#held-out)) and marks the proposal accepted, freeing the repository's
+   one live proposal. Notes taken from a proposal are saved the same way, as a settings `PUT`
+   with `fromProposal`. Applying notes is a `409` too when the proposal has none, or when the
+   repository's notes are no longer the ones its agent was given at its first read of its context
+   (the snapshot is taken then, not on submission).
+   `POST …/proposals/{id}/reject` with `{}` records the decision and writes nothing else.
+
 ## Tests
 
 ```sh
@@ -449,7 +648,16 @@ rubrics), the history of a review from draft to post, the checks of a review aga
 the agent CLI against the server on loopback, calibration — trusted reviewers as a versioned
 setting, the import of past reviews (what it keeps and drops, idempotence, deleted samples, the rate
 limit and the budget of a pass), the matcher, runs and their cap, calibration jobs left alone by
-discovery and never posted by any path, and the aggregates — and that `docs/openapi.json`
+discovery and never posted by any path, and the aggregates — learned style — the examples
+picked for variety and never of the pull request under review, the style notes as a versioned
+setting — rubric proposals — one live a repository and a cap a day, queued with no pull request
+through their own client, what the agent reads and submits, the diff, accepting as a versioned
+write that asks for a rebase when the rubric has moved and rolls back whole, the style notes
+applied only when asked and only over the notes the agent read, rejecting, cancelling, unknown
+fields refused, `fromProposal` keeping provenance — the held-out split by pull request, fixed
+once made, held-out pull requests teaching nothing, and derived scores, by rubric and notes
+version and by pull request, left out; the two agent tokens kept apart; the platform's
+own posts kept out of the samples; the job header required — and that `docs/openapi.json`
 documents exactly the routes the server answers. Nothing in it reaches the network.
 
 `docs/openapi.json` is embedded in the binary with `include_str`, and Lake rebuilds a module when

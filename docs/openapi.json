@@ -2,8 +2,8 @@
   "openapi": "3.1.0",
   "info": {
     "title": "diff-reviewer platform API",
-    "version": "0.5.0",
-    "description": "The review platform: the repositories whose pull requests it reviews, and one review job per review. A job moves `pending → queued → running → draft → approved → posted`; `rejected` is a discarded draft, `stale` a draft whose pull request has moved on, and `failed` a run that ended without a review.\n\nThree credentials, none standing in for another. The password (`$DIFF_REVIEWER_PASSWORD`) is accepted only by `POST /api/login`, which sets the session cookie; failed password logins are rate-limited (an immediate `429` with `Retry-After`), and the API token signs in there too, unlimited. Every route under `/api/v1/` needs the session cookie or the API token (`$DIFF_REVIEWER_API_TOKEN_FILE`) as `Authorization: Bearer <token>`. Every route under `/api/agent/v1/` needs the agent token (`$DIFF_REVIEWER_AGENT_TOKEN_FILE`) as a bearer, and nothing else reaches it; an agent's requests go through kleis, which supplies it.\n\nEvery write must be `application/json` (`415` otherwise). Every write to a job under `/api/v1/` names the job's `version` as last read, and is a `409` if the job has changed since. A request the server fails on is a `500` whose reason goes to the server log; a method a route does not answer is a `405`. Collections answer `{\"items\": [...]}`. Instants are RFC 3339 in UTC; an absent value is `null`.\n\nEach repository has a rubric document — a default rubric and the pull request types its reviews tell apart, each with a rubric and the categories its comments are filed under — written whole and versioned (`/api/v1/repos/{owner}/{name}/rubrics`). Every write of a job's review, by the agent, a person or (once posted) GitHub, is kept as a revision (`/api/v1/jobs/{id}/revisions`).\n\nCalibration (`/api/v1/repos/{owner}/{name}/calibration/…`) compares the agent's reviews with the reviews the repository's `trustedReviewers` wrote on its closed pull requests: an import stores each such review as a sample, a run makes one `calibration` job per sample at the sample's commit, and each job's draft is scored against its sample. A `calibration` job is queued and run like any other, but is never approved, claimed or posted."
+    "version": "0.6.0",
+    "description": "The review platform: the repositories whose pull requests it reviews, and one review job per review. A job moves `pending → queued → running → draft → approved → posted`; `rejected` is a discarded draft, `stale` a draft whose pull request has moved on, and `failed` a run that ended without a review.\n\nThree credentials, none standing in for another. The password (`$DIFF_REVIEWER_PASSWORD`) is accepted only by `POST /api/login`, which sets the session cookie; failed password logins are rate-limited (an immediate `429` with `Retry-After`), and the API token signs in there too, unlimited. Every route under `/api/v1/` needs the session cookie or the API token (`$DIFF_REVIEWER_API_TOKEN_FILE`) as `Authorization: Bearer <token>`. Every route under `/api/agent/v1/` needs the agent token (`$DIFF_REVIEWER_AGENT_TOKEN_FILE`) as a bearer, and nothing else reaches it; an agent's requests go through kleis, which supplies it.\n\nEvery write must be `application/json` (`415` otherwise). Every write to a job under `/api/v1/` names the job's `version` as last read, and is a `409` if the job has changed since. A request the server fails on is a `500` whose reason goes to the server log; a method a route does not answer is a `405`. Collections answer `{\"items\": [...]}`. Instants are RFC 3339 in UTC; an absent value is `null`.\n\nEach repository has a rubric document — a default rubric and the pull request types its reviews tell apart, each with a rubric and the categories its comments are filed under — written whole and versioned (`/api/v1/repos/{owner}/{name}/rubrics`). Every write of a job's review, by the agent, a person or (once posted) GitHub, is kept as a revision (`/api/v1/jobs/{id}/revisions`).\n\nCalibration (`/api/v1/repos/{owner}/{name}/calibration/…`) compares the agent's reviews with the reviews the repository's `trustedReviewers` wrote on its closed pull requests: an import stores each such review as a sample, a run makes one `calibration` job per sample at the sample's commit, and each job's draft is scored against its sample. A `calibration` job is queued and run like any other, but is never approved, claimed or posted.\n\nLearned review style: the agent's `examples` are inline comments the repository's trusted reviewers wrote, picked from its calibration samples — never of the pull request under review — and its instructions end with the repository's `styleNotes`. A rubric proposal (`/api/v1/repos/{owner}/{name}/proposals`) is a `proposal` job of the repository, of no pull request: an agent reads the rubric, the style notes, calibration's results and people's edits of the agent's drafts (`/api/agent/v1/repos/{owner}/{name}/proposals/{jobId}`), and proposes a rubric document, which a person accepts as the next rubric version or rejects. A `proposal` job is never approved, claimed or posted."
   },
   "security": [
     {
@@ -167,6 +167,29 @@
           }
         }
       ],
+      "get": {
+        "summary": "One repository",
+        "operationId": "getRepo",
+        "description": "The repository with its settings and their `version`: the same object as an item of `GET /api/v1/repos`.",
+        "responses": {
+          "200": {
+            "description": "The repository.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Repo"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
       "put": {
         "summary": "Register or update a repository",
         "operationId": "putRepo",
@@ -197,10 +220,24 @@
                     "maxItems": 50,
                     "description": "GitHub logins; stored in lower case, once each. Left out, the current ones are kept."
                   },
+                  "styleNotes": {
+                    "type": "string",
+                    "description": "Markdown, at most 16 KiB (UTF-8). Left out (or null), the current notes are kept; an empty string clears them."
+                  },
+                  "evalShare": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 100,
+                    "description": "Percent of new samples held out; kept when left out. Changes only the samples split after it."
+                  },
                   "version": {
                     "type": "integer",
                     "minimum": 0,
-                    "description": "The version of the settings last read, 0 for a repository not registered yet. Given, the write is a `409` if the settings have changed since; left out, it is not checked."
+                    "description": "The version of the settings last read, 0 for a repository not registered (now). Given, the write is a `409` if the settings have changed since; left out, it is not checked. A repository registered again after being deleted goes on from the version it had, so no version is given twice to one name."
+                  },
+                  "fromProposal": {
+                    "type": "string",
+                    "description": "The rubric proposal the style notes written were taken from: the new notes version records its provenance, and the proposal is marked accepted. `400` for an id that is not a proposal of the repository, `409` for a rejected proposal."
                   }
                 }
               }
@@ -241,11 +278,11 @@
             "$ref": "#/components/responses/Error"
           }
         },
-        "description": "Names are stored in lower case, as GitHub compares them. `mode` and `autoReview` are replaced: a write that omits one sets its default. `trustedReviewers` is kept when omitted, so that a client that does not know it cannot wipe it. Every write increments `version`."
+        "description": "Names are stored in lower case, as GitHub compares them. `mode` and `autoReview` are replaced: a write that omits one sets its default. `trustedReviewers` and `styleNotes` are kept when omitted, so that a client that does not know it cannot wipe it. Every write increments `version`."
       },
       "delete": {
         "summary": "Unregister a repository",
-        "description": "Its jobs are kept: they are the record of reviews that happened. So are its rubric versions, which those jobs name: registering the repository again picks its rubric up where it was.",
+        "description": "Its jobs are kept: they are the record of reviews that happened. So are its rubric versions, which those jobs name: registering the repository again picks its rubric up where it was. Versions of its settings never repeat: registering it again goes on from the version it had, so a page of the old registration is refused (`409`) by the new one.",
         "operationId": "deleteRepo",
         "responses": {
           "204": {
@@ -303,11 +340,12 @@
               "enum": [
                 "review",
                 "calibration",
+                "proposal",
                 "all"
               ],
               "default": "review"
             },
-            "description": "Which jobs: reviews (the default), calibration jobs, or all."
+            "description": "Which jobs: reviews (the default), calibration jobs, rubric proposal jobs, or all."
           }
         ]
       },
@@ -493,7 +531,7 @@
       ],
       "post": {
         "summary": "Make a person's decision on a job",
-        "description": "A person's moves only: `draft → approved | rejected | stale`, `approved → draft`, `rejected → draft`, and `failed → pending` to run the review again (which clears `queueEntry` and `error`; the next attempt is queued under a new orchestra `external_id`). Queueing, running, the agent's draft and posting are the platform's own, and no request makes them — posting is asked for with `POST /api/v1/jobs/{id}/post`. Any other move is a `409`, and so is approving a job without a readable review. `409` while a post of the job may have reached GitHub (`postStartedAt` is set). A `calibration` job is never approved: `409`. Running a failed `calibration` job again (`failed → pending`) charges the repository's daily cap of calibration jobs: `429` past it. It is a `409` while another live calibration job reviews the same sample.",
+        "description": "A person's moves only: `draft → approved | rejected | stale`, `approved → draft`, `rejected → draft`, and `failed → pending` to run the review again (which clears `queueEntry` and `error`; the next attempt is queued under a new orchestra `external_id`). Queueing, running, the agent's draft and posting are the platform's own, and no request makes them — posting is asked for with `POST /api/v1/jobs/{id}/post`. Any other move is a `409`, and so is approving a job without a readable review. `409` while a post of the job may have reached GitHub (`postStartedAt` is set). A `calibration` job is never approved: `409`. Running a failed `calibration` job again (`failed → pending`) charges the repository's daily cap of calibration jobs: `429` past it. It is a `409` while another live calibration job reviews the same sample. A `proposal` job is moved by nobody but the platform (`409`): its proposal is accepted or rejected instead, and a failed one is asked for anew.",
         "operationId": "setJobStatus",
         "requestBody": {
           "required": true,
@@ -732,16 +770,16 @@
         {
           "name": "X-Diff-Reviewer-Job",
           "in": "header",
-          "required": false,
+          "required": true,
           "schema": {
             "type": "string"
           },
-          "description": "The job the agent's prompt named (`--job`). Without it, the request is about the pull request's only queued or running job, and with two it is a `409`: an older run must not take over a newer review."
+          "description": "The job the agent's prompt named (`--job`): a review or calibration job of the pull request, queued or running. Required: a request that names none is a `400`, and one naming a job of another kind (a rubric proposal) or not being run a `404`. Naming a job of a commit another active job of the same pull request was made for later (to the second) is a `409`: only the newest job of a commit is run."
         }
       ],
       "get": {
         "summary": "The review the agent is running",
-        "description": "The job the agent runs (see `X-Diff-Reviewer-Job`), `queued` or `running`; reading a `queued` one moves it to `running`. `404` when no review of the pull request is being run. `409` too when the repository's rubric cannot be read by this build. With `X-Diff-Reviewer-Job` naming a job of a commit another active job of the same pull request was made for later (to the second), `409`: only the newest job of a commit is run.",
+        "description": "The job the agent runs, named by `X-Diff-Reviewer-Job`, `queued` or `running`; reading a `queued` one moves it to `running`. `400` when no job is named, `404` when the named job is not a review of the pull request being run. `409` too when the repository's rubric cannot be read by this build, and when the named job is of a commit another active job of the same pull request was made for later (to the second): only the newest job of a commit is run.",
         "operationId": "agentShow",
         "security": [
           {
@@ -766,6 +804,9 @@
             "$ref": "#/components/responses/Error"
           },
           "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "400": {
             "$ref": "#/components/responses/Error"
           }
         }
@@ -801,11 +842,11 @@
         {
           "name": "X-Diff-Reviewer-Job",
           "in": "header",
-          "required": false,
+          "required": true,
           "schema": {
             "type": "string"
           },
-          "description": "The job the agent's prompt named (`--job`). Without it, the request is about the pull request's only queued or running job, and with two it is a `409`: an older run must not take over a newer review."
+          "description": "The job the agent's prompt named (`--job`): a review or calibration job of the pull request, queued or running. Required: a request that names none is a `400`, and one naming a job of another kind (a rubric proposal) or not being run a `404`. Naming a job of a commit another active job of the same pull request was made for later (to the second) is a `409`: only the newest job of a commit is run."
         }
       ],
       "get": {
@@ -845,6 +886,9 @@
           },
           "413": {
             "$ref": "#/components/responses/Error"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
           }
         }
       }
@@ -879,11 +923,11 @@
         {
           "name": "X-Diff-Reviewer-Job",
           "in": "header",
-          "required": false,
+          "required": true,
           "schema": {
             "type": "string"
           },
-          "description": "The job the agent's prompt named (`--job`). Without it, the request is about the pull request's only queued or running job, and with two it is a `409`: an older run must not take over a newer review."
+          "description": "The job the agent's prompt named (`--job`): a review or calibration job of the pull request, queued or running. Required: a request that names none is a `400`, and one naming a job of another kind (a rubric proposal) or not being run a `404`. Naming a job of a commit another active job of the same pull request was made for later (to the second) is a `409`: only the newest job of a commit is run."
         }
       ],
       "post": {
@@ -948,6 +992,169 @@
                       "type": [
                         "string",
                         "null"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "415": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/agent/v1/repos/{owner}/{name}/proposals/{jobId}": {
+      "parameters": [
+        {
+          "name": "owner",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "name",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "jobId",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          },
+          "description": "The proposal job the agent's prompt named. kleis binds the request to the task's repository; the platform to this job, which must be a proposal job of that repository."
+        }
+      ],
+      "get": {
+        "summary": "What a rubric proposal is written from",
+        "operationId": "agentProposalShow",
+        "description": "The proposal job must be `queued` or `running` (`404` otherwise); reading a `queued` one moves it to `running`. Of the repository and the job, with no pull request: kleis's `reviewer` spec does not allow it, a `rubric-proposer` spec does. The first read records the style notes it gives (which applying the proposal's notes checks are still the repository's), and every read the samples and pull requests its context drew on: the provenance every rubric and notes version taken from the proposal records. Only the proposals' agent token reaches it.",
+        "security": [
+          {
+            "proposerAgentBearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The context.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProposalContext"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "post": {
+        "summary": "Submit a rubric proposal",
+        "operationId": "agentProposalSubmit",
+        "description": "The job must be `running` (`409` otherwise: a proposal is submitted once). `rubric` is checked as `PUT …/rubrics` checks a document, and may carry no field a rubric does not have, on the document, a type or a category (`400`, naming them) — only a person's document keeps unknown fields; `baseVersion` must be a version the rubric has had (`400`) — one older than the current is stored, and accepting it asks for a rebase. Stored as a `pending` proposal; the job becomes a `draft`.",
+        "security": [
+          {
+            "proposerAgentBearer": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "baseVersion",
+                  "rubric",
+                  "rationale"
+                ],
+                "properties": {
+                  "baseVersion": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "The `rubric.version` of the context."
+                  },
+                  "rubric": {
+                    "type": "object",
+                    "description": "A whole rubric document, as `PUT …/rubrics` takes it (without `version`).",
+                    "properties": {
+                      "defaultRubric": {
+                        "type": "string"
+                      },
+                      "prTypes": {
+                        "type": "array",
+                        "items": {
+                          "$ref": "#/components/schemas/PrType"
+                        }
+                      }
+                    }
+                  },
+                  "styleNotes": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "maxLength": 16384,
+                    "description": "The full new style notes; null or left out to propose none."
+                  },
+                  "rationale": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Why, in markdown, at most 32 KiB."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Stored.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "proposalId",
+                    "jobId",
+                    "status"
+                  ],
+                  "properties": {
+                    "proposalId": {
+                      "type": "string"
+                    },
+                    "jobId": {
+                      "type": "string"
+                    },
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "pending"
                       ]
                     }
                   }
@@ -1186,7 +1393,7 @@
       },
       "put": {
         "summary": "Replace a repository's rubric document",
-        "description": "The body is the whole document with the version it replaces, as last read (`409` if that is no longer the current one). It becomes the next version, and the one it replaces stays in the history. A type's `description`, `rubric` and `categories` default to empty. `400` for a type or category without a name or with the name of another, past 50 types or 50 categories a type, or a rubric past 65536 bytes. The answer of a `GET` may be sent back as it is, edited: its `owner`, `name`, `createdAt` and `documentError` are not kept as the document's, and fields this build does not know, on the document, a type or a category, are kept. A field may be left out (it is then empty) but not `null` (`400`). `409` too while the current version cannot be read by this build (`documentError`): it is left for a build that can.",
+        "description": "The body is the whole document with the version it replaces, as last read (`409` if that is no longer the current one). It becomes the next version, and the one it replaces stays in the history. A type's `description`, `rubric` and `categories` default to empty. `400` for a type or category without a name or with the name of another, past 50 types or 50 categories a type, or a rubric past 65536 bytes. The answer of a `GET` may be sent back as it is, edited: its `owner`, `name`, `createdAt` and `documentError` are not kept as the document's, and fields this build does not know, on the document, a type or a category, are kept. A field may be left out (it is then empty) but not `null` (`400`). `409` too while the current version cannot be read by this build (`documentError`): it is left for a build that can. With `fromProposal`, it records that proposal's provenance and accepts it, in the same transaction.",
         "operationId": "putRubrics",
         "requestBody": {
           "required": true,
@@ -1211,6 +1418,10 @@
                     "items": {
                       "$ref": "#/components/schemas/PrType"
                     }
+                  },
+                  "fromProposal": {
+                    "type": "string",
+                    "description": "The rubric proposal this document was made from — a proposal rebased in the editor after the rubric moved on from its base. The version records the proposal's provenance (`derivedFrom`, `derivedFromPulls`), and the proposal is marked accepted with it, freeing the repository's one live proposal. A rejected proposal, or one that is not the repository's, is refused."
                   }
                 }
               }
@@ -1478,6 +1689,446 @@
         }
       }
     },
+    "/api/v1/repos/{owner}/{name}/proposals": {
+      "parameters": [
+        {
+          "name": "owner",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "name",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "post": {
+        "summary": "Ask for a rubric proposal",
+        "operationId": "createProposal",
+        "description": "A `pending` `proposal` job of the repository (`prNumber` 0), queued on orchestra as a task of the repository with no `issue_number`, through the client for proposals (`DIFF_REVIEWER_ORCHESTRA_PROPOSER_TOKEN_FILE`), with the kleis narrowing `github: only discover, fetch`. Never posted. `409` while the repository has a live proposal — a job pending, queued or running, or a proposal waiting for a decision; `429` past `--max-proposals-per-day` (2 by default) for the repository.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "The proposal job.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Job"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "415": {
+            "$ref": "#/components/responses/Error"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "get": {
+        "summary": "The rubric proposals, newest first",
+        "operationId": "listProposals",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 200,
+              "default": 50
+            },
+            "description": "The most items in the page."
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0
+            },
+            "description": "How many items to skip."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "One page, without documents and diffs.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "items",
+                    "nextOffset"
+                  ],
+                  "properties": {
+                    "items": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/RubricProposal"
+                      }
+                    },
+                    "nextOffset": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/v1/repos/{owner}/{name}/proposals/{id}": {
+      "parameters": [
+        {
+          "name": "owner",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "name",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "get": {
+        "summary": "One rubric proposal, with its diff against its base",
+        "operationId": "getProposal",
+        "responses": {
+          "200": {
+            "description": "The proposal, with `document`, `styleNotes` and `diff`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RubricProposal"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/v1/repos/{owner}/{name}/proposals/{id}/accept": {
+      "parameters": [
+        {
+          "name": "owner",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "name",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "post": {
+        "summary": "Accept a rubric proposal",
+        "operationId": "acceptProposal",
+        "description": "A versioned write of the rubric: `version` is the rubric version the person read. The proposal's document becomes the next rubric version, recording the calibration samples the proposal's context drew on (`derivedFrom`); with `applyStyleNotes`, its style notes become the repository's, recording them too. One transaction, the rubric written first: a refusal after it rolls everything back. `409` when the proposal is decided already, when applying notes it has none or the repository's notes are no longer the ones its agent was given at its first read of its context, and — with `baseVersion` and `currentVersion` beside `error` — when the rubric has moved since the proposal's base or since `version`: rebase it in the editor and save that as a rubric `PUT` with `fromProposal`, which keeps its provenance and accepts it.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "version"
+                ],
+                "properties": {
+                  "version": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "applyStyleNotes": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Also write the proposal's style notes as the repository's. Without it the rubric is written and the notes are not. `409` when the proposal has none, or when the repository's notes are no longer the ones its agent read."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Accepted.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "proposal",
+                    "rubric"
+                  ],
+                  "properties": {
+                    "proposal": {
+                      "$ref": "#/components/schemas/RubricProposal"
+                    },
+                    "rubric": {
+                      "$ref": "#/components/schemas/RubricDocument"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Refused; when the rubric has moved, with both versions.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "baseVersion": {
+                      "type": "integer"
+                    },
+                    "currentVersion": {
+                      "type": "integer"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "415": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/v1/repos/{owner}/{name}/proposals/{id}/reject": {
+      "parameters": [
+        {
+          "name": "owner",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "name",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "post": {
+        "summary": "Reject a rubric proposal",
+        "operationId": "rejectProposal",
+        "description": "Records the decision and writes nothing else. `409` when it is decided already.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RubricProposal"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "415": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/v1/repos/{owner}/{name}/proposals/jobs/{jobId}/cancel": {
+      "parameters": [
+        {
+          "name": "owner",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "name",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "jobId",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "post": {
+        "summary": "Cancel a rubric proposal job",
+        "operationId": "cancelProposalJob",
+        "description": "A pending, queued or running `proposal` job becomes `failed` (`error`: cancelled by a person), and its orchestra run is cancelled through the proposals' client. `409` for a job that is not live; `404` for a job that is not a proposal of the repository.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The job, failed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Job"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "415": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
     "/api/v1/repos/{owner}/{name}/calibration/samples": {
       "parameters": [
         {
@@ -1524,6 +2175,20 @@
               "default": 0
             },
             "description": "How many items to skip."
+          },
+          {
+            "name": "deleted",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "exclude",
+                "include"
+              ],
+              "default": "exclude"
+            },
+            "description": "`include` lists deleted samples too, marked by `deleted` and `deletedAt`."
           }
         ],
         "responses": {
@@ -1656,7 +2321,7 @@
       "post": {
         "summary": "Run the agent on samples",
         "operationId": "createCalibrationRun",
-        "description": "One `calibration` job per sample, at the sample's commit and with its base for the diff, queued and run as any review is, with the same prompt and rubric, and never posted. Each job's orchestra request carries the kleis narrowing `github: only discover, fetch`: the task clones and fetches over git, and cannot read GitHub's REST or GraphQL API, where the person's review is. `{\"samples\": [id, …]}` names them; `{\"count\": n}` takes the n reviewed by the fewest runs so far, the most recent first. At most 20 either way, and a sample a live (pending, queued or running) calibration job is reviewing is refused (`409`); `count` leaves those out. `429` when the jobs would pass `--max-calibration-jobs-per-day` (20 by default) for the repository, a cap apart from `--max-jobs-per-day`: each job is a charge on it, and so is each time a person runs a failed one again.",
+        "description": "One `calibration` job per sample, at the sample's commit and with its base for the diff, queued and run as any review is, with the same prompt and rubric, and never posted. Each job's orchestra request carries the kleis narrowing `github: only discover, fetch`: the task clones and fetches over git, and cannot read GitHub's REST or GraphQL API, where the person's review is. `{\"samples\": [id, …]}` names them; `{\"count\": n}` takes the n reviewed by the fewest runs so far, the most recent first. At most 20 either way, and a sample a live (pending, queued or running) calibration job is reviewing is refused (`409`); `count` leaves those out. `429` when the jobs would pass `--max-calibration-jobs-per-day` (20 by default) for the repository, a cap apart from `--max-jobs-per-day`: each job is a charge on it, and so is each time a person runs a failed one again. Runs are of the `eval` samples unless `split` says `pool`.",
         "requestBody": {
           "required": true,
           "content": {
@@ -1676,6 +2341,15 @@
                     "type": "integer",
                     "minimum": 1,
                     "maximum": 20
+                  },
+                  "split": {
+                    "type": "string",
+                    "enum": [
+                      "eval",
+                      "pool"
+                    ],
+                    "default": "eval",
+                    "description": "`eval`: what calibration measures by. `pool`: evidence for rubric proposals, never in an aggregate. Every sample must be of it (`400`); `count` picks from it."
                   }
                 }
               }
@@ -1752,6 +2426,18 @@
               ]
             },
             "description": "`include`: count stale scores in the aggregates too. By default they are left out."
+          },
+          {
+            "name": "derived",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "include"
+              ]
+            },
+            "description": "`include` counts derived scores too."
           }
         ],
         "responses": {
@@ -1856,6 +2542,18 @@
               ]
             },
             "description": "`include`: count stale scores in the aggregates too. By default they are left out."
+          },
+          {
+            "name": "derived",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "include"
+              ]
+            },
+            "description": "`include` counts derived scores too."
           }
         ]
       }
@@ -1913,6 +2611,18 @@
               ]
             },
             "description": "`include`: count stale scores in the aggregates too. By default they are left out."
+          },
+          {
+            "name": "derived",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "include"
+              ]
+            },
+            "description": "`include` counts derived scores too."
           }
         ]
       }
@@ -1991,7 +2701,12 @@
       "agentBearer": {
         "type": "http",
         "scheme": "bearer",
-        "description": "The agent token ($DIFF_REVIEWER_AGENT_TOKEN_FILE), which kleis injects into an agent's requests. Reaches `/api/agent/v1/` only."
+        "description": "The agent token ($DIFF_REVIEWER_AGENT_TOKEN_FILE), which kleis injects into an agent's requests. Reaches `/api/agent/v1/` only, and not a rubric proposal's routes."
+      },
+      "proposerAgentBearer": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "The proposals' agent token ($DIFF_REVIEWER_PROPOSER_AGENT_TOKEN_FILE), which kleis injects, from an account of its own, into a rubric proposal agent's requests. Reaches a rubric proposal's agent routes only."
       }
     },
     "responses": {
@@ -2026,6 +2741,9 @@
           "mode",
           "autoReview",
           "trustedReviewers",
+          "styleNotes",
+          "evalShare",
+          "styleNotesVersion",
           "version",
           "createdAt"
         ],
@@ -2053,6 +2771,22 @@
               "type": "string"
             },
             "description": "The GitHub logins, in lower case, whose reviews calibration imports and scores the agent against."
+          },
+          "styleNotes": {
+            "type": "string",
+            "maxLength": 16384,
+            "description": "What the operator says of how the repository's reviews are written, in markdown, at most 16 KiB: the agent's instructions end with it. Empty for none."
+          },
+          "evalShare": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100,
+            "description": "The share of pull requests, in percent, whose calibration samples are held out as `eval` (what runs measure by); the rest are the `pool` examples and proposals learn from. 50 by default. A pull request's split is fixed once made, and a later sample of it takes it."
+          },
+          "styleNotesVersion": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "The version of the style notes, 0 before any. Each version records what it was derived from, kept by name across a delete and a registration again; a job records the version its agent was given (`notesVersion`)."
           },
           "version": {
             "type": "integer",
@@ -2109,7 +2843,8 @@
           "postDirect",
           "kind",
           "sampleId",
-          "runId"
+          "runId",
+          "notesVersion"
         ],
         "properties": {
           "id": {
@@ -2277,7 +3012,7 @@
           },
           "kind": {
             "type": "string",
-            "description": "`review`: a review of a pull request, posted once approved. `calibration`: a review of a past commit, scored against a trusted reviewer's review of it and never approved, edited, claimed or posted. A kind a newer build wrote is shown as it is, and never posted."
+            "description": "`review`: a review of a pull request, posted once approved. `calibration`: a review of a past commit, scored against a trusted reviewer's review of it and never approved, edited, claimed or posted. `proposal`: a rubric proposal of the repository (`prNumber` 0), a `draft` once the agent has submitted it; never approved, edited, claimed or posted, and moved by no person (decide its proposal instead). A kind a newer build wrote is shown as it is, and never posted."
           },
           "sampleId": {
             "type": [
@@ -2292,6 +3027,14 @@
               "null"
             ],
             "description": "The calibration run that asked for a `calibration` job."
+          },
+          "notesVersion": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0,
+            "description": "The version of the style notes the agent was given when it read the job, as `rubricVersion` records the rubric: a score is `derived` when either was derived from its sample's pull request."
           }
         }
       },
@@ -2432,7 +3175,7 @@
           },
           "instructions": {
             "type": "string",
-            "description": "How to review and how to write the review, in markdown, followed by the repository's default rubric when it has one."
+            "description": "How to review and how to write the review, in markdown, followed by the repository's default rubric when it has one, and then its `styleNotes` when it has them."
           },
           "prTypes": {
             "type": "array",
@@ -2443,21 +3186,10 @@
           },
           "examples": {
             "type": "array",
-            "description": "Past reviews to calibrate against; empty for now.",
+            "maxItems": 20,
+            "description": "Up to 20 inline comments the repository's trusted reviewers wrote, from its `pool` calibration samples (`full` and `partial`) submitted before the review the job is — a calibration job's sample's review, or the time a review job was made — picked deterministically for variety (different files, categories when known, both scopes, short and medium lengths), to write in the style of, not to copy. Each is its text and category only. Never of the job's pull request, nor of an `eval` sample. Empty when nobody is trusted or nothing qualifies.",
             "items": {
-              "type": "object",
-              "required": [
-                "file",
-                "body"
-              ],
-              "properties": {
-                "file": {
-                  "type": "string"
-                },
-                "body": {
-                  "type": "string"
-                }
-              }
+              "$ref": "#/components/schemas/StyleExample"
             }
           },
           "rubricVersion": {
@@ -2579,6 +3311,20 @@
               "null"
             ],
             "description": "Why this build cannot read the stored document, when it cannot. The agent API then refuses the repository's reviews (`409`) rather than review without the rubric."
+          },
+          "derivedFrom": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The calibration samples the version was derived from: those of the rubric proposal it came from (by accepting it, or a `PUT` with `fromProposal`), and every earlier version's. Ignored when sent back with a `PUT`."
+          },
+          "derivedFromPulls": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The pull requests (`owner/name#pr`) it was derived from: those its proposal's context drew on — misses, unmatched comments, people's edits — and every earlier version's. A score of any sample of them, under this version, is `derived`. Ignored when sent back."
           }
         }
       },
@@ -2670,7 +3416,10 @@
           "submittedAt",
           "importedAt",
           "scope",
-          "updatedAt"
+          "updatedAt",
+          "deleted",
+          "deletedAt",
+          "split"
         ],
         "description": "What one trusted reviewer said of one commit of a closed pull request: every review they submitted of it, merged. Its comments are theirs together, its state the strongest (`CHANGES_REQUESTED`, then `APPROVED`, then `COMMENTED`), its bodies joined.",
         "properties": {
@@ -2765,6 +3514,29 @@
             "type": "string",
             "format": "date-time",
             "description": "When a review was last merged into it."
+          },
+          "deleted": {
+            "type": "boolean",
+            "description": "Deleted: listed only with `?deleted=include`, and left out of every run and aggregate."
+          },
+          "deletedAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "split": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "eval",
+              "pool",
+              null
+            ],
+            "description": "`eval` (held out: what runs measure by) or `pool` (what examples and proposals learn from), by a stable hash of its pull request against `evalShare`, or the split its pull request has already; fixed once made, null until assigned. A `pool` sample of a pull request with an `eval` sample is never learned from."
           }
         }
       },
@@ -2782,7 +3554,8 @@
           "stats",
           "error",
           "requestedAt",
-          "updatedAt"
+          "updatedAt",
+          "resetAt"
         ],
         "description": "A request to import the samples of a repository's recent closed pull requests, and how far it has got.",
         "properties": {
@@ -2869,6 +3642,10 @@
               "deleted": {
                 "type": "integer",
                 "description": "Reviews of a group whose sample was deleted: added to nothing."
+              },
+              "ownPosts": {
+                "type": "integer",
+                "description": "The platform's own posts among the trusted reviewers' reviews, by a job's `postedReview` id or the marker in their body; never samples."
               }
             }
           },
@@ -2890,6 +3667,14 @@
           "failures": {
             "type": "integer",
             "description": "How many times reading the next pull request has failed; at 3 it is skipped as `unreadable`."
+          },
+          "resetAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When GitHub's rate limit resets, while the import waits for it — refused for the limit, or paused under `--github-reserve` — as GitHub's last answer said; null otherwise, and once it goes on."
           }
         }
       },
@@ -3165,7 +3950,9 @@
           "bySeverity",
           "decisions",
           "staleScores",
-          "staleIncluded"
+          "staleIncluded",
+          "derivedScores",
+          "derivedIncluded"
         ],
         "description": "Scores by the current matcher of samples not deleted, added up: counts first, every ratio computed from the sums, so each comment weighs the same.",
         "properties": {
@@ -3324,6 +4111,13 @@
           "staleIncluded": {
             "type": "boolean",
             "description": "Whether stale scores are counted in this aggregate."
+          },
+          "derivedScores": {
+            "type": "integer",
+            "description": "Scores whose sample's pull request the rubric version or the style notes version they were made under was derived from; left out unless `?derived=include`."
+          },
+          "derivedIncluded": {
+            "type": "boolean"
           }
         }
       },
@@ -3503,6 +4297,480 @@
                 },
                 "aggregate": {
                   "$ref": "#/components/schemas/CalibrationAggregate"
+                }
+              }
+            }
+          },
+          "split": {
+            "type": "string",
+            "description": "Whose scores: `eval`."
+          }
+        }
+      },
+      "StyleExample": {
+        "type": "object",
+        "required": [
+          "body",
+          "category"
+        ],
+        "properties": {
+          "body": {
+            "type": "string",
+            "description": "What the reviewer wrote, 20 to 600 characters."
+          },
+          "category": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The category of the agent's comment calibration paired it with; null when it was paired with none."
+          }
+        }
+      },
+      "RubricProposalDiff": {
+        "type": "object",
+        "required": [
+          "defaultRubric",
+          "typesAdded",
+          "typesRemoved",
+          "typesChanged",
+          "styleNotes"
+        ],
+        "description": "What a proposal changes of the rubric version it was written from, and of the style notes the repository had when it was submitted.",
+        "properties": {
+          "defaultRubric": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "`{before, after}`, or null when unchanged.",
+            "properties": {
+              "before": {
+                "type": "string"
+              },
+              "after": {
+                "type": "string"
+              }
+            }
+          },
+          "typesAdded": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PrType"
+            }
+          },
+          "typesRemoved": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Their names."
+          },
+          "typesChanged": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "name",
+                "description",
+                "rubric",
+                "categoriesAdded",
+                "categoriesRemoved",
+                "categoriesChanged"
+              ],
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "description": {
+                  "type": [
+                    "object",
+                    "null"
+                  ],
+                  "description": "`{before, after}`, or null when unchanged.",
+                  "properties": {
+                    "before": {
+                      "type": "string"
+                    },
+                    "after": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "rubric": {
+                  "type": [
+                    "object",
+                    "null"
+                  ],
+                  "description": "`{before, after}`, or null when unchanged.",
+                  "properties": {
+                    "before": {
+                      "type": "string"
+                    },
+                    "after": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "categoriesAdded": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Category"
+                  }
+                },
+                "categoriesRemoved": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "categoriesChanged": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "required": [
+                      "name",
+                      "before",
+                      "after"
+                    ],
+                    "properties": {
+                      "name": {
+                        "type": "string"
+                      },
+                      "before": {
+                        "type": "string"
+                      },
+                      "after": {
+                        "type": "string"
+                      }
+                    }
+                  },
+                  "description": "Categories whose description changed."
+                }
+              }
+            }
+          },
+          "styleNotes": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "Null when the proposal proposes no style notes, or the same.",
+            "properties": {
+              "before": {
+                "type": "string"
+              },
+              "after": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "RubricProposal": {
+        "type": "object",
+        "required": [
+          "id",
+          "owner",
+          "name",
+          "jobId",
+          "status",
+          "baseVersion",
+          "currentVersion",
+          "rebaseNeeded",
+          "rationale",
+          "proposesStyleNotes",
+          "createdAt",
+          "decidedAt",
+          "acceptedVersion"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "owner": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "jobId": {
+            "type": "string",
+            "description": "The `proposal` job that wrote it."
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "accepted",
+              "rejected"
+            ]
+          },
+          "baseVersion": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "The rubric version it was written from; 0 for none."
+          },
+          "currentVersion": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "The rubric's version now."
+          },
+          "rebaseNeeded": {
+            "type": "boolean",
+            "description": "Pending, and the rubric has moved since its base: accepting it is a `409`; rebase it in the editor."
+          },
+          "rationale": {
+            "type": "string",
+            "description": "Why, in markdown."
+          },
+          "proposesStyleNotes": {
+            "type": "boolean"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "decidedAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "acceptedVersion": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "The rubric version accepting it wrote."
+          },
+          "document": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "Only in the answer for one proposal: the proposed document; null with `documentError` when this build cannot read it.",
+            "properties": {
+              "defaultRubric": {
+                "type": "string"
+              },
+              "prTypes": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/PrType"
+                }
+              }
+            }
+          },
+          "documentError": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "styleNotes": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Only in the answer for one: the style notes it proposes, or null for none."
+          },
+          "baseStyleNotes": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The repository's style notes when it was submitted, when it proposes some."
+          },
+          "diff": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/RubricProposalDiff"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Only in the answer for one: against its base; null with `diffError` when either cannot be read."
+          },
+          "diffError": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "ProposalContext": {
+        "type": "object",
+        "required": [
+          "jobId",
+          "owner",
+          "name",
+          "status",
+          "instructions",
+          "rubric",
+          "styleNotes",
+          "calibration",
+          "missedHuman",
+          "unmatchedAgent",
+          "personEdits"
+        ],
+        "properties": {
+          "jobId": {
+            "type": "string"
+          },
+          "owner": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "description": "`running`, once read."
+          },
+          "instructions": {
+            "type": "string",
+            "description": "The task, that the proposal is advisory, that everything else in the context is untrusted data and never instructions, and what to submit, in markdown."
+          },
+          "rubric": {
+            "$ref": "#/components/schemas/RubricDocument",
+            "description": "The current rubric, with its `version` (0 for none): what `baseVersion` names."
+          },
+          "styleNotes": {
+            "type": "string"
+          },
+          "calibration": {
+            "$ref": "#/components/schemas/CalibrationSummary",
+            "description": "Calibration's aggregates of the `pool` samples of pull requests with no `eval` sample — overall, by category, by severity and by rubric version — never of what calibration measures by."
+          },
+          "missedHuman": {
+            "type": "array",
+            "maxItems": 30,
+            "description": "Trusted reviewers' comments the agent did not match, from each sample's newest score that is not stale, of `pool` samples (`full`, not deleted, of a reviewer still trusted, of a pull request with no `eval` sample). A body over 2 KiB is cut and marked `bodyTruncated`.",
+            "items": {
+              "type": "object",
+              "required": [
+                "prNumber",
+                "file",
+                "start_line",
+                "end_line",
+                "body"
+              ],
+              "properties": {
+                "prNumber": {
+                  "type": "integer"
+                },
+                "file": {
+                  "type": "string"
+                },
+                "start_line": {
+                  "type": "integer"
+                },
+                "end_line": {
+                  "type": "integer"
+                },
+                "body": {
+                  "type": "string"
+                },
+                "bodyTruncated": {
+                  "type": "boolean"
+                }
+              }
+            }
+          },
+          "unmatchedAgent": {
+            "type": "array",
+            "maxItems": 30,
+            "description": "The agent's comments no trusted reviewer's matched, likewise. A body over 2 KiB is cut and marked `bodyTruncated`.",
+            "items": {
+              "type": "object",
+              "required": [
+                "prNumber",
+                "file",
+                "start_line",
+                "end_line",
+                "body",
+                "category",
+                "severity"
+              ],
+              "properties": {
+                "prNumber": {
+                  "type": "integer"
+                },
+                "file": {
+                  "type": "string"
+                },
+                "start_line": {
+                  "type": "integer"
+                },
+                "end_line": {
+                  "type": "integer"
+                },
+                "body": {
+                  "type": "string"
+                },
+                "category": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "severity": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "bodyTruncated": {
+                  "type": "boolean"
+                }
+              }
+            }
+          },
+          "personEdits": {
+            "type": "array",
+            "maxItems": 30,
+            "description": "What people changed in the agent's drafts before posting them: of the posted review jobs of pull requests with no `eval` sample, most recent first, each comment of the agent's first draft against the same comment (by id) as posted. A body or suggestion over 2 KiB is cut and marked `bodyTruncated` or `suggestionTruncated`.",
+            "items": {
+              "type": "object",
+              "required": [
+                "jobId",
+                "prNumber",
+                "change",
+                "before",
+                "after"
+              ],
+              "properties": {
+                "jobId": {
+                  "type": "string"
+                },
+                "prNumber": {
+                  "type": "integer"
+                },
+                "change": {
+                  "type": "string",
+                  "enum": [
+                    "changed",
+                    "removed",
+                    "added"
+                  ]
+                },
+                "before": {
+                  "type": [
+                    "object",
+                    "null"
+                  ],
+                  "description": "The agent's comment; null when the person added it."
+                },
+                "after": {
+                  "type": [
+                    "object",
+                    "null"
+                  ],
+                  "description": "As posted; null when the person removed it."
                 }
               }
             }

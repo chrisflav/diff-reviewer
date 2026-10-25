@@ -5,11 +5,14 @@ import Lean.Data.Json
 open Lean (Json)
 
 /-!
-# The agent's side: `diff-reviewer agent show|diff|submit`
+# The agent's side: `diff-reviewer agent show|diff|submit|proposal`
 
 What a reviewing agent runs inside its orchestra sandbox. Each subcommand is one request to the
 platform's agent API (`/api/agent/v1/repos/{owner}/{name}/pulls/{pr}…`), made with curl so that it
-goes through the proxy and CA bundle the sandbox is set up with.
+goes through the proxy and CA bundle the sandbox is set up with. `agent proposal show|submit` are
+a rubric proposal's, of the repository and the job
+(`/api/agent/v1/repos/{owner}/{name}/proposals/{jobId}`): the job is in the path, so `--job` is
+required.
 
 The platform's address and token come from `~/.config/diff-reviewer/agent.json`
 (`{"url": …, "token": …}`), which kleis's setup writes, and `DIFF_REVIEWER_URL` and
@@ -117,9 +120,57 @@ def submit (slug pr path : String) (job : Option String := none) : IO UInt32 := 
   | .error e => fail e
   | .ok j => call "POST" slug pr "/review" (some j.compress) true job
 
-/-- `[]` or `["--job", id]`: the optional trailing flag of every subcommand. -/
+/-- One request to the agent API about rubric proposal job `job` of `slug`. -/
+def proposalRequest (cfg : Config) (method slug job : String) (body : Option String := none) :
+    IO (Except String Http.Response) := do
+  let some (owner, name) := splitSlug slug | return .error s!"'{slug}' is not owner/name"
+  unless !job.isEmpty && job.all (fun c => c.isAlphanum || c == '-' || c == '_' || c == '.') do
+    return .error s!"'{job}' is not a job id"
+  let headers := [("Authorization", s!"Bearer {cfg.token}"), ("Accept", "application/json")] ++
+    (if body.isSome then [("Content-Type", "application/json")] else [])
+  let url := s!"{cfg.url}/api/agent/v1/repos/{owner}/{name}/proposals/{job}"
+  return (← Http.send { method, url, headers, body }).mapError (·.message)
+
+private def callProposal (method slug job : String) (body : Option String) : IO UInt32 := do
+  let cfg ← match ← loadConfig with
+    | .ok c => pure c
+    | .error e => return ← fail e
+  match ← proposalRequest cfg method slug job body with
+  | .error e => fail e
+  | .ok r =>
+    let shown := ((Json.parse r.body).toOption.map (·.pretty)).getD r.body
+    if 200 ≤ r.status && r.status < 300 then
+      IO.println shown
+      return 0
+    fail s!"the platform answered {r.status}: {shown}"
+
+/-- What a rubric proposal is to be written from. -/
+def showProposal (slug job : String) : IO UInt32 :=
+  callProposal "GET" slug job none
+
+/-- What `proposal submit` sends, read from the file the agent wrote: an object with a
+    `baseVersion`, a `rubric` object and a `rationale`, checked before a request is made. The
+    platform checks the rest. -/
+def parseProposal (contents : String) : Except String Json := do
+  let j ← (Json.parse contents).mapError (s!"the proposal is not JSON: " ++ ·)
+  if (j.getObjValAs? Nat "baseVersion").toOption.isNone then
+    throw "the proposal must name the \"baseVersion\" of the rubric it was written from"
+  unless ((j.getObjVal? "rubric").toOption.bind (·.getObj?.toOption)).isSome do
+    throw "the proposal must carry the whole \"rubric\" document, as an object"
+  if (j.getObjValAs? String "rationale").toOption.isNone then
+    throw "the proposal must carry a \"rationale\""
+  return j
+
+/-- Submit the proposal in `path` (`-` for standard input). -/
+def submitProposal (slug path job : String) : IO UInt32 := do
+  let contents ← if path == "-" then (← IO.getStdin).readToEnd else IO.FS.readFile path
+  match parseProposal contents with
+  | .error e => fail e
+  | .ok j => callProposal "POST" slug job (some j.compress)
+
+/-- `["--job", id]`: the trailing flag every subcommand requires, since the platform answers only
+    a request that names its job. -/
 def jobFlag : List String → Option (Option String)
-  | [] => some none
   | ["--job", id] => some (some id)
   | _ => none
 

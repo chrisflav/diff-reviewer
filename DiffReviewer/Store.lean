@@ -36,6 +36,15 @@ structure RepoRow where
   /-- Incremented by every write of the repository's settings (`0004`); a row written before has
       none, which is 1. -/
   version : Option Int
+  /-- What the operator says of how the repository's reviews are written, in markdown, which the
+      agent's instructions carry (`0005`); a row written before has none, which is nothing. -/
+  style_notes : Option String
+  /-- The share of new calibration samples, in percent, held out for measuring (`eval`); the rest
+      are the `pool` that examples and proposals learn from (`0005`). None is 50. -/
+  eval_share : Option Int
+  /-- The version of the style notes the repository has (`NotesRow`), whose provenance a job's
+      agent saw (`0005`); none is none yet. -/
+  style_notes_version : Option Int
   deriving Repr
 
 /-- One review of one pull request at one head commit: queued, run, drafted, approved, posted. -/
@@ -97,6 +106,9 @@ structure JobRow where
       (`0004`). -/
   sample_id : Option String
   run_id : Option String
+  /-- The version of the repository's style notes the agent was given when it read the job
+      (`0005`), as `rubric_version` records the rubric it was checked against; none is none. -/
+  notes_version : Option Int
   deriving Repr
 
 /-- The diff of a pull request at one head commit, as GitHub gave it. A commit's diff never
@@ -121,6 +133,11 @@ structure RubricRow where
   version : Int
   document : String
   created_at : String
+  /-- The calibration samples, and the pull requests (`owner/name#pr`), whose evidence the version
+      was written from, as JSON arrays: those of the proposal it came from, and every earlier
+      version's (`0005`). -/
+  derived_samples : Option String
+  derived_prs : Option String
   deriving Repr
 
 /-- One write of a job's review: who wrote it — the agent, a person, or GitHub, as what it holds
@@ -172,6 +189,9 @@ structure SampleRow where
   imported_at : String
   updated_at : String
   deleted_at : Option String
+  /-- `eval` (held out: what runs measure) or `pool` (what examples and proposals learn from),
+      assigned once by a stable hash of the group (`0005`); none is not assigned yet. -/
+  split : Option String
   deriving Repr
 
 /-- Every review an import has looked at and what became of it (`0004`): what makes importing
@@ -222,6 +242,9 @@ structure ImportRow where
   error : Option String
   requested_at : String
   updated_at : String
+  /-- When GitHub's rate limit resets, while the import waits for it — refused for the limit, or
+      paused under the reserve (`0005`); none otherwise. -/
+  reset_at : Option String
   deriving Repr
 
 /-- A set of calibration jobs asked for together (`0004`). -/
@@ -254,6 +277,78 @@ structure ScoreRow where
       it — so that the score is of a sample that is no longer the whole of it. The score itself is
       left as it was; aggregates leave a stale one out unless asked. None is `false`. -/
   stale : Option Bool
+  deriving Repr
+
+/-- The last version of a deleted repository's settings (`0005`), so that registering it again
+    goes on from there: a version is never given twice to one `owner/name`, and a page that read a
+    version of the old registration cannot have its write taken for one of the new. -/
+@[model (dbName := "repo_tombstone") (primaryKey := ["owner", "name"]) reviewdb]
+structure TombstoneRow where
+  owner : String
+  name : String
+  version : Int
+  deleted_at : String
+  deriving Repr
+
+/-- A rubric document an agent proposed for a repository, from its calibration data, and what a
+    person made of it (`0005`). Written once by the agent's submission; a person's decision sets
+    `status` and `decided_at`, and an accepted one the rubric version it became. -/
+@[model (dbName := "rubric_proposal") (primaryKey := ["id"]) reviewdb]
+structure ProposalRow where
+  id : String
+  owner : String
+  name : String
+  /-- The `proposal` job that wrote it. -/
+  job_id : String
+  /-- The rubric version it was written from, 0 for none. -/
+  base_version : Int
+  /-- The proposed document, as `Rubric.toJson`. -/
+  document : String
+  /-- The style notes it proposes, if it proposes any, and the ones its agent was given when it
+      first read its context (`ContextRow`), which applying its notes checks are still the
+      repository's. -/
+  style_notes : Option String
+  base_style_notes : Option String
+  /-- The calibration samples and the pull requests its context drew on, as JSON arrays. -/
+  context_samples : Option String
+  context_prs : Option String
+  /-- Why, in markdown. -/
+  rationale : String
+  /-- `pending`, `accepted` or `rejected`. -/
+  status : String
+  created_at : String
+  decided_at : Option String
+  /-- The rubric version accepting it wrote. -/
+  accepted_version : Option Int
+  deriving Repr
+
+/-- What a rubric proposal job's agent was first given (`0005`): the style notes it read, which
+    accepting the proposal's notes checks are still the repository's, and the calibration samples
+    its context drew on, which every rubric and style notes accepted from it record. -/
+@[model (dbName := "proposal_context") (primaryKey := ["job_id"]) reviewdb]
+structure ContextRow where
+  job_id : String
+  style_notes : String
+  /-- A JSON array of sample ids, and one of pull requests (`owner/name#pr`). -/
+  sample_ids : String
+  prs : String
+  read_at : String
+  deriving Repr
+
+/-- One version of a repository's style notes, and what they were derived from (`0005`). Kept by
+    name, like the rubric's versions: deleting a repository keeps them, and registering it again
+    goes on from the last, so provenance is never lost. -/
+@[model (dbName := "repo_notes") (primaryKey := ["owner", "name", "version"]) reviewdb]
+structure NotesRow where
+  owner : String
+  name : String
+  version : Int
+  notes : String
+  /-- The samples and pull requests (`owner/name#pr`) the notes were derived from, by rubric
+      proposals, as JSON arrays: this version's and every earlier one's. -/
+  derived_samples : String
+  derived_prs : String
+  created_at : String
   deriving Repr
 
 /-- Calibration's jobs are found by their kind, among every review the platform has made. -/
@@ -436,9 +531,73 @@ def migration0004 : Db.Migration.Migration where
         primaryKey := ["job_id", "matcher_version"] },
     .createIndex "review_job" jobKindIndex]
 
+/-- `0005_m4`: learned review style — a repository's style notes, their versions and the share
+    of samples held out, each sample's split, the rubric proposals agents write from the
+    calibration data with what each was given, the samples and pull requests each rubric version
+    and notes version were derived from, and the notes version each job's agent was given — when
+    the rate limit an import waits for resets, and the last settings version of each deleted
+    repository, which registering it again goes on from. The new columns are nullable: a
+    repository written before has no style notes and holds out half, a sample no split yet (it is
+    given one when next read for a run, an example, a proposal or an aggregate), a rubric version
+    is derived from nothing, a job was given no notes, and an import has no reset to wait for. -/
+def migration0005 : Db.Migration.Migration where
+  name := "0005_m4"
+  steps := [
+    .addColumn "repo" "style_notes" { type := .text, nullable := true },
+    .addColumn "repo" "eval_share" { type := .int, nullable := true },
+    .addColumn "repo" "style_notes_version" { type := .int, nullable := true },
+    .addColumn "review_job" "notes_version" { type := .int, nullable := true },
+    .addColumn "repo_rubric" "derived_samples" { type := .text, nullable := true },
+    .addColumn "repo_rubric" "derived_prs" { type := .text, nullable := true },
+    .addColumn "calibration_sample" "split" { type := .text, nullable := true },
+    .addColumn "calibration_import" "reset_at" { type := .text, nullable := true },
+    .createTable "proposal_context"
+      { columns := .ofList
+          [("job_id", { type := .text, nullable := false }),
+           ("style_notes", { type := .text, nullable := false }),
+           ("sample_ids", { type := .text, nullable := false }),
+           ("prs", { type := .text, nullable := false }),
+           ("read_at", { type := .text, nullable := false })],
+        primaryKey := ["job_id"] },
+    .createTable "repo_notes"
+      { columns := .ofList
+          [("owner", { type := .text, nullable := false }),
+           ("name", { type := .text, nullable := false }),
+           ("version", { type := .int, nullable := false }),
+           ("notes", { type := .text, nullable := false }),
+           ("derived_samples", { type := .text, nullable := false }),
+           ("derived_prs", { type := .text, nullable := false }),
+           ("created_at", { type := .text, nullable := false })],
+        primaryKey := ["owner", "name", "version"] },
+    .createTable "repo_tombstone"
+      { columns := .ofList
+          [("owner", { type := .text, nullable := false }),
+           ("name", { type := .text, nullable := false }),
+           ("version", { type := .int, nullable := false }),
+           ("deleted_at", { type := .text, nullable := false })],
+        primaryKey := ["owner", "name"] },
+    .createTable "rubric_proposal"
+      { columns := .ofList
+          [("id", { type := .text, nullable := false }),
+           ("owner", { type := .text, nullable := false }),
+           ("name", { type := .text, nullable := false }),
+           ("job_id", { type := .text, nullable := false }),
+           ("base_version", { type := .int, nullable := false }),
+           ("document", { type := .text, nullable := false }),
+           ("style_notes", { type := .text, nullable := true }),
+           ("base_style_notes", { type := .text, nullable := true }),
+           ("context_samples", { type := .text, nullable := true }),
+           ("context_prs", { type := .text, nullable := true }),
+           ("rationale", { type := .text, nullable := false }),
+           ("status", { type := .text, nullable := false }),
+           ("created_at", { type := .text, nullable := false }),
+           ("decided_at", { type := .text, nullable := true }),
+           ("accepted_version", { type := .int, nullable := true })],
+        primaryKey := ["id"] }]
+
 /-- The migrations, in the order they are applied. Appended to, never edited. -/
 def migrations : List Db.Migration.Migration :=
-  [migration0001, migration0002, migration0003, migration0004]
+  [migration0001, migration0002, migration0003, migration0004, migration0005]
 
 /-- Where the database is. Set once at start-up (`serve --db`), and by the tests. -/
 initialize pathRef : IO.Ref System.FilePath ← IO.mkRef (System.FilePath.mk "diff-reviewer.db")

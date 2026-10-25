@@ -3,6 +3,7 @@ import DiffReviewer.GitHub
 import DiffReviewer.Orchestra
 import DiffReviewer.Diff
 import DiffReviewer.Calibration
+import DiffReviewer.Proposal
 
 open Lean (Json)
 
@@ -61,6 +62,12 @@ after GitHub has acted on it. So:
     `stale` (`Job.claimBlocks`): what it says is what may have been posted. Posting it again
     settles the claim.
 
+A `proposal` job (`DiffReviewer.Proposal`) is of a repository, not of a pull request: it is
+queued with no `issue_number`, through the client for proposals (`Services.proposer`) — its task
+needs a kleis spec of its own, and orchestra gives every task of one client the client's spec — and
+is followed and cancelled through it. Without that client, proposal jobs stay `pending`, with why.
+Nothing of GitHub is read for it, and it is never posted.
+
 A `calibration` job (`DiffReviewer.Calibration`) is queued and run as a review is, at its sample's
 commit and with its sample's base — the pull request is closed, so neither its state nor its head
 is checked — and is never claimed or posted: `postJob`, `reconcileJob` and `postDirect` refuse it
@@ -108,10 +115,16 @@ structure Limits where
   /-- GitHub requests kept for discovery and posting: imports pause, until the limit resets, when
       fewer are left. -/
   githubReserve : Nat := 500
+  /-- New rubric proposal jobs a person may ask for per repository in 24 hours. -/
+  maxProposalsPerDay : Nat := 2
 
 structure Services where
   github    : Option GitHub.Client
   orchestra : Option Orchestra.Client
+  /-- The orchestra client rubric proposals are queued through: a client file of its own, whose
+      `kleis_spec` (`rubric-proposer`) allows the agent's proposal routes, which the review
+      client's (`reviewer`) must not. -/
+  proposer  : Option Orchestra.Client
   log       : String → IO Unit
   limits    : Limits
   /-- The jobs being posted right now, so that two requests to post one review post it once. -/
@@ -122,8 +135,13 @@ structure Services where
 def Services.new (github : Option GitHub.Client := none)
     (orchestra : Option Orchestra.Client := none)
     (log : String → IO Unit := fun m => IO.eprintln s!"diff-reviewer: {m}")
-    (limits : Limits := {}) : IO Services := do
-  return { github, orchestra, log, limits, posting := ← IO.mkRef [], logged := ← IO.mkRef [] }
+    (limits : Limits := {}) (proposer : Option Orchestra.Client := none) : IO Services := do
+  return { github, orchestra, proposer, log, limits, posting := ← IO.mkRef []
+         , logged := ← IO.mkRef [] }
+
+/-- The orchestra client `job` is queued, followed and cancelled through. -/
+def Services.orchestraFor (s : Services) (job : Job) : Option Orchestra.Client :=
+  if job.kind? == some .proposal then s.proposer else s.orchestra
 
 private def nowEpoch : IO Int :=
   return (← Std.Time.Timestamp.now).toSecondsSinceUnixEpoch.val
@@ -169,11 +187,34 @@ kept by the platform, and never posted."
     "Do not comment on, review or otherwise write to the pull request on GitHub yourself: the \
 review is posted, once accepted, by the platform."
 
+/-- The prompt of the orchestra task that writes rubric proposal `job`. -/
+def proposalPrompt (job : Job) : String :=
+  let slug := s!"{job.owner}/{job.name}"
+  s!"Propose a change to the review rubric of {slug} for the diff-reviewer platform (job {job.id}).
+
+1. Run `diff-reviewer agent proposal show {slug} --job {job.id}`. It prints the repository's \
+current rubric and its version, its style notes, its calibration results — what trusted \
+reviewers raised that the reviewing agent missed, what the agent said that nobody did — and what \
+people changed in the agent's drafts before posting them, with the instructions for the proposal; \
+follow them.
+2. The repository is checked out read-only in your working directory, at its default branch: read \
+its code and documentation where they help you judge the evidence. This task reaches GitHub only \
+through git, not through its API; read nothing else.
+3. Write the rubric document you propose — the whole of it — with a rationale, as the \
+instructions describe, and submit it with \
+`diff-reviewer agent proposal submit {slug} <file> --job {job.id}`. Fix what it reports and submit \
+again until it is accepted.
+
+The proposal is advisory: a person reads it beside the current rubric and accepts or rejects it. \
+Do not change the repository, and do not comment on, review or otherwise write to anything on \
+GitHub."
+
 /-- The prompt of the orchestra task that reviews `job`. It names no head commit: the agent asks the
     platform which one (`agent show`), so a prompt never disagrees with the job. A calibration job's
     differs only in how the commit is read (`checkoutStep`) and in who posts the review
     (`postingLine`), and says nothing of the review it is scored against. -/
 def prompt (job : Job) : String :=
+  if job.kind? == some .proposal then proposalPrompt job else
   let slug := s!"{job.owner}/{job.name}"
   s!"Review pull request #{job.prNumber} of {slug} for the diff-reviewer platform (job {job.id}).
 
@@ -185,7 +226,8 @@ review; follow them.
 and review the change by that type's `rubric` together with the `instructions` (with no `prTypes`, \
 by the `instructions` alone). Give every inline comment a `severity` (`nit`, `minor`, `major` or \
 `blocker`) and a `category`: one of that type's `categories`, or, when it lists none, a word or \
-two of your own.
+two of your own. Write your comments in the style of the `examples` it printed — comments the \
+repository's trusted reviewers wrote on other pull requests — but do not copy them.
 4. Write the review as a JSON file `\{\"headSha\": …, \"prType\": …, \"review\": …}`, with \
 `prType` the name of the type you picked (or null when there are no `prTypes`), and submit it with \
 `diff-reviewer agent submit {slug} {job.prNumber} <file> --job {job.id}`. Fix what it reports and \
@@ -204,12 +246,17 @@ important rather than exceed it.
 def calibrationNarrowing : List String := ["github: only discover, fetch"]
 
 /-- The narrowings a job's orchestra task is queued with: `calibrationNarrowing` for a
-    calibration job, none for a review. -/
+    calibration job and for a rubric proposal — which reads the repository's code through git and
+    has no use for GitHub's API — and none for a review. -/
 def narrowingFor (job : Job) : List String :=
-  if job.kind? == some .calibration then calibrationNarrowing else []
+  if job.kind? == some .calibration || job.kind? == some .proposal then calibrationNarrowing
+  else []
 
 /-- The checkable sentence the run is held to. -/
 def goal (job : Job) : String :=
+  if job.kind? == some .proposal then
+    s!"`diff-reviewer agent proposal submit {job.owner}/{job.name}` accepted a rubric proposal."
+  else
   s!"`diff-reviewer agent submit {job.owner}/{job.name} {job.prNumber}` accepted a review of the \
 pull request."
 
@@ -255,17 +302,27 @@ not comment on what is fine.
   diff), and must lie in a hunk of the diff. `suggestion`, when given, replaces lines
   `start_line`..`end_line` exactly.
 - At most 200 inline comments: if you have more, merge related ones or drop the least important.
-- A review is posted only after the platform accepts it; a person may edit it first."
+- A review is posted only after the platform accepts it; a person may edit it first.
+
+## Style
+
+The `examples` printed with these instructions are inline comments the repository's trusted
+reviewers wrote on other pull requests. Write your comments in their style — their length, their
+tone, how directly they say what to change — but do not copy them: every comment of yours is
+about this change, in your own words. With no examples, write plainly and briefly."
 
 /-- The `instructions` of `GET /api/agent/v1/…/pulls/{pr}`: how to review, then the repository's
-    default rubric, when it has one. The pull request types, each with its own rubric, are beside
-    them in `prTypes`. -/
-def instructionsFor (doc : Option Rubric) : String :=
-  match doc with
-  | some d =>
-    if d.defaultRubric.trimAscii.isEmpty then instructions
-    else instructions ++ "\n\n# The repository's rubric\n\n" ++ d.defaultRubric
-  | none => instructions
+    default rubric, when it has one, then its style notes, when it has them. The pull request
+    types, each with its own rubric, are beside them in `prTypes`, and the examples of its style
+    in `examples`. -/
+def instructionsFor (doc : Option Rubric) (styleNotes : String := "") : String :=
+  let withRubric := match doc with
+    | some d =>
+      if d.defaultRubric.trimAscii.isEmpty then instructions
+      else instructions ++ "\n\n# The repository's rubric\n\n" ++ d.defaultRubric
+    | none => instructions
+  if styleNotes.trimAscii.isEmpty then withRubric
+  else withRubric ++ "\n\n# How reviews of this repository are written\n\n" ++ styleNotes
 
 /-! ## Pull request metadata and diffs -/
 
@@ -569,7 +626,7 @@ private def recordError (id : String) (status : JobStatus) (why : String) : IO U
     it. -/
 def retire (s : Services) (job : Job) (to : JobStatus) (why : String) : IO Unit := do
   if job.status? == some .queued || job.status? == some .running then
-    if let (some orch, some entry) := (s.orchestra, job.queueEntry) then
+    if let (some orch, some entry) := (s.orchestraFor job, job.queueEntry) then
       if let .error e ← orch.cancel entry then
         s.log s!"cancelling entry {entry} of job {job.id}: {e}"
   let _ ← Platform.updateJob job.id fun j => do
@@ -627,53 +684,63 @@ def externalId (id : String) (attempts : Nat) : String :=
 /-- Queueing: every `pending` job of a registered repository whose head is still its pull
     request's, onto orchestra, once its diff has been fetched and found small enough. A calibration
     job is of a past commit of a closed pull request, which it knows with its base from its
-    sample: neither the pull request's state nor its head is checked, only its diff. A job of a
-    kind this build does not know is left alone. -/
+    sample: neither the pull request's state nor its head is checked, only its diff. A rubric
+    proposal is of the repository, and nothing of GitHub is read for it; it is queued through the
+    client for proposals, with no `issue_number`. A job of a kind this build does not know is left
+    alone. -/
 def queuePending (s : Services) : IO Unit := do
   let jobs ← Platform.jobsWithStatus [.pending]
   if jobs.isEmpty then return
-  let some orch := s.orchestra
-    | s.logOnce "queue-no-orchestra" "orchestra is not configured (DIFF_REVIEWER_ORCHESTRA_URL, \
-DIFF_REVIEWER_ORCHESTRA_TOKEN_FILE); pending jobs stay pending"
   for job in jobs do
     if (← Platform.findRepo job.owner job.name).isNone then continue
     if job.kind?.isNone then continue
+    let proposal := job.kind? == some .proposal
+    let some orch := s.orchestraFor job
+      | if proposal then
+          recordError job.id .pending "no orchestra client for rubric proposals is configured \
+(DIFF_REVIEWER_ORCHESTRA_URL, DIFF_REVIEWER_ORCHESTRA_PROPOSER_TOKEN_FILE); the proposal waits"
+        else
+          s.logOnce "queue-no-orchestra" "orchestra is not configured \
+(DIFF_REVIEWER_ORCHESTRA_URL, DIFF_REVIEWER_ORCHESTRA_TOKEN_FILE); pending jobs stay pending"
+        continue
     let mut job := job
-    match s.github with
-    | none =>
-      unless hasPull job do
-        recordError job.id .pending "the job does not know its pull request's head and base, \
-and GitHub is not configured to read them"
-        continue
-    | some gh =>
-      if job.kind? == some .calibration then
+    if !proposal then
+      match s.github with
+      | none =>
         unless hasPull job do
-          retire s job .failed "the calibration job does not know its commit, base and title"
+          recordError job.id .pending "the job does not know its pull request's head and base, \
+and GitHub is not configured to read them"
           continue
-      else
-        match ← gh.getPull job.owner job.name job.prNumber with
+      | some gh =>
+        if job.kind? == some .calibration then
+          unless hasPull job do
+            retire s job .failed "the calibration job does not know its commit, base and title"
+            continue
+        else
+          match ← gh.getPull job.owner job.name job.prNumber with
+          | .error e =>
+            recordError job.id .pending s!"reading the pull request: {e.message}"
+            continue
+          | .ok p =>
+            if p.state != "open" then
+              retire s job .stale s!"the pull request is {p.state}"
+              continue
+            if job.headSha.any (· != p.headSha) then
+              retire s job .stale s!"the pull request moved on to {p.headSha}"
+              continue
+            job := setPull job p
+        match ← diffOf s job with
+        | .ok _ => pure ()
+        | .error (.tooLarge why) =>
+          retire s job .failed why
+          continue
         | .error e =>
-          recordError job.id .pending s!"reading the pull request: {e.message}"
+          recordError job.id .pending s!"reading the diff: {e.message}"
           continue
-        | .ok p =>
-          if p.state != "open" then
-            retire s job .stale s!"the pull request is {p.state}"
-            continue
-          if job.headSha.any (· != p.headSha) then
-            retire s job .stale s!"the pull request moved on to {p.headSha}"
-            continue
-          job := setPull job p
-      match ← diffOf s job with
-      | .ok _ => pure ()
-      | .error (.tooLarge why) =>
-        retire s job .failed why
-        continue
-      | .error e =>
-        recordError job.id .pending s!"reading the diff: {e.message}"
-        continue
     let req : Orchestra.QueueRequest :=
       { prompt := prompt job, goal := goal job, upstream := s!"{job.owner}/{job.name}"
-      , issueNumber := job.prNumber, externalId := externalId job.id job.attempts
+      , issueNumber := if proposal then none else some job.prNumber
+      , externalId := externalId job.id job.attempts
       , kleisNarrow := narrowingFor job
       -- TODO(orchestra): send `checkout := job.headSha` for a calibration job once orchestra's
       -- `POST /api/v1/queue` takes `checkout` (its per-task "check out this commit"); until then
@@ -708,8 +775,8 @@ private def latestEntry (orch : Orchestra.Client) (id : String) :
 /-- Following: move each queued or running job as its orchestra entry moves. -/
 def follow (s : Services) : IO Unit := do
   let jobs ← Platform.jobsWithStatus [.queued, .running]
-  let some orch := s.orchestra | return
   for job in jobs do
+    let some orch := s.orchestraFor job | continue
     let some entryId := job.queueEntry | continue
     match ← latestEntry orch entryId with
     | .error e => s.log s!"following job {job.id} (entry {entryId}): {e}"
@@ -726,7 +793,8 @@ def follow (s : Services) : IO Unit := do
         match next with
         | some .failed =>
           return { j with statusRaw := JobStatus.failed.toString
-                          error := some s!"the run ended ({e.status}) without submitting a review" }
+                          error := some s!"the run ended ({e.status}) without submitting \
+{if j.kind? == some .proposal then "a proposal" else "a review"}" }
         | some st => return { j with statusRaw := st.toString }
         | none => return j
 

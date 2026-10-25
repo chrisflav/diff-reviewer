@@ -153,11 +153,13 @@ def import_ (st : State) (body : String := "{}") : IO Reply :=
 def importId (st : State) (body : String := "{}") : IO String := do
   return (field (← import_ st body) "id").getD ""
 
-/-- Register the repository with alice and bob trusted, and import its history in one pass;
+/-- Register the repository with alice and bob trusted, holding out `evalShare` percent of its
+    samples (all, unless it says), and import its history in one pass;
     answers the import's id. -/
-def imported (st : State) (svc : Workers.Services) (f : FakeHistory) (mode := "staged") :
-    IO String := do
-  let _ ← putRepo st s!"\{\"mode\": \"{mode}\", \"trustedReviewers\": [\"Alice\", \"bob\"]}"
+def imported (st : State) (svc : Workers.Services) (f : FakeHistory) (mode := "staged")
+    (evalShare : Nat := 100) : IO String := do
+  let _ ← putRepo st s!"\{\"mode\": \"{mode}\", \"trustedReviewers\": [\"Alice\", \"bob\"], \
+\"evalShare\": {evalShare}}"
   let id ← importId st
   Calibration.importStep f.client svc.log 100
   return id
@@ -460,10 +462,11 @@ def calibrationJobsAreNeverPosted : Test := withTempDb do
   let queued ← orch.queued.get
   let prompt := (queued[0]?.map (·.prompt)).getD ""
   let has (t : String) := (prompt.splitOn t).length > 1
-  let shown ← route st (agentReq .get "" (pr := 13))
+  let shown ← routeAgent st (agentReq .get "" (pr := 13))
   let shownText := String.fromUTF8! shown.body
   let human := ["Please fix the names.", "rename this", "and this"]
-  let submitted ← route st (agentReq .post "/review" (submission jobHead agentReview) (pr := 13))
+  let submitted ← routeAgent st
+    (agentReq .post "/review" (submission jobHead agentReview) (pr := 13))
   let some job ← Platform.findJob jobId | return #["the calibration job is gone"]
   let approve ← route st (req .post s!"/api/v1/jobs/{jobId}/status"
     (statusBody "approved" job.version))
@@ -487,10 +490,11 @@ def calibrationJobsAreNeverPosted : Test := withTempDb do
   let listedCal ← route st { req .get "/api/v1/jobs" with query := "kind=calibration" }
   let reviewPrompt := Workers.prompt { job with kindRaw := none }
   let withCheckout : Orchestra.QueueRequest :=
-    { prompt := "", goal := "", upstream := "acme/widgets", issueNumber := 13, externalId := "x"
+    { prompt := "", goal := "", upstream := "acme/widgets", issueNumber := some 13
+    , externalId := "x"
     , checkout := some jobHead }
   return checkStatus made 201 "the run"
-    ++ checkEq (queued.map (·.issueNumber)) #[13] "queued, though the pull request is closed"
+    ++ checkEq (queued.map (·.issueNumber)) #[some 13] "queued, though the pull request is closed"
     ++ checkEq (queued.map (·.kleisNarrow)) #[["github: only discover, fetch"]]
       "with its token narrowed to cloning and fetching from GitHub"
     ++ check ((queued[0]?.map (·.toJson.getObjVal? "kleis_narrow" |>.isOk)).getD false)
@@ -630,8 +634,8 @@ def runsAreAggregated : Test := withTempDb do
   let made ← runOf st [sid]
   let runId := (field made "id").getD ""
   Workers.queuePending svc
-  let _ ← route st (agentReq .get "" (pr := 13))
-  let _ ← route st (agentReq .post "/review" (submission jobHead agentReview) (pr := 13))
+  let _ ← routeAgent st (agentReq .get "" (pr := 13))
+  let _ ← routeAgent st (agentReq .post "/review" (submission jobHead agentReview) (pr := 13))
   let rescored ← Calibration.scorePending
   let runs ← route st (req .get s!"{repoPath}/calibration/runs")
   let summary ← route st (req .get s!"{repoPath}/calibration/summary")
