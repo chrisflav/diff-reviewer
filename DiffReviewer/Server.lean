@@ -1330,9 +1330,10 @@ give every comment the category '{c}'" .badRequest
   let done ← match submitted with
     | .ok d => pure d
     | .error why => return .error why .conflict
-  -- A run given up on submitted after all: the run that replaced it is not wanted.
-  if attempt < sub.attempts then
-    if let (some entry, some orch) := (sub.queueEntry, st.services.orchestraFor job) then
+  -- A run given up on submitted after all: the run that replaced it, as the row now holds it, is
+  -- not wanted.
+  if attempt < done.attempts then
+    if let (some entry, some orch) := (done.queueEntry, st.services.orchestraFor job) then
       if let .error e ← orch.cancel entry then
         IO.eprintln s!"diff-reviewer: cancelling entry {entry} of sub-run {done.agentId}: {e}"
   Workers.settleFanout st.services job.id

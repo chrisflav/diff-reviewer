@@ -6,10 +6,12 @@ import {
   acceptRequest,
   adoptionEdits,
   adoptRubricPath,
+  diffCounts,
   loadAdoption,
   notesAdoptionEdits,
   parseInline,
   parseRationale,
+  rubricUnchanged,
   saveRubricEdits,
 } from "./proposals";
 import { formOf, mergeRepoSettings, putBody } from "./repoSettings";
@@ -69,6 +71,46 @@ const proposal: RubricProposal = {
   diff: null,
   diffError: null,
 };
+
+describe("a proposal that only flips fan-out", () => {
+  const none = {
+    defaultRubric: null,
+    typesAdded: [],
+    typesRemoved: [],
+    typesChanged: [],
+    styleNotes: null,
+  };
+  const docOnly = { ...none, fanout: { before: false, after: true } };
+  const typeOnly = {
+    ...none,
+    typesChanged: [
+      {
+        name: "feature",
+        description: null,
+        rubric: null,
+        fanout: { before: true, after: false },
+        categoriesAdded: [],
+        categoriesRemoved: [],
+        categoriesChanged: [],
+      },
+    ],
+  };
+
+  it("changes the rubric", () => {
+    expect(rubricUnchanged(none)).toBe(true);
+    expect(rubricUnchanged(docOnly)).toBe(false);
+    expect(rubricUnchanged(typeOnly)).toBe(false);
+  });
+
+  it("is counted", () => {
+    expect(diffCounts(none)).toBe("no changes");
+    expect(diffCounts(docOnly)).toBe("fan-out turned on");
+    expect(diffCounts({ ...docOnly, fanout: { before: true, after: false } })).toBe(
+      "fan-out turned off",
+    );
+    expect(diffCounts(typeOnly)).toBe("1 type changed");
+  });
+});
 
 describe("acceptRequest", () => {
   it("leaves the style notes out unless asked", () => {

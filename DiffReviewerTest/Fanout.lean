@@ -485,6 +485,31 @@ def aGivenUpRunMaySubmit : Test := withTempDb do
     ++ checkEq (← orch.cancelled.get) #["e3"] "and the run that replaced it is cancelled"
     ++ checkStatus unknown 404 "a run the platform never made"
 
+/-- Sub-runs that end in one pass are run again only as far as the day's cap goes: each retry is
+    reserved in the transaction that makes it pending, so with room for one more run, exactly one
+    runs again and the others fail, saying why. -/
+def retriesKeepToTheCap : Test := withTempDb do
+  let gh ← FakeGitHub.new #[pull7 jobHead]
+  let orch ← FakeOrchestra.new
+  let svc ← Workers.Services.new (some gh.client) (some orch.client) (fun _ => pure ())
+    { maxJobsPerDay := 4 }
+  let st ← State.new cfg svc
+  let id ← fannedRepo st
+  Workers.queuePending svc
+  let before ← Fanout.reviewSpend "acme" "widgets" "2000-01-01T00:00:00Z"
+  for e in ["e0", "e1", "e2"] do orch.set e "failed"
+  Workers.followSubRuns svc
+  let subs ← Fanout.current id
+  let after ← Fanout.reviewSpend "acme" "widgets" "2000-01-01T00:00:00Z"
+  Workers.queueRetries svc
+  return checkEq before 3 "three sub-runs, one short of the cap"
+    ++ checkEq (subs.filter (·.status == "pending")).size 1 "exactly one runs again"
+    ++ checkEq (subs.filter (·.status == "failed")).size 2 "the others fail"
+    ++ check (subs.all fun s => s.status == "pending" ||
+        s.error.any (has · "--max-jobs-per-day")) "saying why"
+    ++ checkEq after 4 "the retry reserved at once"
+    ++ checkEq (← orch.queued.get).size 4 "and queued, once"
+
 /-- A job retired between its queueing and the record of it has its run cancelled, as one run
     and as a sub-run. -/
 def aRetiredJobsRunIsCancelled : Test := withTempDb do
@@ -517,6 +542,7 @@ def all : List (String × Test) :=
    ("calibrationFansOut", calibrationFansOut),
    ("aStaleRoundIsHistory", aStaleRoundIsHistory),
    ("aGivenUpRunMaySubmit", aGivenUpRunMaySubmit),
-   ("aRetiredJobsRunIsCancelled", aRetiredJobsRunIsCancelled)]
+   ("aRetiredJobsRunIsCancelled", aRetiredJobsRunIsCancelled),
+   ("retriesKeepToTheCap", retriesKeepToTheCap)]
 
 end DiffReviewerTest.Fanout

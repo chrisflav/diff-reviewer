@@ -1013,13 +1013,13 @@ private def markRunning (id : String) : IO Unit := do
     unless j.status? == some .queued do throw (.conflict "moved on")
     return { j with statusRaw := JobStatus.running.toString }
 
-/-- The charge for running a sub-run of `job` again, against its day's cap: why not, past it. -/
-private def chargeRetry (s : Services) (job : Job) : IO (Except String Unit) := do
-  let since := isoOfEpoch ((← nowEpoch) - 86400)
-  Store.transact do
-    if job.kind? == some .calibration then
-      Calibration.chargeRetryIn job s.limits.maxCalibrationJobsPerDay
-    else Fanout.reviewRetryChargeIn job s.limits.maxJobsPerDay since
+/-- The charge for running a sub-run of `job` again, against its day's cap, inside the transaction
+    that makes it `pending`: why not, past it. -/
+private def chargeRetryIn (s : Services) (job : Job) (since : String) :
+    Sqlite.M (Except String Unit) :=
+  if job.kind? == some .calibration then
+    Calibration.chargeRetryIn job s.limits.maxCalibrationJobsPerDay
+  else Fanout.reviewRetryChargeIn job s.limits.maxJobsPerDay since
 
 /-- Following the sub-runs of every fan-out job under way, as `follow` follows a job: `running`
     when its run starts; when it ends without a submission, `pending` to run again while it has
@@ -1039,23 +1039,24 @@ def followSubRuns (s : Services) : IO Unit := do
           let ended := Orchestra.terminal e.status
           let starts := e.status == "running" && sub.status == "queued"
           if !ended && !starts && e.id == entryId then continue
-          -- Running it again costs a run more, charged like the first: past the cap it fails.
-          let charged ← if ended && sub.attempts < Fanout.maxAttempts then
-              chargeRetry s job else pure (.ok ())
-          let r ← Fanout.update sub.id fun _ cur => do
-            unless cur.status == "queued" || cur.status == "running" do throw "moved on"
+          -- Running it again costs a run more, charged like the first — checked and reserved in
+          -- the transaction that makes it pending: past the cap it fails.
+          let since := isoOfEpoch ((← nowEpoch) - 86400)
+          let r ← Fanout.updateM sub.id fun j cur => do
+            unless cur.status == "queued" || cur.status == "running" do return .error "moved on"
             let cur := { cur with queueEntry := some e.id }
             if ended then
               let why := s!"the run ended ({e.status}) without submitting a review"
               if cur.attempts < Fanout.maxAttempts then
-                match charged with
+                match ← chargeRetryIn s j since with
                 | .ok () =>
-                  return { cur with status := "pending", error := some s!"{why}; it is run again" }
+                  return .ok { cur with status := "pending"
+                                        error := some s!"{why}; it is run again" }
                 | .error capped =>
-                  return { cur with status := "failed", error := some s!"{why}; {capped}" }
-              return { cur with status := "failed", error := some why }
-            if starts then return { cur with status := "running" }
-            return cur
+                  return .ok { cur with status := "failed", error := some s!"{why}; {capped}" }
+              return .ok { cur with status := "failed", error := some why }
+            if starts then return .ok { cur with status := "running" }
+            return .ok cur
           if r matches .ok { status := "running", .. } then markRunning job.id
     settleFanout s job.id
 

@@ -341,7 +341,8 @@ def currentByJob (jobs : Array Job) : IO (List (String × Array SubRun)) := do
 /-- What `owner/name` has spent of its daily cap of review jobs since `since`: one for each review
     job made since whose current attempt is one run — a job fanned out before and run again as
     one run counts for that run too — and, for each sub-run of a review job made since, one for
-    each of its runs (a sub-run run again costs twice). -/
+    each of its runs, the one it waits to run again among them (a sub-run run again costs
+    twice). -/
 def reviewSpendIn (owner name since : String) : Sqlite.M Nat := do
   let rows ← HasModel.fetch <| query% do
     let j ← from Store.JobRow
@@ -357,7 +358,12 @@ def reviewSpendIn (owner name since : String) : Sqlite.M Nat := do
     select s
   let single := jobs.filter fun j => j.isReview && j.createdAt ≥ since && j.fanoutRound.isNone
   let subsSince := subs.filter fun s => s.created_at ≥ since && reviews.contains s.job_id
-  return single.size + subsSince.foldl (fun n s => n + max 1 s.attempts.toNat) 0
+  -- A sub-run `pending` after a run is to run again: that run is spent already, reserved when it
+  -- was made pending, so that several ending in one pass cannot all pass the cap.
+  let cost (s : Store.SubRunRow) : Nat :=
+    if s.status == "pending" && s.attempts ≥ 1 then s.attempts.toNat + 1
+    else max 1 s.attempts.toNat
+  return single.size + subsSince.foldl (fun n s => n + cost s) 0
 
 def reviewSpend (owner name since : String) : IO Nat := Store.run (reviewSpendIn owner name since)
 
@@ -422,8 +428,10 @@ def begin (job : Job) (learnt : Job → Job) (plan : FanoutPlan) (rubricVersion 
     HasModel.save next.toRow
     return .ok (next, subs)
 
-/-- Change sub-run `id` with `f`, given its job, in one transaction; `f` answers why not. -/
-def update (id : String) (f : Job → SubRun → Except String SubRun) :
+/-- Change sub-run `id` with `f`, given its job, run in one transaction: for a change that
+    writes something else with it, and checks what it reads — the charge for running a sub-run
+    again, reserved in the transaction that makes it `pending`. -/
+def updateM (id : String) (f : Job → SubRun → Sqlite.M (Except String SubRun)) :
     IO (Except String SubRun) := do
   let now ← nowIso
   Store.transact do
@@ -434,12 +442,17 @@ def update (id : String) (f : Job → SubRun → Except String SubRun) :
     let some row := rows[0]? | return .error s!"sub-run {id} is gone"
     let s := SubRun.ofRow row
     let some job ← Platform.fetchJob s.jobId | return .error s!"job {s.jobId} is gone"
-    match f job s with
+    match ← f job s with
     | .error e => return .error e
     | .ok next =>
       let next := { next with updatedAt := now }
       HasModel.save next.toRow
       return .ok next
+
+/-- Change sub-run `id` with `f`, given its job, in one transaction; `f` answers why not. -/
+def update (id : String) (f : Job → SubRun → Except String SubRun) :
+    IO (Except String SubRun) :=
+  updateM id fun j s => pure (f j s)
 
 /-- Record `why` as sub-run `s`'s error while it is still `status`, unless it is recorded already:
     a failure repeated on every pass is written once. -/

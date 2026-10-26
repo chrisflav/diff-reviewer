@@ -490,10 +490,10 @@ export type RubricProposalStatus = "pending" | "accepted" | "rejected";
 /** `{before, after}` of a text a proposal changes; null when unchanged. */
 export type TextChange = { before: string; after: string } | null;
 
-/** What a proposal changes of the rubric version it was written from. */
 /** A flag before and after, or null when it is the same. */
 export type FlagChange = { before: boolean; after: boolean } | null;
 
+/** What a proposal changes of the rubric version it was written from. */
 export interface RubricProposalDiff {
   defaultRubric: TextChange;
   /** The document's `fanout`, when the proposal changes it (API 0.7.0). */
