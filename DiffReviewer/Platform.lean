@@ -342,6 +342,12 @@ structure Job where
   fullReviewReason : Option String := none
   /-- The head the incremental decision was made at: it is made once a head. -/
   incrementalHead : Option String := none
+  /-- Whether a calibration job's task is checked out at its commit, isolated (`true`), or —
+      its commit no longer reached by its pull request's head, after a force-push — runs on the
+      default branch, from the diff alone (`false`); `none` until it is decided, when it is first
+      queued, and for a job of another kind. A job run before checkouts has `none`, and ran on
+      the default branch. -/
+  isolated : Option Bool := none
 
 def Job.status? (j : Job) : Option JobStatus := JobStatus.ofString? j.statusRaw
 
@@ -403,7 +409,8 @@ def Job.toJson (j : Job) : Json :=
     ("directPosts", j.directPosts), ("postDirect", j.postDirect),
     ("kind", j.kindRaw.getD JobKind.review.toString), ("sampleId", optStr j.sampleId),
     ("runId", optStr j.runId),
-    ("notesVersion", (j.notesVersion.map fun v => (v : Json)).getD .null)]
+    ("notesVersion", (j.notesVersion.map fun v => (v : Json)).getD .null),
+    ("isolated", (j.isolated.map fun b => (b : Json)).getD .null)]
   .mkObj (known ++ incremental)
 
 def Job.ofRow (row : Store.JobRow) : Job :=
@@ -421,7 +428,7 @@ def Job.ofRow (row : Store.JobRow) : Job :=
   , fanoutRound := row.fanout_round.map (·.toNat)
   , previousJob := row.previous_job, incrementalSince := row.incremental_since
   , incrementalCommitsRaw := row.incremental_commits, fullReviewReason := row.full_review_reason
-  , incrementalHead := row.incremental_head }
+  , incrementalHead := row.incremental_head, isolated := row.isolated }
 
 def Job.toRow (j : Job) : Store.JobRow :=
   { id := j.id, owner := j.owner, name := j.name, pr_number := j.prNumber
@@ -438,7 +445,7 @@ def Job.toRow (j : Job) : Store.JobRow :=
   , fanout_round := j.fanoutRound.map Int.ofNat
   , previous_job := j.previousJob, incremental_since := j.incrementalSince
   , incremental_commits := j.incrementalCommitsRaw, full_review_reason := j.fullReviewReason
-  , incremental_head := j.incrementalHead }
+  , incremental_head := j.incrementalHead, isolated := j.isolated }
 
 /-- The largest pull request number accepted: what fits a 32-bit column with room to spare. -/
 def maxPrNumber : Nat := 2147483647

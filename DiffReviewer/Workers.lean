@@ -204,28 +204,36 @@ prints it as GitHub holds it (`incremental.postedReview`, with its comments) and
 and every inline comment must be on a line of it. Do not repeat a point the earlier review made; \
 say in the summary which of its points the new commits resolve."
 
-/-- The step of `prompt` that has the agent check out the commit under review. A calibration
-    job's commit is of a pull request that has since been closed. The task's checkout is the
-    repository's default branch, mounted read-only — which may well hold the change as it was
-    merged, after the review — so the agent reviews from the platform's diff, reads files at the
-    commit with `git show` where the clone has it, and is told to read no other ref; what was said
-    of the pull request on GitHub its token's narrowing (`calibrationNarrowing`) keeps from it. -/
+/-- The step of `prompt` that says where the commit under review is. Orchestra checks the task's
+    repository out at it, read-only (`checkoutFor`). A calibration job's commit is of a pull
+    request that has since been closed, and its checkout is isolated: the commit and its history,
+    nothing that came after it — no later commit of the pull request, no default branch that holds
+    the change as it was merged. One whose commit its pull request's head no longer reaches
+    (`isolated` is `false`) runs on the default branch, which may hold the change as it was merged:
+    its agent reviews from the platform's diff, reads files at the commit with `git show` where the
+    clone has it, and is told to read no other ref. What was said of the pull request on GitHub,
+    and GitHub itself, its token's narrowing (`calibrationNarrowing`) keeps from it. -/
 private def checkoutStep (job : Job) (ref : String) : String :=
   let slug := s!"{job.owner}/{job.name}"
   let diff := s!"`diff-reviewer agent diff {slug} {job.prNumber} --job {ref}` prints the diff \
 under review."
+  let noGitHub := "Do not fetch anything, and do not use GitHub in any way, not even anonymously: \
+the pull request's later commits, reviews and comments must stay unread."
   if job.kind? == some .calibration then
-    s!"2. Review the change as it stands at the head commit it names, as if the pull request were \
-open for review now. {diff} Read that diff first. The working directory holds the repository \
-read-only, at a later state than that commit: do not read its files as they are, and do not check \
-out, fetch or read any other ref, branch or commit. For the context of a changed file, read it at \
-the head commit, `git show <headSha>:<path>`, where that commit is in the clone; where it is not, \
-review from the diff alone. Do not read the pull request's reviews or comments; this task reaches \
-GitHub only through git, not through its API."
+    let intro := s!"2. Review the change as it stands at the head commit it names, as if the pull \
+request were open for review now. {diff} Read that diff first."
+    if job.isolated == some false then
+      s!"{intro} The working directory holds the repository read-only, at a later state than \
+that commit: do not read its files as they are, and do not check out or read any other ref, \
+branch or commit. For the context of a changed file, read it at the head commit, \
+`git show <headSha>:<path>`, where that commit is in the clone; where it is not, review from the \
+diff alone. {noGitHub}"
+    else
+      s!"{intro} The working directory holds the repository read-only at that commit, with its \
+history and nothing after it: read its files for the context of a changed file. {noGitHub}"
   else
-    s!"2. The repository is checked out read-only in your working directory. Check out the head \
-commit it names (`git fetch origin pull/{job.prNumber}/head && git checkout <headSha>`) and read \
-the change in context. {diff}{incrementalNote job ref}"
+    s!"2. The repository is checked out read-only in your working directory, at the head commit \
+it names (a detached `HEAD`): read the change in context. {diff}{incrementalNote job ref}"
 
 /-- The prompt's last line: who posts the review, which for a calibration job is nobody. -/
 private def postingLine (job : Job) : String :=
@@ -247,8 +255,8 @@ reviewers raised that the reviewing agent missed, what the agent said that nobod
 people changed in the agent's drafts before posting them, with the instructions for the proposal; \
 follow them.
 2. The repository is checked out read-only in your working directory, at its default branch: read \
-its code and documentation where they help you judge the evidence. This task reaches GitHub only \
-through git, not through its API; read nothing else.
+its code and documentation where they help you judge the evidence. Do not use GitHub in any way, \
+not even anonymously; read nothing else.
 3. Write the rubric document you propose — the whole of it — with a rationale, as the \
 instructions describe, and submit it with \
 `diff-reviewer agent proposal submit {slug} <file> --job {job.id}`. Fix what it reports and submit \
@@ -322,12 +330,29 @@ important rather than exceed it.
 
 {postingLine job}"
 
-/-- The narrowing of a calibration job's kleis token: of GitHub, only the ref advertisement
-    (`discover`) and `git-upload-pack` (`fetch`) — enough to clone and fetch the commit, and no
-    REST or GraphQL read, so the agent cannot read the review it is scored against, nor anything
-    said of the pull request since. kleis compiles it to a reject of every other operation of the
-    `github` service; the agent API (`diff-reviewer`) is not narrowed, and gives it the diff. -/
-def calibrationNarrowing : List String := ["github: only discover, fetch"]
+/-- The narrowing of a calibration or proposal job's kleis token: the platform's agent API
+    (`diff-reviewer`) and no other service — of GitHub nothing at all, no REST or GraphQL read and
+    no git either, so the agent can neither read the review it is scored against nor clone the
+    repository or fetch `refs/pull/<n>/head` and see what came after the commit. It needs none:
+    orchestra fetches the commit, or for a proposal resets the default branch, itself, before the
+    sandbox exists. kleis compiles it to a reject of every request to another service. -/
+def calibrationNarrowing : List String := ["services: diff-reviewer"]
+
+/-- Where orchestra checks a job's task out (`checkout`): at the job's head, fetched by its pull
+    request's head ref (`refs/pull/<n>/head`, which GitHub keeps for a closed pull request too,
+    as it does not keep `merge`), on a detached `HEAD`. A calibration job's is isolated: a
+    repository of the reviewed commit and its history only, so that its agent sees neither what
+    the pull request became after the review nor the default branch that merged it — unless its
+    pull request's head no longer reaches the commit (`isolated` is `false`, `isolationOf`), which
+    orchestra would refuse to check out: that job runs on the default branch, from the diff. A
+    rubric proposal is of the repository, and reads its default branch: none. Nor is there one for
+    a job that does not know its head yet, which is not queued. -/
+def checkoutFor (job : Job) : Option Orchestra.Checkout :=
+  if job.kind? == some .proposal then none else
+  if job.kind? == some .calibration && job.isolated == some false then none else
+  job.headSha.map fun sha =>
+    { commit := sha, fetchRef := some s!"refs/pull/{job.prNumber}/head"
+      isolate := job.kind? == some .calibration }
 
 /-- The narrowings a job's orchestra task is queued with: `calibrationNarrowing` for a
     calibration job and for a rubric proposal — which reads the repository's code through git and
@@ -965,8 +990,14 @@ def queueSubRuns (s : Services) (job : Job) : IO Unit := do
     let req : Orchestra.QueueRequest :=
       { prompt := prompt job (some scope), goal := goal job, upstream := s!"{job.owner}/{job.name}"
       , issueNumber := some job.prNumber, externalId := sub.externalId
-      , kleisNarrow := narrowingFor job, checkout := none }
+      , kleisNarrow := narrowingFor job, checkout := checkoutFor job }
     match ← orch.queue req with
+    | .error (.refused why) =>
+      if Orchestra.refusesCheckout why then
+        -- Every sub-run asks for the same checkout: one refused, the review is.
+        retire s job .failed s!"orchestra refused sub-run {scope.ref}: {why}"
+        return
+      Fanout.recordError sub "pending" s!"queueing on orchestra: {why}"
     | .error e => Fanout.recordError sub "pending" s!"queueing on orchestra: {e}"
     | .ok entry =>
       let r ← Fanout.update sub.id fun j cur => do
@@ -984,6 +1015,21 @@ def queueSubRuns (s : Services) (job : Job) : IO Unit := do
           if let .error e ← orch.cancel entry.id then
             s.log s!"cancelling entry {entry.id} of sub-run {scope.ref}: {e}"
         s.log s!"sub-run {scope.ref} changed while it was queued as entry {entry.id}"
+
+/-- Whether calibration job `job`'s commit can be checked out isolated: whether its pull
+    request's head now — what `refs/pull/<n>/head` names, which orchestra fetches and requires to
+    reach the commit — is the commit or descends from it. A head a force-push rewrote after the
+    review does not (GitHub compares them as `behind` or `diverged`), and orchestra would fail the
+    run, charged, on every attempt: such a job runs without a checkout instead (`checkoutFor`). -/
+def isolationOf (gh : GitHub.Client) (job : Job) : IO (Except String Bool) := do
+  let some commit := job.headSha | return .error "the calibration job does not know its commit"
+  match ← gh.getPull job.owner job.name job.prNumber with
+  | .error e => return .error s!"reading the pull request's head: {e.message}"
+  | .ok p =>
+    if p.headSha == commit then return .ok true
+    match ← gh.compare job.owner job.name commit p.headSha with
+    | .error e => return .error s!"comparing the commit with the pull request's head: {e.message}"
+    | .ok c => return .ok (c.status == "ahead" || c.status == "identical")
 
 /-- Queueing: every `pending` job of a registered repository whose head is still its pull
     request's, onto orchestra, once its diff has been fetched and found small enough. A calibration
@@ -1020,6 +1066,21 @@ and GitHub is not configured to read them"
           unless hasPull job do
             retire s job .failed "the calibration job does not know its commit, base and title"
             continue
+          -- Whether its commit can be checked out isolated: decided once, and kept on the job.
+          if job.isolated.isNone then
+            match ← isolationOf gh job with
+            | .error why =>
+              recordError job.id .pending why
+              continue
+            | .ok iso =>
+              match ← Platform.updateJob job.id fun j => do
+                  unless j.status? == some .pending && j.version == job.version do
+                    throw (.conflict "moved on")
+                  return { j with isolated := some iso } with
+              | .ok j =>
+                job := { job with isolated := some iso, version := j.version
+                                  updatedAt := j.updatedAt }
+              | .error _ => continue
         else
           match ← gh.getPull job.owner job.name job.prNumber with
           | .error e =>
@@ -1090,12 +1151,15 @@ default and {plan.categories.length} categories), more than {repo.slug}'s maxFan
       { prompt := prompt job, goal := goal job, upstream := s!"{job.owner}/{job.name}"
       , issueNumber := if proposal then none else some job.prNumber
       , externalId := externalId job.id job.attempts
-      , kleisNarrow := narrowingFor job
-      -- TODO(orchestra): send `checkout := job.headSha` for a calibration job once orchestra's
-      -- `POST /api/v1/queue` takes `checkout` (its per-task "check out this commit"); until then
-      -- it refuses the field, and the task is checked out at the default branch.
-      , checkout := none }
+      , kleisNarrow := narrowingFor job, checkout := checkoutFor job }
     match ← orch.queue req with
+    -- A checkout the backend does not make: asked again, it would be refused again, so the job
+    -- fails with why, for a person to run again once that is fixed. Any other refusal is of the
+    -- client file, which the job waits on, as it does on everything else.
+    | .error (.refused why) =>
+      if Orchestra.refusesCheckout why then
+        retire s job .failed s!"orchestra refused the task: {why}"
+      else recordError job.id .pending s!"queueing on orchestra: {why}"
     | .error e => recordError job.id .pending s!"queueing on orchestra: {e}"
     | .ok entry =>
       let r ← Platform.updateJob job.id fun j => do
@@ -1138,6 +1202,18 @@ private def latestEntry (orch : Orchestra.Client) (id : String) :
     | .error err => return .error err
   return .ok e
 
+/-- What a run of `job` that ended `status` may have failed of, for its error: orchestra fails a
+    task whose checkout cannot be had — a commit its fetch ref no longer reaches, after a
+    force-push — and its queue entry says only that it `failed`. -/
+private def checkoutNote (job : Job) (status : String) : String :=
+  match checkoutFor job with
+  | some c =>
+    if status != "failed" then "" else
+    let ref := (c.fetchRef.map (s!" of " ++ ·)).getD ""
+    s!"; orchestra fails a run whose checkout, {c.commit}{ref}, cannot be fetched, and its task's \
+log says whether that is why"
+  | none => ""
+
 /-- Following: move each queued or running job as its orchestra entry moves. -/
 def follow (s : Services) : IO Unit := do
   let jobs ← Platform.jobsWithStatus [.queued, .running]
@@ -1160,7 +1236,7 @@ def follow (s : Services) : IO Unit := do
         | some .failed =>
           return { j with statusRaw := JobStatus.failed.toString
                           error := some s!"the run ended ({e.status}) without submitting \
-{if j.kind? == some .proposal then "a proposal" else "a review"}" }
+{if j.kind? == some .proposal then "a proposal" else "a review"}{checkoutNote j e.status}" }
         | some st => return { j with statusRaw := st.toString }
         | none => return j
 
@@ -1205,7 +1281,8 @@ def followSubRuns (s : Services) : IO Unit := do
             unless cur.status == "queued" || cur.status == "running" do return .error "moved on"
             let cur := { cur with queueEntry := some e.id }
             if ended then
-              let why := s!"the run ended ({e.status}) without submitting a review"
+              let why := s!"the run ended ({e.status}) without submitting a review\
+{checkoutNote j e.status}"
               if cur.attempts < Fanout.maxAttempts then
                 match ← chargeRetryIn s j since with
                 | .ok () =>

@@ -533,6 +533,29 @@ def aRetiredJobsRunIsCancelled : Test := withTempDb do
   return checkEq single #["e0"] "one run's entry"
     ++ check (all.contains "e1") "a sub-run's entry"
 
+/-- Every sub-run of a fan-out asks for the job's checkout; one refused by orchestra fails the
+    job with its reason, and the sub-runs queued before it have their runs cancelled. -/
+def aRefusedSubRunFailsTheJob : Test := withTempDb do
+  let gh ← FakeGitHub.new #[pull7 jobHead]
+  let orch ← FakeOrchestra.new
+  let why := s!"orchestra answered 400: {isolateRefusal}"
+  let refusing : Orchestra.Client := { orch.client with
+    queue := fun r => do
+      if (← orch.queued.get).size ≥ 1 then return .error (.refused why)
+      orch.client.queue r }
+  let svc ← Workers.Services.new (some gh.client) (some refusing) (fun _ => pure ())
+  let st ← State.new cfg svc
+  let id ← fannedRepo st
+  Workers.queuePending svc
+  let some job ← Platform.findJob id | return #["the job is gone"]
+  let subs ← Fanout.current id
+  return checkEq ((← orch.queued.get).map (·.checkout.map (·.commit))) #[some jobHead]
+      "the first sub-run, checked out at the head"
+    ++ checkEq job.statusRaw "failed" "the job"
+    ++ check (job.error.any (·.endsWith why)) "with orchestra's reason"
+    ++ check (subs.all (·.status == "cancelled")) "its sub-runs, cancelled"
+    ++ checkEq (← orch.cancelled.get) #["e0"] "the queued one's run with them"
+
 def all : List (String × Test) :=
   [("theFanoutIsPlanned", theFanoutIsPlanned),
    ("theMergeRules", theMergeRules),
@@ -544,6 +567,7 @@ def all : List (String × Test) :=
    ("aStaleRoundIsHistory", aStaleRoundIsHistory),
    ("aGivenUpRunMaySubmit", aGivenUpRunMaySubmit),
    ("aRetiredJobsRunIsCancelled", aRetiredJobsRunIsCancelled),
-   ("retriesKeepToTheCap", retriesKeepToTheCap)]
+   ("retriesKeepToTheCap", retriesKeepToTheCap),
+   ("aRefusedSubRunFailsTheJob", aRefusedSubRunFailsTheJob)]
 
 end DiffReviewerTest.Fanout

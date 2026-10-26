@@ -1566,6 +1566,13 @@ svg.chart .hit {
   margin-left: 4px;
 }
 
+.tag.flag-unisolated {
+  color: var(--warn);
+  border-color: currentColor;
+  border-style: dashed;
+  margin-left: 4px;
+}
+
 .tag.split-eval {
   color: var(--accent);
   border-color: currentColor;

@@ -223,7 +223,7 @@ def whatThisBuildCannotReadIsKept : Test := do
        , post_direct := none, kind := none, sample_id := none, run_id := none
        , notes_version := none, fanout_round := none, previous_job := none
        , incremental_since := none, incremental_commits := none, full_review_reason := none
-       , incremental_head := none }
+       , incremental_head := none, isolated := none }
        : Store.JobRow)
     let read ← route st (req .get s!"/api/v1/jobs/{id}")
     let write ← route st (req .post s!"/api/v1/jobs/{id}/status" (statusBody "rejected" 1))

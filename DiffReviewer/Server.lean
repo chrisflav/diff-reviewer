@@ -407,7 +407,7 @@ private def parseBody (body : String) : Except String Json :=
     sub-runs one review fans out to; `incremental` turns incremental re-review on or off. All three
     are kept when left out. `fromProposal` names
     the rubric proposal the style notes written come from: they record its provenance, and it is
-    accepted with the write. `mode` and
+    left pending, its rubric still to be accepted or rejected. `mode` and
     `autoReview` take their defaults when left out, as they always have; `trustedReviewers` and
     `styleNotes` keep what they were, so that a client that does not know them cannot wipe them.
     `version`, when given, is the version of the settings last read (0 for a repository not
@@ -483,7 +483,7 @@ or be \"\" for none; '{t}' is not one" .badRequest
     | .ok (.bool b) => pure (some b)
     | .ok _ => return .error "'incremental' must be true or false" .badRequest
   -- Style notes a person wrote from a rubric proposal — after rebasing it, say — record its
-  -- provenance, and the proposal is accepted with the write.
+  -- provenance; the proposal is not decided by them, and its rubric can still be accepted.
   let provenance ← match j.getObjVal? "fromProposal" with
     | .error _ | .ok .null => pure (pure (.ok {}))
     | .ok (.str id) =>
@@ -767,6 +767,11 @@ private def staleIn (query : String) : Bool := queryParam query "stale" == some 
 /-- Whether it asks for derived scores too (`?derived=include`). -/
 private def derivedIn (query : String) : Bool := queryParam query "derived" == some "include"
 
+/-- Whether it takes in the scores of jobs not checked out isolated at their commit, as it does
+    unless asked not to (`?unisolated=exclude`). -/
+private def unisolatedIn (query : String) : Bool :=
+  queryParam query "unisolated" != some "exclude"
+
 /-- Answer `k` for registered repository `owner/name`, or `404`. -/
 private def withRepo (owner name : String) (k : Repo → IO Reply) : IO Reply := do
   match ← Platform.findRepo owner.toLower name.toLower with
@@ -1032,18 +1037,18 @@ import is cancelled"), ("import", i.toJson)]) .conflict
     withRepo owner name fun repo => do
       let runs ← Calibration.runsOf repo.owner repo.name
       page r.query (← runs.mapM (Calibration.runJson · (detail := false) (staleIn r.query)
-        (derivedIn r.query)))
+        (derivedIn r.query) (unisolatedIn r.query)))
   | ["repos", owner, name, "calibration", "runs", id], .get =>
     withRepo owner name fun repo => do
       match ← Calibration.findRun repo.owner repo.name id with
       | some run =>
         return .json (← Calibration.runJson run (detail := true) (staleIn r.query)
-          (derivedIn r.query))
+          (derivedIn r.query) (unisolatedIn r.query))
       | none => return .error "not found" .notFound
   | ["repos", owner, name, "calibration", "summary"], .get =>
     withRepo owner name fun repo => do
       return .json (← Calibration.summaryJson repo.owner repo.name (staleIn r.query)
-        (derivedIn r.query))
+        (derivedIn r.query) (includeUnisolated := unisolatedIn r.query))
   | ["repos", owner, name, "proposals"], .post =>
     createProposal st owner.toLower name.toLower r.body
   | ["repos", owner, name, "proposals"], .get =>

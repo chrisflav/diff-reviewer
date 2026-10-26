@@ -348,6 +348,15 @@ describe("parseRationale", () => {
   });
 });
 
+describe("parseInline after a link with no end", () => {
+  it("is text, and a link after it is still one", () => {
+    expect(parseInline("[[a](b [c](d)")).toEqual([
+      { kind: "text", text: "[[a](b " },
+      { kind: "link", children: [{ kind: "text", text: "c" }], target: "d" },
+    ]);
+  });
+});
+
 describe("parseRationale on hostile input", () => {
   // At the 32 KB limit of a rationale; each of these took from a third of a second to minutes.
   const limit = 32 * 1024;
@@ -361,6 +370,8 @@ describe("parseRationale on hostile input", () => {
     "a heading of #s": () => `# ${"#".repeat(limit)}x`,
     "backtick runs of distinct lengths": ticks,
     "unclosed brackets": () => "[".repeat(limit),
+    "brackets before a link with no end": () =>
+      `${"[".repeat(limit / 2)}a](${"b".repeat(limit / 2)}`,
     "unclosed strong": () => "**a ".repeat(limit / 4),
     "unclosed underscores": () => "__a ".repeat(limit / 4),
     "a mix": () => "[`*_".repeat(limit / 4),

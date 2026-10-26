@@ -183,7 +183,8 @@ def anIncrementalReReview : Test := withTempDb do
     waiting, recorded once. -/
 def aForcePushIsReviewedInFull : Test := withTempDb do
   let failing : Orchestra.Client :=
-    { queue := fun _ => return .error "orchestra answered 503", entry := fun _ => return .error ""
+    { queue := fun _ => return .error (.failed "orchestra answered 503")
+      entry := fun _ => return .error ""
       cancel := fun _ => return .ok () }
   let (svc0, _, _, _, _, b0) ← posted .diverged
   let svcF := { svc0 with orchestra := some failing }
@@ -285,6 +286,24 @@ def compareReadsTheNewestPages : Test := do
     ++ checkEq round (some (100, some "c200", some "c299")) "a full last page"
     ++ checkEq roundPages #[1, 3] "alone"
 
+/-- What the real client reads of a comparison: the page it asks for, 100 commits a page, and
+    of GitHub's answer `total_commits` — how many there are in all, more than a page holds — beside
+    the page's commits, lower-cased, with their messages. -/
+def theClientReadsAComparison : Test := do
+  let answer := "{\"status\": \"ahead\", \"total_commits\": 250, \"commits\": [\
+{\"sha\": \"ABC1\", \"commit\": {\"message\": \"First.\"}}, {\"sha\": \"abc2\"}]}"
+  let parsed := (Json.parse answer).bind GitHub.Comparison.ofJson
+  let short := (Json.parse "{\"status\": \"behind\", \"commits\": []}").bind
+    GitHub.Comparison.ofJson
+  return checkEq (GitHub.comparePagePath "acme" "widgets" headA headB 3)
+      s!"/repos/acme/widgets/compare/{headA}...{headB}?per_page=100&page=3" "page 3's path"
+    ++ checkEq (parsed.toOption.map (·.totalCommits)) (some 250) "total_commits, in all"
+    ++ checkEq (parsed.toOption.map (·.commits)) (some #[("abc1", "First."), ("abc2", "")])
+      "the page's commits"
+    ++ checkEq (parsed.toOption.map (·.status)) (some "ahead") "the status"
+    ++ checkEq (short.toOption.map (·.totalCommits)) (some 0)
+      "without total_commits, the page's count"
+
 /-- The agent CLI's `--since`, and the prompt of a fan-out's sub-run of an incremental re-review. -/
 def theAgentAsksForTheChangesSince : Test := do
   let job : Job := { id := "j1", owner := "acme", name := "widgets", prNumber := 7
@@ -310,6 +329,7 @@ def all : List (String × Test) :=
    ("aForcePushIsReviewedInFull", aForcePushIsReviewedInFull),
    ("incrementalIsASetting", incrementalIsASetting),
    ("theAgentAsksForTheChangesSince", theAgentAsksForTheChangesSince),
-   ("compareReadsTheNewestPages", compareReadsTheNewestPages)]
+   ("compareReadsTheNewestPages", compareReadsTheNewestPages),
+   ("theClientReadsAComparison", theClientReadsAComparison)]
 
 end DiffReviewerTest.Incremental

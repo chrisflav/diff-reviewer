@@ -429,6 +429,12 @@ export interface CalibrationAggregate {
    */
   derivedScores?: number;
   derivedIncluded?: boolean;
+  /**
+   * Scores of jobs not checked out isolated at their commit, and whether they are counted (they
+   * are unless `?unisolated=exclude`). Absent before API 0.9.0.
+   */
+  unisolatedScores?: number;
+  unisolatedIncluded?: boolean;
   agentComments: number;
   humanComments: number;
   matched: number;
@@ -470,6 +476,14 @@ export interface CalibrationRunResult {
   scoreStale: boolean;
   /** The score is of a sample its rubric version learned from: left out of the aggregate. */
   scoreDerived?: boolean;
+  /**
+   * Whether the job was checked out isolated at its commit: false when a force-push left the
+   * commit unreached by its pull request's head and it ran on the default branch, null before
+   * checkouts or until decided. Absent before API 0.9.0.
+   */
+  isolated?: boolean | null;
+  /** The score is of a job not checked out isolated; counted unless asked not to. */
+  scoreUnisolated?: boolean;
 }
 
 export interface CalibrationRun {
@@ -477,6 +491,8 @@ export interface CalibrationRun {
   owner: string;
   name: string;
   createdAt: string;
+  /** The split it was run of; `pool` runs are never counted. Absent before API 0.9.0. */
+  split?: "eval" | "pool";
   samples: number;
   /** Its jobs by status. */
   jobs: Record<string, number>;
@@ -767,28 +783,43 @@ export const api = {
     offset = 0,
     stale = false,
     derived = false,
+    isolatedOnly = false,
   ) =>
     request<Page<CalibrationRun>>(
       "GET",
-      `${calibration(owner, name)}/runs?${pageQuery(limit, offset)}${scoreQuery(stale, derived, "&")}`,
+      `${calibration(owner, name)}/runs?${pageQuery(limit, offset)}${scoreQuery(stale, derived, "&", isolatedOnly)}`,
     ),
   /**
    * One run, with each sample's result; `stale` counts stale scores in its aggregate, `derived`
-   * the scores of samples its rubric or style notes learned from (API 0.6.0).
+   * the scores of samples its rubric or style notes learned from (API 0.6.0); `isolatedOnly`
+   * leaves out the scores of jobs not checked out isolated (API 0.9.0).
    */
-  calibrationRun: (owner: string, name: string, id: string, stale = false, derived = false) =>
+  calibrationRun: (
+    owner: string,
+    name: string,
+    id: string,
+    stale = false,
+    derived = false,
+    isolatedOnly = false,
+  ) =>
     request<CalibrationRun>(
       "GET",
-      `${calibration(owner, name)}/runs/${seg(id)}${scoreQuery(stale, derived, "?")}`,
+      `${calibration(owner, name)}/runs/${seg(id)}${scoreQuery(stale, derived, "?", isolatedOnly)}`,
     ),
   /**
    * The aggregate over every run, and by rubric version; `stale` counts stale scores too, and
-   * `derived` derived ones.
+   * `derived` derived ones; `isolatedOnly` leaves out those of jobs not checked out isolated.
    */
-  calibrationSummary: (owner: string, name: string, stale = false, derived = false) =>
+  calibrationSummary: (
+    owner: string,
+    name: string,
+    stale = false,
+    derived = false,
+    isolatedOnly = false,
+  ) =>
     request<CalibrationSummary>(
       "GET",
-      `${calibration(owner, name)}/summary${scoreQuery(stale, derived, "?")}`,
+      `${calibration(owner, name)}/summary${scoreQuery(stale, derived, "?", isolatedOnly)}`,
     ),
 
   /**
@@ -845,11 +876,20 @@ export interface Page<T> {
 }
 
 /**
- * `?stale=include` (or `&…`) when stale scores are to be counted, and `derived=include` when
- * derived ones are.
+ * `?stale=include` (or `&…`) when stale scores are to be counted, `derived=include` when
+ * derived ones are, and `unisolated=exclude` when only isolated jobs' scores are.
  */
-export function scoreQuery(stale: boolean, derived: boolean, sep: "?" | "&"): string {
-  const q = [...(stale ? ["stale=include"] : []), ...(derived ? ["derived=include"] : [])];
+export function scoreQuery(
+  stale: boolean,
+  derived: boolean,
+  sep: "?" | "&",
+  isolatedOnly = false,
+): string {
+  const q = [
+    ...(stale ? ["stale=include"] : []),
+    ...(derived ? ["derived=include"] : []),
+    ...(isolatedOnly ? ["unisolated=exclude"] : []),
+  ];
   return q.length === 0 ? "" : `${sep}${q.join("&")}`;
 }
 

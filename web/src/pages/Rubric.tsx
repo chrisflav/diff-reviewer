@@ -2,6 +2,7 @@ import { useCallback, useContext, useEffect, useMemo, useRef, useState } from "r
 import { Link, useBlocker, useParams, useSearchParams } from "react-router-dom";
 import { api, ApiError, UnauthorizedError, type RubricDocument } from "../api";
 import { loadAdoption, proposalPath, saveRubricEdits } from "../proposals";
+import { saveRefusal } from "../repoSettings";
 import {
   alignRubric,
   documentOf,
@@ -81,6 +82,7 @@ function RubricView({
 
   const [edits, setEdits] = useState<RubricEdits | null>(null);
   const [conflict, setConflict] = useState<string | null>(null);
+  const [refused, setRefused] = useState<string | null>(null);
   const [rebased, setRebased] = useState<Rebased | null>(null);
   const [busy, setBusy] = useState(false);
   const [savedNote, setSavedNote] = useState<string | null>(null);
@@ -292,6 +294,7 @@ function RubricView({
     setBusy(true);
     setError(null);
     setSavedNote(null);
+    setRefused(null);
     saveRubricEdits(owner, name, sent)
       .then((d) => {
         setHistoryNonce((n) => n + 1);
@@ -315,15 +318,45 @@ function RubricView({
           mergeOnto(d, rest, false);
         }
       })
-      .catch(fail)
+      .catch((err: unknown) => {
+        if (!(err instanceof ApiError && err.status === 409)) return fail(err);
+        // The rubric still at the version the edits are to: refused for something else — the
+        // proposal named was rejected meanwhile, say — which no merge mends.
+        api
+          .rubrics(owner, name)
+          .then((theirs) => {
+            const why = saveRefusal(sent.version, theirs, err.message);
+            if (why === null) setConflict(err.message);
+            else setRefused(why);
+          })
+          .catch(fail);
+      })
       .finally(() => setBusy(false));
   };
 
   const discard = () => {
     setEdits(null);
     setRebased(null);
+    setRefused(null);
     dropRubricStash(repo);
     setError(null);
+  };
+
+  /** Keep the edits as one's own: saved, they no longer name the proposal. */
+  const stopAdopting = () => {
+    setRefused(null);
+    setEdits((e) => {
+      if (e === null) return e;
+      const own = { ...e };
+      delete own.fromProposal;
+      return own;
+    });
+    setRebased((rb) => {
+      if (rb === null) return rb;
+      const source = { ...rb.source };
+      delete source.fromProposal;
+      return { ...rb, source };
+    });
   };
 
   const reloadDiscarding = () => {
@@ -489,6 +522,20 @@ function RubricView({
             <div className="actions">
               <button type="button" onClick={reloadDiscarding}>
                 Reload
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+      {refused !== null && (
+        <div className="notice warn-notice" role="alert">
+          <p>
+            Refused, nothing was saved: <span className="body">{refused}</span>
+          </p>
+          {edits?.fromProposal !== undefined && (
+            <div className="actions">
+              <button type="button" onClick={stopAdopting} disabled={busy}>
+                Stop adopting, keep my edits
               </button>
             </div>
           )}

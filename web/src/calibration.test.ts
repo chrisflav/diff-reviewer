@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { AgentComment, HumanComment } from "./api";
+import { scoreQuery, type AgentComment, type HumanComment } from "./api";
 import {
   decisionTable,
   FEW,
@@ -241,5 +241,24 @@ describe("the chart's direct labels", () => {
     const a = { ...run({}), id: "new", createdAt: "2026-10-02T00:00:00Z" };
     const b = { ...run({}), id: "old", createdAt: "2026-09-01T00:00:00Z" };
     expect(runPoints([a, b]).map((p) => p.id)).toEqual(["old", "new"]);
+  });
+
+  it("leave out a run of the pool, which is never counted", () => {
+    const e = { ...run({}), id: "eval", split: "eval" as const };
+    const p = { ...run({}), id: "pool", split: "pool" as const };
+    const old = { ...run({}), id: "old" };
+    expect(runPoints([e, p, old]).map((x) => x.id)).toEqual(["eval", "old"]);
+  });
+});
+describe("scoreQuery", () => {
+  it("asks for nothing by default", () => {
+    expect(scoreQuery(false, false, "?")).toBe("");
+  });
+
+  it("leaves out the scores of jobs not checked out isolated only when asked", () => {
+    expect(scoreQuery(false, false, "?", true)).toBe("?unisolated=exclude");
+    expect(scoreQuery(true, true, "&", true)).toBe(
+      "&stale=include&derived=include&unisolated=exclude",
+    );
   });
 });

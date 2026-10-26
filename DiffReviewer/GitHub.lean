@@ -141,6 +141,11 @@ def Comparison.ofJson (j : Json) : Except String Comparison := do
     | .error _ => #[]
   return { status, commits, totalCommits := total.getD commits.size }
 
+/-- The path of page `page` of the comparison of `base` and `head` in `owner/name`, 100 commits
+    a page: what `Client.curl`'s `compare` reads, for `compareNewest`. -/
+def comparePagePath (owner name base head : String) (page : Nat) : String :=
+  s!"/repos/{owner}/{name}/compare/{base}...{head}?per_page=100&page={page}"
+
 /-- The comparison of two commits with its newest `keep` commits (at most 100), from `fetch`,
     which answers page `n` of the comparison as GitHub does: 100 commits a page, oldest first, and
     `total_commits` in all. The first page says how many there are; the newest are on the last
@@ -370,8 +375,7 @@ def Client.curl (token : String) (api : String) (maxDiffBytes : Nat := defaultMa
           return (← (← j.getObjVal? "merge_base_commit").getObjValAs? String "sha").toLower)
     compare := fun owner name base head =>
       compareNewest fun page => do
-        return (← call "GET"
-            s!"/repos/{owner}/{name}/compare/{base}...{head}?per_page=100&page={page}").bind
+        return (← call "GET" (comparePagePath owner name base head page)).bind
           (parse Comparison.ofJson)
     rateLimit := lastRateLimit.get }
 

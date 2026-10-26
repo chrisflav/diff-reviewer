@@ -13,11 +13,13 @@ import { useLoad } from "../useLoad";
 import {
   CalibrationCrumbs,
   DerivedToggle,
+  IsolatedToggle,
   jobCounts,
   repoPath,
   SplitTag,
   StaleToggle,
   useDerived,
+  useIsolatedOnly,
   usePoll,
   useStale,
 } from "./Calibration";
@@ -26,17 +28,23 @@ export function CalibrationRunPage({ onUnauthorized }: { onUnauthorized: () => v
   const { owner = "", name = "", id = "" } = useParams();
   const [stale, setStale] = useStale();
   const [derived, setDerived] = useDerived();
+  const [isolatedOnly, setIsolatedOnly] = useIsolatedOnly();
   const fetch = useCallback(
-    () => api.calibrationRun(owner, name, id, stale, derived),
-    [owner, name, id, stale, derived],
+    () => api.calibrationRun(owner, name, id, stale, derived, isolatedOnly),
+    [owner, name, id, stale, derived, isolatedOnly],
   );
   const { data: run, error, reload } = useLoad(fetch, onUnauthorized);
   const live = run?.results?.some((r) => ["pending", "queued", "running"].includes(r.status));
   usePoll(reload, live ?? false);
-  // A run is of one split; what it is of is what its samples are of.
-  const splits = [
-    ...new Set((run?.results ?? []).flatMap((r) => (r.sample?.split ? [r.sample.split] : []))),
-  ];
+  // A run is of one split, which it records; one made before it did is of what its samples are of.
+  const splits =
+    run?.split !== undefined
+      ? [run.split]
+      : [
+          ...new Set(
+            (run?.results ?? []).flatMap((r) => (r.sample?.split ? [r.sample.split] : [])),
+          ),
+        ];
   const pool = splits.length === 1 && splits[0] === "pool";
 
   return (
@@ -79,11 +87,13 @@ export function CalibrationRunPage({ onUnauthorized }: { onUnauthorized: () => v
           <Limits />
           <StaleToggle stale={stale} onChange={setStale} />
           <DerivedToggle derived={derived} onChange={setDerived} />
+          <IsolatedToggle only={isolatedOnly} onChange={setIsolatedOnly} />
           <h2>Aggregate</h2>
           <p className="mute small-text">
             Of this run's <code>eval</code> scores, deleted samples left out
             {stale ? ", stale scores counted" : ", stale scores left out"}
-            {derived ? ", derived scores counted" : ", derived scores left out"}.
+            {derived ? ", derived scores counted" : ", derived scores left out"}
+            {isolatedOnly ? ", scores of jobs not isolated left out" : ""}.
           </p>
           <AggregateFigures a={run.aggregate} />
           <AggregateBreakdown a={run.aggregate} />
@@ -150,6 +160,14 @@ function Flags({ r }: { r: CalibrationRunResult }) {
           title="The rubric or style notes this score was made under learned from this pull request: left out of the aggregate unless asked."
         >
           derived
+        </span>
+      )}
+      {r.isolated === false && (
+        <span
+          className="tag flag-unisolated"
+          title="A force-push left this commit unreached by its pull request's head, so it was not checked out isolated: the job ran on the default branch, which may hold the change as merged, and reviewed from the diff."
+        >
+          not isolated
         </span>
       )}
       {r.sample?.split === "pool" && <SplitTag split="pool" />}
