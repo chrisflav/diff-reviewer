@@ -280,6 +280,9 @@ structure RunRow where
   /-- The samples it reviews, as a JSON array of ids. -/
   sample_ids : String
   created_at : String
+  /-- The split its samples are of, `eval` or `pool` (`0008`); none for a run made before, whose
+      samples say. -/
+  split : Option String
   deriving Repr
 
 /-- The score of one calibration job's review against its sample, by one version of the matcher
@@ -348,7 +351,7 @@ structure ProposalRow where
 
 /-- What a rubric proposal job's agent was first given (`0005`): the style notes it read, which
     accepting the proposal's notes checks are still the repository's, and the calibration samples
-    its context drew on, which every rubric and style notes accepted from it record. -/
+    its context drew on, which every rubric and style notes version made from it records. -/
 @[model (dbName := "proposal_context") (primaryKey := ["job_id"]) reviewdb]
 structure ContextRow where
   job_id : String
@@ -704,10 +707,16 @@ def migration0007 : Db.Migration.Migration where
     .addColumn "review_job" "full_review_reason" { type := .text, nullable := true },
     .addColumn "review_job" "incremental_head" { type := .text, nullable := true }]
 
+/-- `0008`: the split a calibration run is of, so that its scores say what was evaluated. The
+    column is nullable: a run written before is of the split its samples have. -/
+def migration0008 : Db.Migration.Migration where
+  name := "0008_run_split"
+  steps := [.addColumn "calibration_run" "split" { type := .text, nullable := true }]
+
 /-- The migrations, in the order they are applied. Appended to, never edited. -/
 def migrations : List Db.Migration.Migration :=
   [migration0001, migration0002, migration0003, migration0004, migration0005, migration0006,
-   migration0007]
+   migration0007, migration0008]
 
 /-- Where the database is. Set once at start-up (`serve --db`), and by the tests. -/
 initialize pathRef : IO.Ref System.FilePath ← IO.mkRef (System.FilePath.mk "diff-reviewer.db")

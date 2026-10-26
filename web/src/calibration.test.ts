@@ -242,4 +242,11 @@ describe("the chart's direct labels", () => {
     const b = { ...run({}), id: "old", createdAt: "2026-09-01T00:00:00Z" };
     expect(runPoints([a, b]).map((p) => p.id)).toEqual(["old", "new"]);
   });
+
+  it("leave out a run of the pool, which is never counted", () => {
+    const e = { ...run({}), id: "eval", split: "eval" as const };
+    const p = { ...run({}), id: "pool", split: "pool" as const };
+    const old = { ...run({}), id: "old" };
+    expect(runPoints([e, p, old]).map((x) => x.id)).toEqual(["eval", "old"]);
+  });
 });

@@ -33,10 +33,15 @@ export function CalibrationRunPage({ onUnauthorized }: { onUnauthorized: () => v
   const { data: run, error, reload } = useLoad(fetch, onUnauthorized);
   const live = run?.results?.some((r) => ["pending", "queued", "running"].includes(r.status));
   usePoll(reload, live ?? false);
-  // A run is of one split; what it is of is what its samples are of.
-  const splits = [
-    ...new Set((run?.results ?? []).flatMap((r) => (r.sample?.split ? [r.sample.split] : []))),
-  ];
+  // A run is of one split, which it records; one made before it did is of what its samples are of.
+  const splits =
+    run?.split !== undefined
+      ? [run.split]
+      : [
+          ...new Set(
+            (run?.results ?? []).flatMap((r) => (r.sample?.split ? [r.sample.split] : [])),
+          ),
+        ];
   const pool = splits.length === 1 && splits[0] === "pool";
 
   return (

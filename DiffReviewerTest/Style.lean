@@ -563,6 +563,36 @@ def versionsNeverRepeat : Test := withTempDb do
     ++ checkEq (trusted now) ["carol"] "the new registration's trusted reviewers, untouched"
     ++ checkStatus deletedTwice 404 "deleting a repository that is not registered"
 
+/-- A run records the split it was asked of, and says it, as one run and in the list; a run
+    stored before runs recorded it is of the split its samples have. -/
+def runsRecordTheirSplit : Test := withTempDb do
+  let f ← history
+  let orch ← FakeOrchestra.new
+  let svc ← DiffReviewerTest.Calibration.services f orch
+  let st ← State.new cfg svc
+  let _ ← imported st svc f (evalShare := 0)
+  let pool ← poolRunOf st [← sampleId st 301]
+  let s101 ← sampleId st 101
+  setSplit s101 "eval"
+  let evalRun ← runOf st [s101]
+  let listed ← route st (req .get s!"{repoPath}/calibration/runs")
+  let poolId := (field pool "id").getD ""
+  -- Its sample moved to `eval` since, by hand: the run is still of what it was asked of.
+  setSplit (← sampleId st 301) "eval"
+  let kept ← route st (req .get s!"{repoPath}/calibration/runs/{poolId}")
+  -- As a run stored before `0008` is.
+  Store.run do
+    let db ← read
+    SQLite.exec db "UPDATE calibration_run SET split = NULL"
+  let old ← route st (req .get s!"{repoPath}/calibration/runs/{poolId}")
+  let splits := (listOf (bodyJson listed) ["items"]).filterMap (str · ["split"])
+  return checkStatus pool 201 "a run of the pool"
+    ++ checkEq (field pool "split") (some "pool") "says it is of the pool"
+    ++ checkEq (field evalRun "split") (some "eval") "a run of the eval samples, of eval"
+    ++ checkEq (splits.toArray.qsort (· < ·)) #["eval", "pool"] "as the list says"
+    ++ checkEq (field kept "split") (some "pool") "the split it was run of is stored"
+    ++ checkEq (field old "split") (some "eval") "an older run, of its samples' split"
+
 def all : List (String × Test) :=
   [("examplesAreVaried", examplesAreVaried),
    ("examplesLeaveOutThePullUnderReview", examplesLeaveOutThePullUnderReview),
@@ -573,6 +603,7 @@ def all : List (String × Test) :=
    ("proposalsWaitForTheirClient", proposalsWaitForTheirClient),
    ("theProposalCliChecksItsInput", theProposalCliChecksItsInput),
    ("theUiReadsWhatItNeeds", theUiReadsWhatItNeeds),
-   ("versionsNeverRepeat", versionsNeverRepeat)]
+   ("versionsNeverRepeat", versionsNeverRepeat),
+   ("runsRecordTheirSplit", runsRecordTheirSplit)]
 
 end DiffReviewerTest.Style

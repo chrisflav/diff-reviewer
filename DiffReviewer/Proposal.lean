@@ -336,19 +336,21 @@ into the settings")
     | none => throw e
 
 /-- Inside the transaction of a person's write — a rubric `PUT` or a settings `PUT` naming
-    `fromProposal` — proposal `id` of `repo`: its provenance, for the write to record, and the
-    proposal marked accepted (with the rubric version written, `rubricVersion`, when there is
-    one). A proposal rejected is refused: what it said was turned down, and a write that keeps
-    some of it records its provenance only by being accepted. One accepted already gives its
-    provenance again, keeping the rubric version it records. -/
+    `fromProposal` — proposal `id` of `repo`: its provenance, for the write to record, and, for a
+    rubric written from it (`rubricVersion`, the version written), the proposal marked accepted.
+    A settings write adopts only the style notes (`rubricVersion` is `none`): it records the
+    provenance and decides nothing, so the proposal stays pending and its rubric can still be
+    accepted, or rejected. A proposal rejected is refused: what it said was turned down. One
+    accepted already gives its provenance again, keeping the rubric version it records. -/
 def adoptIn (repo : Repo) (id : String) (rubricVersion : Option Nat) (now : String) :
     Sqlite.M (Except Platform.UpdateError Provenance) := do
   let some p := (← fetchProposals repo.owner repo.name).find? (·.id == id)
     | return .error (.invalid s!"'fromProposal': {id} is not a proposal of {repo.slug}")
   if p.status == "rejected" then
     return .error (.conflict s!"'fromProposal': proposal {id} was rejected")
+  let some rubricVersion := rubricVersion | return .ok p.context
   let p := { p with status := "accepted", decidedAt := p.decidedAt <|> some now
-                    acceptedVersion := p.acceptedVersion <|> rubricVersion }
+                    acceptedVersion := p.acceptedVersion <|> some rubricVersion }
   HasModel.save p.toRow
   return .ok p.context
 

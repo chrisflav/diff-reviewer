@@ -336,12 +336,10 @@ export function Limits({ open = false }: { open?: boolean }) {
           changes. Both count for their decision only.
         </li>
         <li>
-          <strong>What git still shows (the default-branch leak).</strong> The agent cannot read
-          GitHub's API, but its checkout is the repository's default branch, which for a merged pull
-          request already holds the change as merged, after the review and often with what the
-          reviewer asked for; it could fetch the pull request's later commits too. It is told to
-          read only the diff and the reviewed commit, and nothing enforces that yet. Numbers may be
-          better than a blind review would earn.
+          <strong>What isolation is not.</strong> The agent's checkout is the reviewed commit and
+          its history only, with no branch, no remote and nothing after it, and it cannot read
+          GitHub's API; but it still has the network, and could fetch the pull request's later
+          commits from GitHub by their URL. It is told to fetch nothing.
         </li>
         <li>
           <strong>Stale scores.</strong> A review imported after a run scored its sample joins the

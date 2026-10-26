@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "diff-reviewer platform API",
-    "version": "0.8.0",
+    "version": "0.9.0",
     "description": "The review platform: the repositories whose pull requests it reviews, and one review job per review. A job moves `pending → queued → running → draft → approved → posted`; `rejected` is a discarded draft, `stale` a draft whose pull request has moved on, and `failed` a run that ended without a review.\n\nThree credentials, none standing in for another. The password (`$DIFF_REVIEWER_PASSWORD`) is accepted only by `POST /api/login`, which sets the session cookie; failed password logins are rate-limited (an immediate `429` with `Retry-After`), and the API token signs in there too, unlimited. Every route under `/api/v1/` needs the session cookie or the API token (`$DIFF_REVIEWER_API_TOKEN_FILE`) as `Authorization: Bearer <token>`. Every route under `/api/agent/v1/` needs the agent token (`$DIFF_REVIEWER_AGENT_TOKEN_FILE`) as a bearer, and nothing else reaches it; an agent's requests go through kleis, which supplies it.\n\nEvery write must be `application/json` (`415` otherwise). Every write to a job under `/api/v1/` names the job's `version` as last read, and is a `409` if the job has changed since. A request the server fails on is a `500` whose reason goes to the server log; a method a route does not answer is a `405`. Collections answer `{\"items\": [...]}`. Instants are RFC 3339 in UTC; an absent value is `null`.\n\nEach repository has a rubric document — a default rubric and the pull request types its reviews tell apart, each with a rubric and the categories its comments are filed under — written whole and versioned (`/api/v1/repos/{owner}/{name}/rubrics`). Every write of a job's review, by the agent, a person or (once posted) GitHub, is kept as a revision (`/api/v1/jobs/{id}/revisions`).\n\nCalibration (`/api/v1/repos/{owner}/{name}/calibration/…`) compares the agent's reviews with the reviews the repository's `trustedReviewers` wrote on its closed pull requests: an import stores each such review as a sample, a run makes one `calibration` job per sample at the sample's commit, and each job's draft is scored against its sample. A `calibration` job is queued and run like any other, but is never approved, claimed or posted.\n\nLearned review style: the agent's `examples` are inline comments the repository's trusted reviewers wrote, picked from its calibration samples — never of the pull request under review — and its instructions end with the repository's `styleNotes`. A rubric proposal (`/api/v1/repos/{owner}/{name}/proposals`) is a `proposal` job of the repository, of no pull request: an agent reads the rubric, the style notes, calibration's results and people's edits of the agent's drafts (`/api/agent/v1/repos/{owner}/{name}/proposals/{jobId}`), and proposes a rubric document, which a person accepts as the next rubric version or rejects. A `proposal` job is never approved, claimed or posted.\n\nFan-out: a pull request type, or the rubric document for every review, may set `fanout`: a review under it is run as sub-runs side by side, one per category and one by the default rubric, each an orchestra task of its own that submits a partial review through the agent API naming itself `X-Diff-Reviewer-Job: <job>.<key>`; the platform merges them into the job's draft. The type must be known before anything is queued, so it is the repository's fixed `prType`. A job is `running` until merged, and shows its sub-runs (`subRuns`).\n\nIncremental re-review: a review job of a pull request whose review was posted, at a new head descending from the posted one, reviews the changes since. The job records what it follows (`previousJob`, `incrementalSince`, `incrementalCommits`); its agent is given the posted review and reads the diff since (`…/diff?since=<sha>`), every comment must be on that diff, and the draft ends with a line linking the earlier review, which a person reads and approves with it. A force-push falls back to a full review, with why in `fullReviewReason`. Per repository, `incremental` (on by default)."
   },
   "security": [
@@ -251,7 +251,7 @@
                   },
                   "fromProposal": {
                     "type": "string",
-                    "description": "The rubric proposal the style notes written were taken from: the new notes version records its provenance, and the proposal is marked accepted. `400` for an id that is not a proposal of the repository, `409` for a rejected proposal."
+                    "description": "The rubric proposal the style notes written were taken from: the new notes version records its provenance, and the proposal is not decided: it stays pending, its rubric still to be accepted or rejected. `400` for an id that is not a proposal of the repository, `409` for a rejected proposal."
                   }
                 }
               }
@@ -4340,6 +4340,7 @@
           "owner",
           "name",
           "createdAt",
+          "split",
           "samples",
           "jobs",
           "aggregate"
@@ -4358,6 +4359,14 @@
           "createdAt": {
             "type": "string",
             "format": "date-time"
+          },
+          "split": {
+            "type": "string",
+            "enum": [
+              "eval",
+              "pool"
+            ],
+            "description": "The split the run is of, as it was asked for: an `eval` run is measured by, a `pool` run gives rubric proposals evidence and is in no aggregate (its own `aggregate` is empty). A run made before runs recorded it is of the split its samples have."
           },
           "samples": {
             "type": "integer"

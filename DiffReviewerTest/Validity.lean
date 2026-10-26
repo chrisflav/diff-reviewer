@@ -264,6 +264,41 @@ def fromProposalKeepsProvenance : Test := withTempDb do
     ++ checkEq ((notesAfter[0]?.map (·.derived.prs)).getD []) ["acme/widgets#7"]
       "and keep what they were derived from"
 
+/-- Style notes saved in the settings from a proposal record its provenance and decide nothing:
+    the proposal stays pending, its slot taken, and its rubric can still be accepted, which the
+    notes do not get in the way of. -/
+def notesAloneDecideNothing : Test := withTempDb do
+  let f ← history
+  let orch ← FakeOrchestra.new
+  let prop ← FakeOrchestra.new
+  let svc ← withProposer f orch prop
+  let st ← State.new cfg svc
+  let _ ← putRepo st "{}"
+  let _ ← route st (req .put s!"{repoPath}/rubrics" rubricV1)
+  let _ ← postedReviewOf 7
+  let made ← route st (req .post proposalsPath "{}")
+  let jobId := (field made "id").getD ""
+  Workers.queuePending svc
+  let _ ← route st (agentProposalReq .get jobId)
+  let submitted ← route st (agentProposalReq .post jobId (proposal 1))
+  let pid := (field submitted "proposalId").getD ""
+  let notes ← putRepo st s!"\{\"styleNotes\": \"Brief.\", \"fromProposal\": \"{pid}\"}"
+  let notesNow ← Platform.notesHistory "acme" "widgets"
+  let shown ← route st (req .get s!"{proposalsPath}/{pid}")
+  let anew ← route st (req .post proposalsPath "{}")
+  let accepted ← route st (req .post s!"{proposalsPath}/{pid}/accept" "{\"version\": 1}")
+  let after ← route st (req .get s!"{proposalsPath}/{pid}")
+  return checkStatus notes 200 "style notes, written from the proposal"
+    ++ checkEq ((notesNow[0]?.map (·.derived.prs)).getD []) ["acme/widgets#7"]
+      "record its provenance"
+    ++ checkEq (str (bodyJson shown) ["status"]) (some "pending") "the proposal is still pending"
+    ++ check ((bodyJson shown).getObjVal? "acceptedVersion" matches .ok .null)
+      "with no rubric version"
+    ++ checkStatus anew 409 "and still the repository's live proposal"
+    ++ checkStatus accepted 200 "its rubric is accepted afterwards"
+    ++ checkEq (str (bodyJson after) ["status"]) (some "accepted") "and then it is accepted"
+    ++ checkEq (num (bodyJson after) ["acceptedVersion"]) (some 2) "as rubric version 2"
+
 /-- The notes version an agent was given is recorded on its job; a score of any sample of a pull
     request those notes were derived from is derived, one imported after them too. -/
 def derivedByPullAndNotes : Test := withTempDb do
@@ -340,6 +375,7 @@ def all : List (String × Test) :=
    ("theAgentTokensStandApart", theAgentTokensStandApart),
    ("heldOutPullsTeachNothing", heldOutPullsTeachNothing),
    ("fromProposalKeepsProvenance", fromProposalKeepsProvenance),
+   ("notesAloneDecideNothing", notesAloneDecideNothing),
    ("derivedByPullAndNotes", derivedByPullAndNotes),
    ("missesAreOfTheNewestScore", missesAreOfTheNewestScore)]
 

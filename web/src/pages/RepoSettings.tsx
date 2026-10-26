@@ -308,7 +308,7 @@ function RepoSettingsView({
           }.${
             body.fromProposal === undefined
               ? ""
-              : ` The notes record proposal ${body.fromProposal} as what they came from, and the proposal is accepted.`
+              : ` The notes record proposal ${body.fromProposal} as what they came from; the proposal is still pending, its rubric to be accepted or rejected on its page.`
           }`,
         );
       })
@@ -484,13 +484,12 @@ function RepoSettingsView({
             </strong>{" "}
             They are below as unsaved changes, on top of the settings at version {edits.version};
             change them as you like. Saving names the proposal: the new notes version records what
-            it was derived from, and the proposal is accepted. Notes saved as they are now keep
-            nothing of it, and do not name it.
+            it was derived from. Notes saved as they are now keep nothing of it, and do not name
+            it.
           </p>
           <p>
-            <strong>A pending proposal is accepted without its rubric:</strong> the rubric it
-            proposes is not written, and it cannot be accepted afterwards. To keep both, accept it
-            on its page with its style notes.
+            <strong>Saving does not decide the proposal:</strong> a pending one stays pending, and
+            its rubric can still be accepted or rejected on its page.
           </p>
           <div className="actions">
             <button type="button" className="ghost" onClick={stopAdopting} disabled={busy}>

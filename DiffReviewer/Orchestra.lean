@@ -24,6 +24,24 @@ As with `GitHub.Client`, a record of functions, so that the workers can be run a
 
 namespace DiffReviewer.Orchestra
 
+/-- The commit a task's workspace is checked out at instead of the default branch (orchestra's
+    `checkout`). Orchestra fetches it from the task's upstream before the sandbox exists — which a
+    read-only task cannot do for itself — and fails the task if the commit cannot be had. -/
+structure Checkout where
+  /-- The full commit name, lower case. -/
+  commit   : String
+  /-- The upstream ref fetched for it, which must reach it: `refs/pull/<n>/head`. -/
+  fetchRef : Option String := none
+  /-- A repository holding only the commit and its history: no branches, no tags, no remotes, no
+      reflog, nothing that came after it. -/
+  isolate  : Bool := false
+  deriving Repr, BEq
+
+def Checkout.toJson (c : Checkout) : Json :=
+  .mkObj ([("commit", (c.commit : Json))] ++
+    (c.fetchRef.map fun r => [("fetch_ref", (r : Json))]).getD [] ++
+    (if c.isolate then [("isolate", (true : Json))] else []))
+
 /-- What the platform asks for. -/
 structure QueueRequest where
   prompt      : String
@@ -40,8 +58,8 @@ structure QueueRequest where
       client's spec, never more. Empty for a review. -/
   kleisNarrow : List String := []
   /-- The commit to check the task's repository out at (`checkout`), rather than its default
-      branch. Not yet sent: orchestra's queue API does not take it yet (see `queuePending`). -/
-  checkout    : Option String := none
+      branch: a review's head; `none` for a rubric proposal, which reads the default branch. -/
+  checkout    : Option Checkout := none
   deriving Repr
 
 def QueueRequest.toJson (r : QueueRequest) : Json :=
@@ -52,7 +70,7 @@ def QueueRequest.toJson (r : QueueRequest) : Json :=
   let fields := if r.kleisNarrow.isEmpty then fields
     else fields ++ [("kleis_narrow", .arr (r.kleisNarrow.map Json.str).toArray)]
   .mkObj (match r.checkout with
-    | some sha => fields ++ [("checkout", (sha : Json))]
+    | some c => fields ++ [("checkout", c.toJson)]
     | none => fields)
 
 /-- What the platform reads of a queue entry. -/
@@ -74,8 +92,32 @@ def Entry.ofJson (j : Json) : Except String Entry := do
 def terminal (status : String) : Bool :=
   ["done", "failed", "unfinished", "cancelled"].contains status
 
+/-- Why a request was not queued. -/
+inductive QueueError where
+  /-- Orchestra refused the request as it is (`400`): a checkout its backend does not make — any
+      on `landrun` or `local` unless the operator allows hooks on the host, `isolate` on `local`
+      at all, any on `merger` or `triage` (`refusesCheckout`) — or a field the client's policy
+      does not allow. Asked again unchanged, it is refused again. -/
+  | refused (why : String)
+  /-- Anything else — orchestra unreachable, its daemon down (`409`), the client at its
+      `max_active` (`429`) — which may pass. -/
+  | failed (why : String)
+  deriving Repr, BEq
+
+/-- Whether refusal `why` is of the request's `checkout` — orchestra's words when its backend
+    does not make one (`ExecutionConfig.checkoutRefusal?`: they name the checkout, `'isolate'` or
+    a task "checked out at a commit") — rather than of a field the client file does not allow, a
+    repository its `queue_policy` does not list say, which the operator may yet add. -/
+def refusesCheckout (why : String) : Bool :=
+  ["checkout", "'isolate'", "checked out"].any fun w => (why.splitOn w).length > 1
+
+instance : ToString QueueError where
+  toString
+    | .refused why | .failed why => why
+
 structure Client where
-  queue  : QueueRequest → IO (Except String Entry)
+  /-- Queue a task; an `Entry` answers it, or the one an `externalId` seen before made. -/
+  queue  : QueueRequest → IO (Except QueueError Entry)
   entry  : (id : String) → IO (Except String Entry)
   /-- Stop the run of entry `id`, or withdraw it if it has not started. -/
   cancel : (id : String) → IO (Except String Unit)
@@ -89,23 +131,27 @@ private def errorOf (r : Http.Response) : String :=
     token is the platform's own, not one kleis should see. -/
 def Client.curl (url token : String) : Client :=
   let url := (url.dropEndWhile (· == '/')).toString
-  let send (method path : String) (body : Option Json) : IO (Except String Http.Response) := do
+  -- A refusal of the request itself (`400`) is told apart: asking again would be refused again.
+  let send (method path : String) (body : Option Json) :
+      IO (Except QueueError Http.Response) := do
     let headers := [("Authorization", s!"Bearer {token}"), ("Accept", "application/json")] ++
       (if body.isSome then [("Content-Type", "application/json")] else [])
     match ← Http.send { method, url := url ++ path, headers, body := body.map (·.compress)
                       , noproxy := some (Http.hostOf url) } with
-    | .error e => return .error e.message
+    | .error e => return .error (.failed e.message)
     | .ok r =>
-      unless 200 ≤ r.status && r.status < 300 do return .error (errorOf r)
+      if r.status == 400 then return .error (.refused (errorOf r))
+      unless 200 ≤ r.status && r.status < 300 do return .error (.failed (errorOf r))
       return .ok r
-  let call (method path : String) (body : Option Json) : IO (Except String Entry) := do
+  let call (method path : String) (body : Option Json) : IO (Except QueueError Entry) := do
     return (← send method path body).bind fun r =>
       (Json.parse r.body).bind Entry.ofJson |>.mapError
-        (s!"orchestra's answer is not a queue entry: " ++ ·)
+        (.failed <| s!"orchestra's answer is not a queue entry: " ++ ·)
   { queue := fun req => call "POST" "/api/v1/queue" (some req.toJson)
-    entry := fun id => call "GET" s!"/api/v1/queue/{id}" none
+    entry := fun id => return (← call "GET" s!"/api/v1/queue/{id}" none).mapError toString
     cancel := fun id => do
-      return (← send "POST" s!"/api/v1/queue/{id}/cancel" (some (.mkObj []))).map fun _ => () }
+      return (← send "POST" s!"/api/v1/queue/{id}/cancel" (some (.mkObj []))).map (fun _ => ())
+        |>.mapError toString }
 
 /-- The client configured by `DIFF_REVIEWER_ORCHESTRA_URL` and the token file `tokenVar` names
     (`DIFF_REVIEWER_ORCHESTRA_TOKEN_FILE` unless it says), or `none` unless both are set. -/

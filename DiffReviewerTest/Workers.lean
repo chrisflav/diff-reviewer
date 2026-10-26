@@ -386,7 +386,8 @@ def followingMovesTheJob : Test := withTempDb do
 def aRepeatedFailureIsRecordedOnce : Test := withTempDb do
   let logs ← IO.mkRef #[]
   let failing : Orchestra.Client :=
-    { queue := fun _ => return .error "orchestra answered 429", entry := fun _ => return .error ""
+    { queue := fun _ => return .error (.failed "orchestra answered 429")
+      entry := fun _ => return .error ""
       cancel := fun _ => return .ok () }
   let gh ← FakeGitHub.new #[pull7 jobHead]
   let svc ← Workers.Services.new (some gh.client) (some failing) (fun m => logs.modify (·.push m))
@@ -400,6 +401,55 @@ def aRepeatedFailureIsRecordedOnce : Test := withTempDb do
   return checkEq once.statusRaw "pending" "the job"
     ++ check (once.error.any (·.endsWith "429")) "the reason"
     ++ checkEq twice.version once.version "the version, after the second failure"
+
+/-- A review's task is checked out at the job's head, by its pull request's head ref, and not
+    isolated; a checkout orchestra refuses (`400`, one its backend does not make) fails the job
+    with orchestra's reason rather than being asked again on every pass, while any other refusal
+    leaves it waiting; and a run that fails says its checkout may be why. -/
+def checkoutsAreSentAndRefusalsFail : Test := withTempDb do
+  let gh ← FakeGitHub.new #[pull7 jobHead]
+  let orch ← FakeOrchestra.new
+  let svc ← services gh orch (← IO.mkRef #[])
+  let st ← State.new cfg svc
+  let id := (field (← newJob st) "id").getD ""
+  Workers.queuePending svc
+  let queued ← orch.queued.get
+  let sent := queued[0]?.map (·.toJson.getObjValD "checkout")
+  orch.set "e0" "failed"
+  Workers.follow svc
+  let some failed ← Platform.findJob id | return #["the job is gone"]
+  let why := "orchestra answered 400: a checkout is refused on the landrun backend"
+  let attempts ← IO.mkRef 0
+  let refusing : Orchestra.Client :=
+    { orch.client with queue := fun _ => do
+        attempts.modify (· + 1)
+        return .error (.refused why) }
+  let svc' ← Workers.Services.new (some gh.client) (some refusing) (fun _ => pure ())
+  let _ ← Platform.updateJob id fun j =>
+    return { j with statusRaw := "pending", queueEntry := none }
+  -- A refusal of anything but the checkout is of the client file: the job waits.
+  let unlisted : Orchestra.Client :=
+    { orch.client with queue := fun _ => return .error (.refused
+        "orchestra answered 400: 'upstream' acme/widgets is not in queue_policy.repos") }
+  let svcU ← Workers.Services.new (some gh.client) (some unlisted) (fun _ => pure ())
+  Workers.queuePending svcU
+  let some waiting ← Platform.findJob id | return #["the job is gone"]
+  Workers.queuePending svc'
+  Workers.queuePending svc'
+  let some refused ← Platform.findJob id | return #["the job is gone"]
+  return checkEq (queued.map (·.checkout))
+      #[some { commit := jobHead, fetchRef := some "refs/pull/7/head" }]
+      "the review is checked out at its head"
+    ++ checkEq (sent.map (·.compress))
+      (some s!"\{\"commit\":\"{jobHead}\",\"fetch_ref\":\"refs/pull/7/head\"}")
+      "as orchestra is sent it"
+    ++ checkEq failed.statusRaw "failed" "a run that failed"
+    ++ check (failed.error.any (·.contains jobHead)) "says what it was to be checked out at"
+    ++ checkEq waiting.statusRaw "pending" "a repository orchestra does not list waits"
+    ++ check (waiting.error.any (·.endsWith "queue_policy.repos")) "saying why"
+    ++ checkEq refused.statusRaw "failed" "a refused checkout fails the job"
+    ++ checkEq refused.error (some s!"orchestra refused the task: {why}") "with orchestra's reason"
+    ++ checkEq (← attempts.get) 1 "asked once"
 
 /-- The agent CLI's configuration and its local check of a submission. -/
 def theAgentCliChecksItsInput : Test := do
@@ -482,6 +532,7 @@ def all : List (String × Test) :=
    ("aDirectReviewIsPostedOnSubmission", aDirectReviewIsPostedOnSubmission),
    ("followingMovesTheJob", followingMovesTheJob),
    ("aRepeatedFailureIsRecordedOnce", aRepeatedFailureIsRecordedOnce),
+   ("checkoutsAreSentAndRefusalsFail", checkoutsAreSentAndRefusalsFail),
    ("theAgentCliChecksItsInput", theAgentCliChecksItsInput),
    ("curlConfigIsQuoted", curlConfigIsQuoted),
    ("theAgentCliTalksToTheServer", theAgentCliTalksToTheServer)]

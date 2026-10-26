@@ -75,12 +75,16 @@ export function putBody(read: Repo, form: RepoForm, fromProposal?: string): Repo
 }
 
 /**
- * What a 409 refusing a write over version `sent` said, when `theirs`, the settings read after it,
- * are still at that version: not that they moved, which a merge mends, but something else — the
- * proposal named was decided meanwhile, say — to be shown as the server put it. Null when they
- * moved.
+ * What a 409 refusing a write over version `sent` said, when `theirs`, the settings (or the
+ * rubric) read after it, are still at that version: not that they moved, which a merge mends, but
+ * something else — the proposal named was rejected meanwhile, say — to be shown as the server put
+ * it. Null when they moved.
  */
-export function saveRefusal(sent: number, theirs: Repo, message: string): string | null {
+export function saveRefusal(
+  sent: number,
+  theirs: Pick<Repo, "version">,
+  message: string,
+): string | null {
   return theirs.version === sent ? message : null;
 }
 

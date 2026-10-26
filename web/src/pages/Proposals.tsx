@@ -560,7 +560,7 @@ function ProposalView({
           <StyleNotesDiff change={p.diff?.styleNotes ?? null} />
           {canAdopt && (
             <>
-              {pendingNow && <NotesOnlyWarning />}
+              {pendingNow && <NotesOnlyNote />}
               <div className="actions">
                 <button type="button" className="ghost" onClick={openNotes}>
                   Open the style notes in the settings…
@@ -579,6 +579,7 @@ function ProposalView({
           busy={busy}
           onAccept={accept}
           onReject={reject}
+          onEdit={canAdopt ? openEditor : undefined}
         />
       )}
     </>
@@ -587,17 +588,14 @@ function ProposalView({
 
 /**
  * What saving a pending proposal's style notes in the settings does: the save names the proposal,
- * and the server takes that as its accept, the rubric it proposes left unwritten.
+ * which the new notes version records as what it came from, and decides nothing.
  */
-function NotesOnlyWarning() {
+function NotesOnlyNote() {
   return (
-    <p className="notice warn-notice">
-      <strong>
-        Saving the style notes in the settings accepts this proposal without its rubric:
-      </strong>{" "}
-      the rubric it proposes is not written, and it cannot be accepted afterwards. To keep both,
-      accept the rubric first: here, with "Also apply the style notes" ticked, or by saving it in
-      the editor.
+    <p className="notice">
+      <strong>Saving the style notes in the settings does not decide this proposal:</strong> the
+      notes record it as what they came from, and it stays pending, so its rubric can still be
+      accepted or rejected here, or saved from the editor.
     </p>
   );
 }
@@ -610,9 +608,11 @@ function acceptShown(p: Pick<RubricProposal, "diff" | "document">): boolean {
 }
 
 /**
- * Accept or reject a pending proposal. "Also apply the style notes" is shown only when the
- * proposal has some, and is off until the person ticks it. Accepting is not offered when neither
- * the diff nor the document can be shown: nothing is accepted unseen.
+ * Accept or reject a pending proposal, or, with `onEdit`, edit it before accepting: its document
+ * opened in the rubric editor as unsaved edits, which saving there accepts. "Also apply the style
+ * notes" is shown only when the proposal has some, and is off until the person ticks it.
+ * Accepting is not offered when neither the diff nor the document can be shown: nothing is
+ * accepted unseen.
  */
 export function Decide({
   p,
@@ -621,6 +621,7 @@ export function Decide({
   busy,
   onAccept,
   onReject,
+  onEdit,
 }: {
   p: RubricProposal;
   applyNotes: boolean;
@@ -628,6 +629,7 @@ export function Decide({
   busy: boolean;
   onAccept: () => void;
   onReject: () => void;
+  onEdit?: (() => void) | undefined;
 }) {
   const shown = acceptShown(p);
   return (
@@ -660,10 +662,21 @@ export function Decide({
           Accept as rubric version {p.currentVersion + 1}
           {p.proposesStyleNotes && applyNotes && ", with the style notes"}
         </button>
+        {onEdit !== undefined && (
+          <button type="button" className="ghost" onClick={onEdit} disabled={busy}>
+            Edit before accepting…
+          </button>
+        )}
         <button type="button" className="ghost danger" onClick={onReject} disabled={busy}>
           Reject
         </button>
       </div>
+      {onEdit !== undefined && (
+        <p className="mute small-text">
+          Editing opens the proposed document in the rubric editor as unsaved changes on top of
+          the rubric as it is now; saving it there accepts the proposal, as the version you saved.
+        </p>
+      )}
     </section>
   );
 }
@@ -700,7 +713,7 @@ function Refused({
             proposesNotes &&
             " Its style notes were not applied either: open them in the settings once the rubric is saved."}
         </p>
-        {canAdopt && pending && r.withNotes && proposesNotes && <NotesOnlyWarning />}
+        {canAdopt && pending && r.withNotes && proposesNotes && <NotesOnlyNote />}
         {canAdopt && (
           <div className="actions">
             <button type="button" onClick={onEditor}>
@@ -726,7 +739,7 @@ function Refused({
             If the style notes are what was refused, accept without them, and open them in the
             settings, where they are put on top of the notes as they are now.
           </p>
-          {pending && <NotesOnlyWarning />}
+          {pending && <NotesOnlyNote />}
           <div className="actions">
             <button type="button" className="ghost" onClick={onNotes}>
               Open the style notes in the settings

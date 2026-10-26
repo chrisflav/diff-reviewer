@@ -724,12 +724,16 @@ structure Run where
   name      : String
   sampleIds : List String
   createdAt : String
+  /-- `eval` or `pool`, as the run was asked for; `none` for a run stored before runs recorded
+      it (`splitOfRun`). -/
+  split     : Option String := none
 
 private def Run.ofRow (r : Store.RunRow) : Run :=
   let ids := match Json.parse r.sample_ids >>= (·.getArr?) with
     | .ok xs => xs.toList.filterMap (·.getStr?.toOption)
     | .error _ => []
-  { id := r.id, owner := r.owner, name := r.name, sampleIds := ids, createdAt := r.created_at }
+  { id := r.id, owner := r.owner, name := r.name, sampleIds := ids, createdAt := r.created_at
+    split := r.split }
 
 /-- The runs of `owner/name`, newest first (ties broken by id). -/
 def runsOf (owner name : String) : IO (Array Run) := do
@@ -889,10 +893,11 @@ which calibration does not measure by" else ""}")
       HasModel.save j.toRow
       charge repo.owner repo.name j.id now
     let run : Run :=
-      { id := runId, owner := repo.owner, name := repo.name, sampleIds, createdAt := now }
+      { id := runId, owner := repo.owner, name := repo.name, sampleIds, createdAt := now
+        split := some split }
     HasModel.save ({ id := runId, owner := repo.owner, name := repo.name
                    , sample_ids := (Json.arr (sampleIds.map Json.str).toArray).compress
-                   , created_at := now } : Store.RunRow)
+                   , created_at := now, split := some split } : Store.RunRow)
     return .ok (run, jobs)
 
 /-- A person's `failed → pending` of calibration job `id`, read at `version`: run it again, which
@@ -1051,17 +1056,28 @@ private def statusCounts (jobs : Array Job) : Json :=
   let names := (jobs.map (·.statusRaw)).toList.eraseDups
   .mkObj (names.map fun s => (s, ((jobs.filter (·.statusRaw == s)).size : Json)))
 
-/-- A run, with its aggregate — of the samples not deleted and not of the pool, and of the scores
-    not stale and not derived unless asked; with `detail`, each of its jobs beside its sample,
-    marked when deleted, and its score, marked when stale or derived. -/
+/-- The split run `run` is of: the one it records, or for a run stored before runs recorded it,
+    the one its samples have — every sample of a run is of one split (`createRun`), and a split
+    once assigned is kept — and `eval` when none of them is left to say. -/
+def splitOfRun (run : Run) : IO String := do
+  if let some s := run.split then return s
+  let samples ← Store.run (fetchSamples run.owner run.name)
+  return ((run.sampleIds.findSome? fun id =>
+    (samples.find? (·.id == id)).bind (·.split))).getD "eval"
+
+/-- A run, with the split it is of, and its aggregate — of the samples not deleted and not of the
+    pool, and of the scores not stale and not derived unless asked, so that a run of the pool has
+    an empty one, and says why; with `detail`, each of its jobs beside its sample, marked when
+    deleted, and its score, marked when stale or derived. -/
 def runJson (run : Run) (detail : Bool) (includeStale := false) (includeDerived := false) :
     IO Json := do
   let jobs := (← calibrationJobs run.owner run.name).filter (·.runId == some run.id)
   let scores := (← scoresOf run.owner run.name).filter (·.run_id == some run.id)
+  let split ← splitOfRun run
   let f ← filterOf run.owner run.name includeStale includeDerived
   let fields : List (String × Json) :=
     [("id", run.id), ("owner", run.owner), ("name", run.name), ("createdAt", run.createdAt),
-     ("samples", run.sampleIds.length), ("jobs", statusCounts jobs),
+     ("split", split), ("samples", run.sampleIds.length), ("jobs", statusCounts jobs),
      ("aggregate", aggregateOf scores f)]
   unless detail do return .mkObj fields
   let results ← jobs.mapM fun j => do

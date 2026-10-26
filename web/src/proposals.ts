@@ -210,9 +210,10 @@ function isSpace(c: string | undefined): boolean {
  * The inline parts of `s`: code spans, links, strong and emphasis; everything else is text.
  *
  * Read in one pass, each construct found by a scan forward that a failed attempt remembers: a
- * backtick run with no closer of its length, a `[` with no `]` after it, a `**` with no closer —
- * none of these is looked for again further on. The input is an agent's, up to 32 KB of it, and a
- * regular expression tried at each position takes seconds on the wrong one.
+ * backtick run with no closer of its length, a `[` with no `]` after it, a `](` with no address
+ * and `)` after it, a `**` with no closer — none of these is looked for again further on. The
+ * input is an agent's, up to 32 KB of it, and a regular expression tried at each position takes
+ * seconds on the wrong one.
  */
 export function parseInline(s: string, depth = 0): Inline[] {
   const out: Inline[] = [];
@@ -243,6 +244,8 @@ export function parseInline(s: string, depth = 0): Inline[] {
   // The link's address and its closing `)`, from just after `](`; linear, the alternatives
   // starting with different characters.
   const target = /((?:[^()\s]|\([^()\s]*\))*)\)/y;
+  // The `]` whose `(` opened no link: every `[` before it would try the same address again.
+  let noTarget = -1;
   // Where a strong span opened by `d` closes, from the earliest place its closer can be: the
   // first `d` after a character that is not whitespace. Remembered as for the brackets.
   const strongAt: Record<string, { from: number; at: number }> = {};
@@ -278,10 +281,16 @@ export function parseInline(s: string, depth = 0): Inline[] {
     if (depth < 3 && c === "[") {
       bracket = next("]", i + 1, bracket);
       newline = next("\n", i + 1, newline);
-      if (bracket > i + 1 && (newline === -1 || newline > bracket) && s[bracket + 1] === "(") {
+      if (
+        bracket > i + 1 &&
+        bracket !== noTarget &&
+        (newline === -1 || newline > bracket) &&
+        s[bracket + 1] === "("
+      ) {
         target.lastIndex = bracket + 2;
         const t = target.exec(s);
-        if (t !== null) {
+        if (t === null) noTarget = bracket;
+        else {
           flush();
           out.push({
             kind: "link",

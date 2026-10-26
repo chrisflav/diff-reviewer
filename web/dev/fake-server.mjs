@@ -877,6 +877,7 @@ function runJson(run, detail, includeStale, includeDerived = false) {
     owner: run.owner,
     name: run.name,
     createdAt: run.createdAt,
+    split: run.split ?? "eval",
     samples: run.results.length,
     jobs: counts,
     aggregate: aggregate(run.results, includeStale, includeDerived),
@@ -1069,6 +1070,7 @@ function calibrationRoute(req, res, url, parts, body) {
         (rubrics.get(`${owner}/${name}`) ?? []).length,
         "pending",
       );
+      run.split = split;
       return send(res, 201, runJson(run, true, false));
     }
   }
@@ -1328,13 +1330,17 @@ function proposalJson(p, detail) {
   };
 }
 
-/** `Proposal.adoptIn`: a rubric or settings write naming proposal `id`; marks it accepted. */
+/**
+ * `Proposal.adoptIn`: a rubric or settings write naming proposal `id`. A rubric written from it
+ * (`rubricVersion`) marks it accepted; style notes alone (`null`) record it and decide nothing.
+ */
 function adoptProposal(key, id, rubricVersion) {
   const p = proposals.find((x) => `${x.owner}/${x.name}` === key && x.id === id);
   if (p === undefined)
     return { status: 400, error: `'fromProposal': ${id} is not a proposal of ${key}` };
   if (p.status === "rejected")
     return { status: 409, error: `'fromProposal': proposal ${id} was rejected` };
+  if (rubricVersion === null) return { context: p.context };
   p.status = "accepted";
   p.decidedAt ??= now();
   p.acceptedVersion ??= rubricVersion;

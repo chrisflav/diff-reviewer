@@ -227,6 +227,23 @@ describe("Decide", () => {
     expect(render({ ...p, proposesStyleNotes: false })).not.toContain("style notes");
   });
 
+  it("offers to edit before accepting, in the rubric editor, when it can be adopted", () => {
+    const html = renderToStaticMarkup(
+      <Decide
+        p={p}
+        applyNotes={false}
+        setApplyNotes={() => {}}
+        busy={false}
+        onAccept={() => {}}
+        onReject={() => {}}
+        onEdit={() => {}}
+      />,
+    );
+    expect(html).toContain("Edit before accepting");
+    expect(html).toContain("rubric editor");
+    expect(render(p)).not.toContain("Edit before accepting");
+  });
+
   it("does not offer to accept what cannot be shown", () => {
     const unseen = render({ ...p, document: null, diff: null, diffError: "unreadable" });
     expect(unseen).toMatch(/<button type="button" disabled="">Accept/);

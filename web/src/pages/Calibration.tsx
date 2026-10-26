@@ -514,7 +514,9 @@ function Runs({
         <p className="mute">No runs yet.</p>
       ) : (
         <>
-          {data.items.length > 1 && <RunChart runs={data.items} stale={stale} />}
+          {data.items.filter((r) => r.split !== "pool").length > 1 && (
+            <RunChart runs={data.items} stale={stale} />
+          )}
           <p className="mute small-text">
             Each run's figures are of its own <code>eval</code> scores, deleted samples left out;
             stale scores are {stale ? "counted" : "left out"}, derived ones{" "}
@@ -542,7 +544,8 @@ function Runs({
                         className="data"
                       >
                         {r.createdAt}
-                      </Link>
+                      </Link>{" "}
+                      {r.split === "pool" && <SplitTag split="pool" />}
                     </td>
                     <td className="data">{r.samples}</td>
                     <td className="small-text">{jobCounts(r.jobs)}</td>

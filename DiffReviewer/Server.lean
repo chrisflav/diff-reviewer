@@ -407,7 +407,7 @@ private def parseBody (body : String) : Except String Json :=
     sub-runs one review fans out to; `incremental` turns incremental re-review on or off. All three
     are kept when left out. `fromProposal` names
     the rubric proposal the style notes written come from: they record its provenance, and it is
-    accepted with the write. `mode` and
+    left pending, its rubric still to be accepted or rejected. `mode` and
     `autoReview` take their defaults when left out, as they always have; `trustedReviewers` and
     `styleNotes` keep what they were, so that a client that does not know them cannot wipe them.
     `version`, when given, is the version of the settings last read (0 for a repository not
@@ -483,7 +483,7 @@ or be \"\" for none; '{t}' is not one" .badRequest
     | .ok (.bool b) => pure (some b)
     | .ok _ => return .error "'incremental' must be true or false" .badRequest
   -- Style notes a person wrote from a rubric proposal — after rebasing it, say — record its
-  -- provenance, and the proposal is accepted with the write.
+  -- provenance; the proposal is not decided by them, and its rubric can still be accepted.
   let provenance ← match j.getObjVal? "fromProposal" with
     | .error _ | .ok .null => pure (pure (.ok {}))
     | .ok (.str id) =>

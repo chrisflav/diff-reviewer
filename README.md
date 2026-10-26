@@ -177,8 +177,21 @@ the pull request (`issue_number`) and the job id as `external_id` — `<id>.2`, 
 retry, since orchestra answers an `external_id` it has seen with the entry it already made; a
 [fan-out](#fan-out)'s sub-runs are `<id>.<key>` (`<id>.<key>.2` run again). When a
 pull request moves on, the platform cancels the runs of its older heads
-(`POST /api/v1/queue/{id}/cancel`). The
-agent needs `curl` and the `diff-reviewer` binary from a release on its `PATH`: see the next
+(`POST /api/v1/queue/{id}/cancel`).
+
+**Each review is checked out at its head.** A review's request (and each fan-out sub-run's)
+carries `"checkout": {"commit": "<head>", "fetch_ref": "refs/pull/<n>/head"}`: orchestra fetches
+the commit and checks the task out at it, on a detached `HEAD`, before the agent starts, so a
+read-only agent never has to fetch it itself. A [calibration](#calibration) job's adds
+`"isolate": true`; a rubric proposal's carries none, and reads the default branch. Orchestra
+refuses (`400`) a checkout on its `landrun` and `local` execution backends, which run a
+repository's hooks on the host, unless `execution.allow_checkout_hooks_on_host` is set, and
+`isolate` on `local` at all: run reviews on `kubernetes`. Such a refusal fails the job with
+orchestra's reason (any other `400` leaves it `pending`, as above), and it can be run again once
+that is fixed. A run whose commit cannot be had — one a force-push left unreachable from the pull
+request's head ref — fails on orchestra, and the job's `error` says the checkout may be why.
+
+The agent needs `curl` and the `diff-reviewer` binary from a release on its `PATH`: see the next
 section.
 
 **Rubric proposals need a second client.** A proposal task must run under a kleis spec of its
@@ -438,10 +451,11 @@ reviewed, without being shown that review, and the two are compared.
    on GitHub either: its orchestra request carries the kleis narrowing
    `"github: only discover, fetch"` (`kleis_narrow`), so its token reaches GitHub only through
    git — no REST or GraphQL read, no download — while the agent API, which gives it the pull
-   request and the diff, is not narrowed. A review job's request carries none. The task's
-   checkout is the default branch, read-only, so the agent is told to review from
-   `diff-reviewer agent diff`, to read a file at the commit with `git show <headSha>:<path>` where
-   the clone has it, and to read no other ref. A calibration job is **never posted**: it cannot be
+   request and the diff, is not narrowed. A review job's request carries none. The task is
+   checked out at the sample's commit, isolated (`checkout` with `"isolate": true`): a
+   repository of that commit and its history only, with no branch, no tag, no remote and nothing
+   that came after it, so the agent sees neither the pull request's later commits nor the default
+   branch that merged it. A calibration job is **never posted**: it cannot be
    approved, edited, claimed, posted or reconciled (`409`), in a `direct` repository too;
    discovery never makes it `stale`. Its repository's `--max-calibration-jobs-per-day` (20 by
    default, apart from `--max-jobs-per-day`) is charged once for each job a run makes and once
@@ -535,12 +549,9 @@ to divide by.
   is told not to, and spread one review over several. An agent comment with no pair may be right,
   and a person's that the agent missed may be a matter of taste. Few samples make for noisy
   numbers.
-- **What git still shows.** The narrowing closes GitHub's API to the agent, not git. The task's
-  checkout is the repository's default branch, which for a merged pull request already holds the
-  change as it was merged — after the review, often with what the reviewer asked for — and the
-  agent could fetch the pull request's later commits too. It is told to read only the diff and
-  the reviewed commit; nothing enforces it until orchestra can check a task out at a given commit,
-  which the platform will then ask for (`checkout`, a TODO in `Workers.queuePending`).
+- **What isolation is not.** The checkout holds within git only: the agent still has the
+  network, and the token's narrowing lets it fetch from GitHub, so a determined agent could fetch
+  the pull request's later commits by their URL. It is told to fetch nothing.
 - **A job is bound by its pull request, not by itself.** kleis lets an agent's requests through
   for its task's repository and pull request, and the job is the one it names (`--job`). Of the
   active jobs at one commit only the one made last (to the second) is answered, and a run never
@@ -635,9 +646,11 @@ person reads it beside the rubric and accepts or rejects it.
    as a rubric `PUT` with `"fromProposal": "<id>"`: it records the proposal's provenance on the
    version (see [Held out](#held-out)) and marks the proposal accepted, freeing the repository's
    one live proposal. Notes taken from a proposal are saved the same way, as a settings `PUT`
-   with `fromProposal`. Applying notes is a `409` too when the proposal has none, or when the
-   repository's notes are no longer the ones its agent was given at its first read of its context
-   (the snapshot is taken then, not on submission).
+   with `fromProposal`, which records its provenance on the notes version and decides nothing:
+   the proposal stays pending, and its rubric can still be accepted or rejected. Applying notes
+   is a `409` too when the proposal has none, or when the repository's notes are no longer the
+   ones its agent was given at its first read of its context (the snapshot is taken then, not on
+   submission).
    `POST …/proposals/{id}/reject` with `{}` records the decision and writes nothing else.
 
 ## Fan-out
@@ -751,7 +764,8 @@ lake test
 The suite covers the review format, the job transitions, that the migrations build the declared
 schema and bring an old database up to date, the credentials (each reaches only its own routes)
 and the login rate limit per address, a review's whole life over the API, the workers —
-discovery, its cap and cancellations, queueing, following, posting once whatever GitHub answers,
+discovery, its cap and cancellations, queueing with the checkout each task asks for (and a
+checkout orchestra refuses failing the job), following, posting once whatever GitHub answers,
 direct mode, settling claims on their own and posting a direct review again at most three times —
 against a fake GitHub and a fake orchestra, rubrics and their versions, the agent's submission
 checked against them, comment ids and unknown fields kept through every round trip (of reviews and
@@ -765,7 +779,8 @@ setting — rubric proposals — one live a repository and a cap a day, queued w
 through their own client, what the agent reads and submits, the diff, accepting as a versioned
 write that asks for a rebase when the rubric has moved and rolls back whole, the style notes
 applied only when asked and only over the notes the agent read, rejecting, cancelling, unknown
-fields refused, `fromProposal` keeping provenance — the held-out split by pull request, fixed
+fields refused, `fromProposal` keeping provenance, and style notes alone deciding nothing — runs
+recording their split — the held-out split by pull request, fixed
 once made, held-out pull requests teaching nothing, and derived scores, by rubric and notes
 version and by pull request, left out; the two agent tokens kept apart; the platform's
 own posts kept out of the samples; the job header required — fan-out: planned from the fixed type or the document, queued as sub-runs

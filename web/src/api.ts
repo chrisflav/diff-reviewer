@@ -477,6 +477,8 @@ export interface CalibrationRun {
   owner: string;
   name: string;
   createdAt: string;
+  /** The split it was run of; `pool` runs are never counted. Absent before API 0.9.0. */
+  split?: "eval" | "pool";
   samples: number;
   /** Its jobs by status. */
   jobs: Record<string, number>;

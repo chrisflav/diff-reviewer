@@ -489,24 +489,25 @@ def calibrationJobsAreNeverPosted : Test := withTempDb do
   let listed ← route st (req .get "/api/v1/jobs")
   let listedCal ← route st { req .get "/api/v1/jobs" with query := "kind=calibration" }
   let reviewPrompt := Workers.prompt { job with kindRaw := none }
-  let withCheckout : Orchestra.QueueRequest :=
-    { prompt := "", goal := "", upstream := "acme/widgets", issueNumber := some 13
-    , externalId := "x"
-    , checkout := some jobHead }
   return checkStatus made 201 "the run"
     ++ checkEq (queued.map (·.issueNumber)) #[some 13] "queued, though the pull request is closed"
     ++ checkEq (queued.map (·.kleisNarrow)) #[["github: only discover, fetch"]]
       "with its token narrowed to cloning and fetching from GitHub"
     ++ check ((queued[0]?.map (·.toJson.getObjVal? "kleis_narrow" |>.isOk)).getD false)
       "the narrowing is in the request orchestra is sent"
-    ++ checkEq (queued.map (·.checkout)) #[none] "no checkout, until orchestra takes one"
-    ++ check (str withCheckout.toJson ["checkout"] == some jobHead)
-      "a checkout, once set, is in the request"
+    ++ checkEq (queued.map (·.checkout))
+      #[some { commit := jobHead, fetchRef := some "refs/pull/13/head", isolate := true }]
+      "checked out at the reviewed commit, isolated from what came after it"
+    ++ checkEq (queued[0]?.bind (str ·.toJson ["checkout", "commit"])) (some jobHead)
+      "the checkout is in the request orchestra is sent"
+    ++ check ((queued[0]?.map (·.toJson.getObjValD "checkout" |>.getObjValD "isolate")) ==
+        some (Json.bool true)) "isolated, in the request"
     ++ checkEq job.headSha (some jobHead) "at the sample's commit"
     ++ checkEq job.baseSha (some mergeBase) "with its base"
     ++ checkEq job.kindRaw (some "calibration") "of the kind"
     ++ check (!has "pull/13/head" && !has "git fetch") "the prompt fetches nothing"
-    ++ check (has "git show <headSha>:<path>") "it reads files at the commit"
+    ++ check (has "read-only at that commit" && has "Do not fetch anything")
+      "it reads files at the commit"
     ++ check (has "never posted" && !has "posted, once accepted") "and is told it is not posted"
     ++ check ((reviewPrompt.splitOn "posted, once accepted").length > 1)
       "while a review's prompt says it is"

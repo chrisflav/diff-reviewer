@@ -14,9 +14,13 @@ export interface RunPoint {
   humanComments: number;
 }
 
-/** The runs as points, oldest first: the order a chart over time reads in. */
+/**
+ * The runs as points, oldest first: the order a chart over time reads in. A run of the pool is
+ * never counted, and is not a point.
+ */
 export function runPoints(runs: CalibrationRun[]): RunPoint[] {
-  return [...runs]
+  return runs
+    .filter((r) => r.split !== "pool")
     .sort((a, b) => (a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : 0))
     .map((r) => ({
       id: r.id,
