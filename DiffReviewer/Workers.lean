@@ -208,18 +208,29 @@ say in the summary which of its points the new commits resolve."
     repository out at it, read-only (`checkoutFor`). A calibration job's commit is of a pull
     request that has since been closed, and its checkout is isolated: the commit and its history,
     nothing that came after it — no later commit of the pull request, no default branch that holds
-    the change as it was merged. What was said of the pull request on GitHub its token's narrowing
-    (`calibrationNarrowing`) keeps from it. -/
+    the change as it was merged. One whose commit its pull request's head no longer reaches
+    (`isolated` is `false`) runs on the default branch, which may hold the change as it was merged:
+    its agent reviews from the platform's diff, reads files at the commit with `git show` where the
+    clone has it, and is told to read no other ref. What was said of the pull request on GitHub,
+    and GitHub itself, its token's narrowing (`calibrationNarrowing`) keeps from it. -/
 private def checkoutStep (job : Job) (ref : String) : String :=
   let slug := s!"{job.owner}/{job.name}"
   let diff := s!"`diff-reviewer agent diff {slug} {job.prNumber} --job {ref}` prints the diff \
 under review."
+  let noGitHub := "Do not fetch anything. Do not read the pull request's reviews or comments; this \
+task cannot reach GitHub."
   if job.kind? == some .calibration then
-    s!"2. Review the change as it stands at the head commit it names, as if the pull request were \
-open for review now. {diff} Read that diff first. The working directory holds the repository \
-read-only at that commit, with its history and nothing after it: read its files for the context \
-of a changed file. Do not fetch anything. Do not read the pull request's reviews or comments; \
-this task reaches GitHub only through git, not through its API."
+    let intro := s!"2. Review the change as it stands at the head commit it names, as if the pull \
+request were open for review now. {diff} Read that diff first."
+    if job.isolated == some false then
+      s!"{intro} The working directory holds the repository read-only, at a later state than \
+that commit: do not read its files as they are, and do not check out or read any other ref, \
+branch or commit. For the context of a changed file, read it at the head commit, \
+`git show <headSha>:<path>`, where that commit is in the clone; where it is not, review from the \
+diff alone. {noGitHub}"
+    else
+      s!"{intro} The working directory holds the repository read-only at that commit, with its \
+history and nothing after it: read its files for the context of a changed file. {noGitHub}"
   else
     s!"2. The repository is checked out read-only in your working directory, at the head commit \
 it names (a detached `HEAD`): read the change in context. {diff}{incrementalNote job ref}"
@@ -244,8 +255,8 @@ reviewers raised that the reviewing agent missed, what the agent said that nobod
 people changed in the agent's drafts before posting them, with the instructions for the proposal; \
 follow them.
 2. The repository is checked out read-only in your working directory, at its default branch: read \
-its code and documentation where they help you judge the evidence. This task reaches GitHub only \
-through git, not through its API; read nothing else.
+its code and documentation where they help you judge the evidence. This task cannot reach GitHub; \
+read nothing else.
 3. Write the rubric document you propose — the whole of it — with a rationale, as the \
 instructions describe, and submit it with \
 `diff-reviewer agent proposal submit {slug} <file> --job {job.id}`. Fix what it reports and submit \
@@ -319,22 +330,26 @@ important rather than exceed it.
 
 {postingLine job}"
 
-/-- The narrowing of a calibration job's kleis token: of GitHub, only the ref advertisement
-    (`discover`) and `git-upload-pack` (`fetch`) — enough to clone and fetch the commit, and no
-    REST or GraphQL read, so the agent cannot read the review it is scored against, nor anything
-    said of the pull request since. kleis compiles it to a reject of every other operation of the
-    `github` service; the agent API (`diff-reviewer`) is not narrowed, and gives it the diff. -/
-def calibrationNarrowing : List String := ["github: only discover, fetch"]
+/-- The narrowing of a calibration or proposal job's kleis token: the platform's agent API
+    (`diff-reviewer`) and no other service — of GitHub nothing at all, no REST or GraphQL read and
+    no git either, so the agent can neither read the review it is scored against nor clone the
+    repository or fetch `refs/pull/<n>/head` and see what came after the commit. It needs none:
+    orchestra fetches the commit, or for a proposal resets the default branch, itself, before the
+    sandbox exists. kleis compiles it to a reject of every request to another service. -/
+def calibrationNarrowing : List String := ["services: diff-reviewer"]
 
 /-- Where orchestra checks a job's task out (`checkout`): at the job's head, fetched by its pull
     request's head ref (`refs/pull/<n>/head`, which GitHub keeps for a closed pull request too,
-    as it does not keep `merge`), on a detached `HEAD`. A calibration job's is isolated: a repository of
-    the reviewed commit and its history only, so that its agent sees neither what the pull request
-    became after the review nor the default branch that merged it. A rubric proposal is of the
-    repository, and reads its default branch: none. Nor is there one for a job that does not know
-    its head yet, which is not queued. -/
+    as it does not keep `merge`), on a detached `HEAD`. A calibration job's is isolated: a
+    repository of the reviewed commit and its history only, so that its agent sees neither what
+    the pull request became after the review nor the default branch that merged it — unless its
+    pull request's head no longer reaches the commit (`isolated` is `false`, `isolationOf`), which
+    orchestra would refuse to check out: that job runs on the default branch, from the diff. A
+    rubric proposal is of the repository, and reads its default branch: none. Nor is there one for
+    a job that does not know its head yet, which is not queued. -/
 def checkoutFor (job : Job) : Option Orchestra.Checkout :=
   if job.kind? == some .proposal then none else
+  if job.kind? == some .calibration && job.isolated == some false then none else
   job.headSha.map fun sha =>
     { commit := sha, fetchRef := some s!"refs/pull/{job.prNumber}/head"
       isolate := job.kind? == some .calibration }
@@ -1001,6 +1016,21 @@ def queueSubRuns (s : Services) (job : Job) : IO Unit := do
             s.log s!"cancelling entry {entry.id} of sub-run {scope.ref}: {e}"
         s.log s!"sub-run {scope.ref} changed while it was queued as entry {entry.id}"
 
+/-- Whether calibration job `job`'s commit can be checked out isolated: whether its pull
+    request's head now — what `refs/pull/<n>/head` names, which orchestra fetches and requires to
+    reach the commit — is the commit or descends from it. A head a force-push rewrote after the
+    review does not (GitHub compares them as `behind` or `diverged`), and orchestra would fail the
+    run, charged, on every attempt: such a job runs without a checkout instead (`checkoutFor`). -/
+def isolationOf (gh : GitHub.Client) (job : Job) : IO (Except String Bool) := do
+  let some commit := job.headSha | return .error "the calibration job does not know its commit"
+  match ← gh.getPull job.owner job.name job.prNumber with
+  | .error e => return .error s!"reading the pull request's head: {e.message}"
+  | .ok p =>
+    if p.headSha == commit then return .ok true
+    match ← gh.compare job.owner job.name commit p.headSha with
+    | .error e => return .error s!"comparing the commit with the pull request's head: {e.message}"
+    | .ok c => return .ok (c.status == "ahead" || c.status == "identical")
+
 /-- Queueing: every `pending` job of a registered repository whose head is still its pull
     request's, onto orchestra, once its diff has been fetched and found small enough. A calibration
     job is of a past commit of a closed pull request, which it knows with its base from its
@@ -1036,6 +1066,21 @@ and GitHub is not configured to read them"
           unless hasPull job do
             retire s job .failed "the calibration job does not know its commit, base and title"
             continue
+          -- Whether its commit can be checked out isolated: decided once, and kept on the job.
+          if job.isolated.isNone then
+            match ← isolationOf gh job with
+            | .error why =>
+              recordError job.id .pending why
+              continue
+            | .ok iso =>
+              match ← Platform.updateJob job.id fun j => do
+                  unless j.status? == some .pending && j.version == job.version do
+                    throw (.conflict "moved on")
+                  return { j with isolated := some iso } with
+              | .ok j =>
+                job := { job with isolated := some iso, version := j.version
+                                  updatedAt := j.updatedAt }
+              | .error _ => continue
         else
           match ← gh.getPull job.owner job.name job.prNumber with
           | .error e =>

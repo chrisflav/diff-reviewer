@@ -189,7 +189,17 @@ repository's hooks on the host, unless `execution.allow_checkout_hooks_on_host` 
 `isolate` on `local` at all: run reviews on `kubernetes`. Such a refusal fails the job with
 orchestra's reason (any other `400` leaves it `pending`, as above), and it can be run again once
 that is fixed. A run whose commit cannot be had — one a force-push left unreachable from the pull
-request's head ref — fails on orchestra, and the job's `error` says the checkout may be why.
+request's head ref — fails on orchestra, and the job's `error` says the checkout may be why; a
+calibration job is checked for that before it is queued, and runs without a checkout instead (see
+[Their limits](#their-limits)).
+
+**Upgrading.** `checkout` needs orchestra with per-task checkouts (orchestra PR #222): an older
+orchestra refuses the field (`400`), and every review and calibration job then fails with that
+reason. On orchestra's `landrun` or `local` execution backends every checkout is refused unless
+the operator sets `execution.allow_checkout_hooks_on_host` (which runs a pull request's hooks on
+the host, so only for a deployment where everyone who can open a pull request is trusted), and
+`isolate` is refused on `local` whatever it says: so on those backends every review and
+calibration job fails. Run the platform's tasks on `kubernetes`.
 
 The agent needs `curl` and the `diff-reviewer` binary from a release on its `PATH`: see the next
 section.
@@ -222,7 +232,8 @@ platform's `DIFF_REVIEWER_ORCHESTRA_PROPOSER_TOKEN_FILE`. A proposal's request n
 a goal, the upstream and the job id as `external_id`, and no `issue_number`: orchestra takes a
 task of a repository with no issue (its `queue_policy` has no rule about one), and the task's
 token then carries `task_upstream` and no `task_issue`. It carries the narrowing
-`"github: only discover, fetch"`, as a calibration job's does. The platform follows and cancels a
+`"services: diff-reviewer"`, as a calibration job's does: nothing of GitHub, since orchestra
+resets the default branch itself. The platform follows and cancels a
 proposal's entry through the same client. (If orchestra one day lets a client's `queue_policy`
 list the specs a request may name — a `kleis_specs` list beside `repos`, and a `kleis_spec`
 request field checked against it — one client would do.)
@@ -449,13 +460,18 @@ reviewed, without being shown that review, and the two are compared.
    from how the code is read, and from being told it is not posted. The prompt and what the agent
    reads name no sample and quote nothing of the person's review, and the task cannot read it
    on GitHub either: its orchestra request carries the kleis narrowing
-   `"github: only discover, fetch"` (`kleis_narrow`), so its token reaches GitHub only through
-   git — no REST or GraphQL read, no download — while the agent API, which gives it the pull
-   request and the diff, is not narrowed. A review job's request carries none. The task is
-   checked out at the sample's commit, isolated (`checkout` with `"isolate": true`): a
-   repository of that commit and its history only, with no branch, no tag, no remote and nothing
-   that came after it, so the agent sees neither the pull request's later commits nor the default
-   branch that merged it. A calibration job is **never posted**: it cannot be
+   `"services: diff-reviewer"` (`kleis_narrow`), so its token reaches nothing of GitHub — no
+   REST or GraphQL read, no download, and no git, so it cannot clone the repository or fetch
+   `refs/pull/<n>/head` — while the agent API, which gives it the pull request and the diff, is
+   not narrowed. A review job's request carries none. The task is checked out at the sample's
+   commit, isolated (`checkout` with `"isolate": true`): a repository of that commit and its
+   history only, with no branch, no tag, no remote and nothing that came after it, so the agent
+   sees neither the pull request's later commits nor the default branch that merged it. Orchestra
+   fetches the commit itself, before the task starts, by the pull request's head ref, and checks
+   it out only if that ref reaches it; so before a calibration job is first queued the platform
+   compares the commit with the pull request's head (`isolated` on the job), and one a force-push
+   left behind runs without a checkout (see [Their limits](#their-limits)). A calibration job is
+   **never posted**: it cannot be
    approved, edited, claimed, posted or reconciled (`409`), in a `direct` repository too;
    discovery never makes it `stale`. Its repository's `--max-calibration-jobs-per-day` (20 by
    default, apart from `--max-jobs-per-day`) is charged once for each job a run makes and once
@@ -549,9 +565,20 @@ to divide by.
   is told not to, and spread one review over several. An agent comment with no pair may be right,
   and a person's that the agent missed may be a matter of taste. Few samples make for noisy
   numbers.
-- **What isolation is not.** The checkout holds within git only: the agent still has the
-  network, and the token's narrowing lets it fetch from GitHub, so a determined agent could fetch
-  the pull request's later commits by their URL. It is told to fetch nothing.
+- **What isolation is not.** The checkout holds within git, and the token reaches nothing of
+  GitHub; the agent may still have the network, and where its sandbox lets it past kleis it could
+  clone a public repository anonymously. It is told to fetch nothing.
+- **A force-pushed sample is not isolated.** A sample whose pull request was rewritten after the
+  review has a head that no longer reaches the reviewed commit (GitHub compares them as `behind`
+  or `diverged`), and orchestra checks a commit out only if the head reaches it: it would fail
+  the run, charged, every time. So such a job (`isolated: false`) is queued without a checkout,
+  on the default branch, with the diff-only prompt: it reviews from `diff-reviewer agent diff`,
+  reads files with `git show <headSha>:<path>` where the clone has the commit, and is told to
+  read no other ref. The default branch may hold the change as it was merged, after the review,
+  so its score may be better than a blind review would earn. It is marked in its run, and
+  counted unless `?unisolated=exclude` on `…/runs`, `…/runs/{id}` and `…/summary` leaves out the
+  scores of every job not isolated (each aggregate says how many, `unisolatedScores`) — those of
+  jobs run before checkouts among them.
 - **A job is bound by its pull request, not by itself.** kleis lets an agent's requests through
   for its task's repository and pull request, and the job is the one it names (`--job`). Of the
   active jobs at one commit only the one made last (to the second) is answered, and a run never
@@ -765,14 +792,16 @@ The suite covers the review format, the job transitions, that the migrations bui
 schema and bring an old database up to date, the credentials (each reaches only its own routes)
 and the login rate limit per address, a review's whole life over the API, the workers —
 discovery, its cap and cancellations, queueing with the checkout each task asks for (and a
-checkout orchestra refuses failing the job), following, posting once whatever GitHub answers,
+checkout orchestra refuses, in its own words, failing the job) and the narrowing each kind of job
+is queued with, following, posting once whatever GitHub answers,
 direct mode, settling claims on their own and posting a direct review again at most three times —
 against a fake GitHub and a fake orchestra, rubrics and their versions, the agent's submission
 checked against them, comment ids and unknown fields kept through every round trip (of reviews and
 rubrics), the history of a review from draft to post, the checks of a review against its diff,
 the agent CLI against the server on loopback, calibration — trusted reviewers as a versioned
 setting, the import of past reviews (what it keeps and drops, idempotence, deleted samples, the rate
-limit and the budget of a pass), the matcher, runs and their cap, calibration jobs left alone by
+limit and the budget of a pass), the matcher, runs and their cap, a force-pushed sample run without
+isolation and scored apart, calibration jobs left alone by
 discovery and never posted by any path, and the aggregates — learned style — the examples
 picked for variety and never of the pull request under review, the style notes as a versioned
 setting — rubric proposals — one live a repository and a cap a day, queued with no pull request

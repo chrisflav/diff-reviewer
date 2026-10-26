@@ -767,6 +767,11 @@ private def staleIn (query : String) : Bool := queryParam query "stale" == some 
 /-- Whether it asks for derived scores too (`?derived=include`). -/
 private def derivedIn (query : String) : Bool := queryParam query "derived" == some "include"
 
+/-- Whether it takes in the scores of jobs not checked out isolated at their commit, as it does
+    unless asked not to (`?unisolated=exclude`). -/
+private def unisolatedIn (query : String) : Bool :=
+  queryParam query "unisolated" != some "exclude"
+
 /-- Answer `k` for registered repository `owner/name`, or `404`. -/
 private def withRepo (owner name : String) (k : Repo → IO Reply) : IO Reply := do
   match ← Platform.findRepo owner.toLower name.toLower with
@@ -1032,18 +1037,18 @@ import is cancelled"), ("import", i.toJson)]) .conflict
     withRepo owner name fun repo => do
       let runs ← Calibration.runsOf repo.owner repo.name
       page r.query (← runs.mapM (Calibration.runJson · (detail := false) (staleIn r.query)
-        (derivedIn r.query)))
+        (derivedIn r.query) (unisolatedIn r.query)))
   | ["repos", owner, name, "calibration", "runs", id], .get =>
     withRepo owner name fun repo => do
       match ← Calibration.findRun repo.owner repo.name id with
       | some run =>
         return .json (← Calibration.runJson run (detail := true) (staleIn r.query)
-          (derivedIn r.query))
+          (derivedIn r.query) (unisolatedIn r.query))
       | none => return .error "not found" .notFound
   | ["repos", owner, name, "calibration", "summary"], .get =>
     withRepo owner name fun repo => do
       return .json (← Calibration.summaryJson repo.owner repo.name (staleIn r.query)
-        (derivedIn r.query))
+        (derivedIn r.query) (includeUnisolated := unisolatedIn r.query))
   | ["repos", owner, name, "proposals"], .post =>
     createProposal st owner.toLower name.toLower r.body
   | ["repos", owner, name, "proposals"], .get =>

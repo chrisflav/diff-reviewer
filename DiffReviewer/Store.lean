@@ -133,6 +133,10 @@ structure JobRow where
   /-- The head the incremental decision above was made at (`0007`): made once a head, not on
       every pass a job waits; none before it is made. -/
   incremental_head : Option String
+  /-- Whether a calibration job's task is checked out isolated at its commit, or runs on the
+      default branch because its pull request's head no longer reaches the commit (`0008`); none
+      until decided, and for a job of another kind. -/
+  isolated : Option Bool
   deriving Repr
 
 /-- The diff of a pull request at one head commit, as GitHub gave it. A commit's diff never
@@ -707,11 +711,14 @@ def migration0007 : Db.Migration.Migration where
     .addColumn "review_job" "full_review_reason" { type := .text, nullable := true },
     .addColumn "review_job" "incremental_head" { type := .text, nullable := true }]
 
-/-- `0008`: the split a calibration run is of, so that its scores say what was evaluated. The
-    column is nullable: a run written before is of the split its samples have. -/
+/-- `0008`: the split a calibration run is of, so that its scores say what was evaluated, and
+    whether a calibration job's task was checked out isolated at its commit. The columns are
+    nullable: a run written before is of the split its samples have, and a job run before was not
+    isolated. -/
 def migration0008 : Db.Migration.Migration where
-  name := "0008_run_split"
-  steps := [.addColumn "calibration_run" "split" { type := .text, nullable := true }]
+  name := "0008_checkouts"
+  steps := [.addColumn "calibration_run" "split" { type := .text, nullable := true },
+            .addColumn "review_job" "isolated" { type := .bool, nullable := true }]
 
 /-- The migrations, in the order they are applied. Appended to, never edited. -/
 def migrations : List Db.Migration.Migration :=

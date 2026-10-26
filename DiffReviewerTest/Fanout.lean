@@ -538,7 +538,7 @@ def aRetiredJobsRunIsCancelled : Test := withTempDb do
 def aRefusedSubRunFailsTheJob : Test := withTempDb do
   let gh ← FakeGitHub.new #[pull7 jobHead]
   let orch ← FakeOrchestra.new
-  let why := "orchestra answered 400: 'isolate' is refused on the local backend"
+  let why := s!"orchestra answered 400: {isolateRefusal}"
   let refusing : Orchestra.Client := { orch.client with
     queue := fun r => do
       if (← orch.queued.get).size ≥ 1 then return .error (.refused why)

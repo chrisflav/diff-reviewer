@@ -1017,8 +1017,12 @@ structure Filter where
   deleted  : List String := []
   others   : List String := []
   derived  : Store.ScoreRow → Bool := fun _ => false
+  /-- The scores of jobs not checked out isolated at their commit (`Job.isolated`): run on the
+      default branch, which may hold the change as merged, so possibly better than blind. -/
+  unisolated : Store.ScoreRow → Bool := fun _ => false
   includeStale   : Bool := false
   includeDerived : Bool := false
+  includeUnisolated : Bool := true
 
 /-- The aggregate of `rows` under `f`: never of the samples deleted or of the pool, and, unless
     asked, not of the stale or derived scores; with how many of those there were and whether they
@@ -1028,6 +1032,7 @@ private def aggregateOf (rows : Array Store.ScoreRow) (f : Filter) : Json :=
   let agg := rows.foldl (init := ({} : Score.Aggregate)) fun a r =>
     if isStale r && !f.includeStale then a else
     if f.derived r && !f.includeDerived then a else
+    if f.unisolated r && !f.includeUnisolated then a else
     match Json.parse r.score with
     | .ok j => (a.add j).getD a
     | .error _ => a
@@ -1035,11 +1040,13 @@ private def aggregateOf (rows : Array Store.ScoreRow) (f : Filter) : Json :=
     |>.setObjVal! "staleIncluded" f.includeStale
     |>.setObjVal! "derivedScores" ((rows.filter f.derived).size : Json)
     |>.setObjVal! "derivedIncluded" f.includeDerived
+    |>.setObjVal! "unisolatedScores" ((rows.filter f.unisolated).size : Json)
+    |>.setObjVal! "unisolatedIncluded" f.includeUnisolated
 
 /-- The filter of `owner/name`'s aggregates of the samples of `split`: `eval` for what calibration
     measures, `pool` for the evidence a rubric proposal is given. -/
-def filterOf (owner name : String) (includeStale includeDerived : Bool) (split := "eval") :
-    IO Filter := do
+def filterOf (owner name : String) (includeStale includeDerived : Bool) (split := "eval")
+    (includeUnisolated := true) : IO Filter := do
   if let some repo ← Platform.findRepo owner name then assignSplits repo
   let all ← Store.run (fetchSamples owner name)
   -- The pool's aggregates, which a proposal reads, leave out every sample of a pull request that
@@ -1047,9 +1054,12 @@ def filterOf (owner name : String) (includeStale includeDerived : Bool) (split :
   let held ← evalPulls owner name
   let outside (s : Sample) : Bool :=
     s.split != some split || (split == "pool" && held.contains s.prNumber)
+  let isolated := ((← calibrationJobs owner name).filter (·.isolated == some true)).map (·.id)
   return { deleted := ← deletedSamples owner name
          , others := (all.filter outside).toList.map (·.id)
-         , derived := ← derivedOf owner name, includeStale, includeDerived }
+         , derived := ← derivedOf owner name
+         , unisolated := fun r => !isolated.contains r.job_id
+         , includeStale, includeDerived, includeUnisolated }
 
 /-- How many of `jobs` are in each status, as `{status: n}`. -/
 private def statusCounts (jobs : Array Job) : Json :=
@@ -1069,12 +1079,13 @@ def splitOfRun (run : Run) : IO String := do
     pool, and of the scores not stale and not derived unless asked, so that a run of the pool has
     an empty one, and says why; with `detail`, each of its jobs beside its sample, marked when
     deleted, and its score, marked when stale or derived. -/
-def runJson (run : Run) (detail : Bool) (includeStale := false) (includeDerived := false) :
-    IO Json := do
+def runJson (run : Run) (detail : Bool) (includeStale := false) (includeDerived := false)
+    (includeUnisolated := true) : IO Json := do
   let jobs := (← calibrationJobs run.owner run.name).filter (·.runId == some run.id)
   let scores := (← scoresOf run.owner run.name).filter (·.run_id == some run.id)
   let split ← splitOfRun run
-  let f ← filterOf run.owner run.name includeStale includeDerived
+  let f ← filterOf run.owner run.name includeStale includeDerived (includeUnisolated :=
+    includeUnisolated)
   let fields : List (String × Json) :=
     [("id", run.id), ("owner", run.owner), ("name", run.name), ("createdAt", run.createdAt),
      ("split", split), ("samples", run.sampleIds.length), ("jobs", statusCounts jobs),
@@ -1090,12 +1101,13 @@ def runJson (run : Run) (detail : Bool) (includeStale := false) (includeDerived 
       ("jobId", j.id), ("status", j.statusRaw), ("error", optStr j.error),
       ("rubricVersion", (j.rubricVersion.map fun v => (v : Json)).getD .null),
       ("prType", optStr j.prType),
+      ("isolated", (j.isolated.map fun b => (b : Json)).getD .null),
       ("sample", (sample.map fun s => Json.mkObj [("id", s.id), ("prNumber", s.prNumber),
         ("reviewer", s.reviewer), ("state", s.state), ("commitId", s.commitId),
         ("title", s.title), ("scope", s.scope), ("comments", s.comments.length),
         ("deleted", s.deletedAt.isSome), ("split", optStr s.split)]).getD .null),
       ("score", score.getD .null), ("scoreStale", row.any isStale),
-      ("scoreDerived", row.any f.derived)]
+      ("scoreDerived", row.any f.derived), ("scoreUnisolated", row.any f.unisolated)]
   return .mkObj (fields ++ [("results", .arr results)])
 
 /-- The aggregate over every scored calibration job of `owner/name` whose sample is not deleted
@@ -1103,8 +1115,8 @@ def runJson (run : Run) (detail : Bool) (includeStale := false) (includeDerived 
     for each rubric version the jobs were reviewed against (`null`: before rubrics), newest version
     first. -/
 def summaryJson (owner name : String) (includeStale := false) (includeDerived := false)
-    (split := "eval") : IO Json := do
-  let f ← filterOf owner name includeStale includeDerived split
+    (split := "eval") (includeUnisolated := true) : IO Json := do
+  let f ← filterOf owner name includeStale includeDerived split includeUnisolated
   let scores := (← scoresOf owner name).filter (!f.deleted.contains ·.sample_id)
   let versions := ((scores.map (·.rubric_version)).toList.eraseDups.toArray.qsort fun a b =>
     a.getD (-1) > b.getD (-1)).toList

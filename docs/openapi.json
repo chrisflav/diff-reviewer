@@ -2469,6 +2469,18 @@
               ]
             },
             "description": "`include` counts derived scores too."
+          },
+          {
+            "name": "unisolated",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "exclude"
+              ]
+            },
+            "description": "`exclude` leaves out the scores of calibration jobs not checked out isolated at their commit (`isolated` not `true`): run on the default branch, which may hold the change as merged. By default they are counted."
           }
         ],
         "responses": {
@@ -2585,6 +2597,18 @@
               ]
             },
             "description": "`include` counts derived scores too."
+          },
+          {
+            "name": "unisolated",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "exclude"
+              ]
+            },
+            "description": "`exclude` leaves out the scores of calibration jobs not checked out isolated at their commit."
           }
         ]
       }
@@ -2654,6 +2678,18 @@
               ]
             },
             "description": "`include` counts derived scores too."
+          },
+          {
+            "name": "unisolated",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "exclude"
+              ]
+            },
+            "description": "`exclude` leaves out the scores of calibration jobs not checked out isolated at their commit."
           }
         ]
       }
@@ -2899,7 +2935,8 @@
           "previousJob",
           "incrementalSince",
           "incrementalCommits",
-          "fullReviewReason"
+          "fullReviewReason",
+          "isolated"
         ],
         "properties": {
           "id": {
@@ -3090,6 +3127,13 @@
             ],
             "minimum": 0,
             "description": "The version of the style notes the agent was given when it read the job, as `rubricVersion` records the rubric: a score is `derived` when either was derived from its sample's pull request."
+          },
+          "isolated": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "For a `calibration` job: `true` when its task is checked out isolated at its commit, `false` when its pull request's head no longer reaches the commit (a force-push) and it runs on the default branch from the diff, `null` until decided when it is first queued, and for a job run before checkouts or of another kind."
           },
           "subRuns": {
             "type": "array",
@@ -4164,7 +4208,9 @@
           "staleScores",
           "staleIncluded",
           "derivedScores",
-          "derivedIncluded"
+          "derivedIncluded",
+          "unisolatedScores",
+          "unisolatedIncluded"
         ],
         "description": "Scores by the current matcher of samples not deleted, added up: counts first, every ratio computed from the sums, so each comment weighs the same.",
         "properties": {
@@ -4330,6 +4376,13 @@
           },
           "derivedIncluded": {
             "type": "boolean"
+          },
+          "unisolatedScores": {
+            "type": "integer",
+            "description": "Scores of calibration jobs not checked out isolated at their commit: run before checkouts, or of a commit a force-push left unreached by the pull request's head, on the default branch. Counted unless `?unisolated=exclude`."
+          },
+          "unisolatedIncluded": {
+            "type": "boolean"
           }
         }
       },
@@ -4462,6 +4515,17 @@
                     "null"
                   ],
                   "description": "A `CalibrationScore`, an `unscorable` record, or null until the job's draft is scored."
+                },
+                "isolated": {
+                  "type": [
+                    "boolean",
+                    "null"
+                  ],
+                  "description": "Whether the job was checked out isolated at its commit (see the Job's `isolated`)."
+                },
+                "scoreUnisolated": {
+                  "type": "boolean",
+                  "description": "The score is of a job not checked out isolated: counted unless `?unisolated=exclude`."
                 },
                 "scoreStale": {
                   "type": "boolean",

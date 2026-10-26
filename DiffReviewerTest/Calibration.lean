@@ -33,6 +33,9 @@ structure FakeHistory where
   limit       : IO.Ref (Option GitHub.RateLimit)
   /-- Every request for the reviews of a pull request, by its number. -/
   reviewCalls : IO.Ref (Array Nat)
+  /-- How GitHub compares a commit with its pull request's head, when they differ: `ahead`, the
+      head descends from it, or `diverged`, a force-push rewrote it. -/
+  compareStatus : IO.Ref String
 
 def mergeBase : String := "dddddddd44444444dddddddd44444444dddddddd"
 
@@ -80,7 +83,7 @@ def FakeHistory.new : IO FakeHistory := do
                (body := "rename this")),
              (13, comment 10 301 "RIGHT" 12 (commit := jobHead) (body := "and this"))]
          , rateLimited := ← IO.mkRef [], failing := ← IO.mkRef [], limit := ← IO.mkRef none
-         , reviewCalls := ← IO.mkRef #[] }
+         , reviewCalls := ← IO.mkRef #[], compareStatus := ← IO.mkRef "ahead" }
 
 def FakeHistory.client (f : FakeHistory) : GitHub.Client :=
   { f.gh.client with
@@ -95,6 +98,14 @@ def FakeHistory.client (f : FakeHistory) : GitHub.Client :=
     listReviewComments := fun _ _ n =>
       return .ok (((← f.comments.get).filter (·.1 == n)).map (·.2))
     mergeBase := fun _ _ _ _ => return .ok mergeBase
+    -- A closed pull request is read as GitHub reads it: with the head it was closed at.
+    getPull := fun o n number => do
+      match (← f.closed.get).find? (·.number == number) with
+      | some p => return .ok p
+      | none => f.gh.client.getPull o n number
+    compare := fun _ _ base head => do
+      let status ← f.compareStatus.get
+      return .ok { status := if base == head then "identical" else status }
     rateLimit := f.limit.get }
 
 def services (f : FakeHistory) (orch : Option FakeOrchestra := none) (limits : Workers.Limits := {})
@@ -491,8 +502,9 @@ def calibrationJobsAreNeverPosted : Test := withTempDb do
   let reviewPrompt := Workers.prompt { job with kindRaw := none }
   return checkStatus made 201 "the run"
     ++ checkEq (queued.map (·.issueNumber)) #[some 13] "queued, though the pull request is closed"
-    ++ checkEq (queued.map (·.kleisNarrow)) #[["github: only discover, fetch"]]
-      "with its token narrowed to cloning and fetching from GitHub"
+    ++ checkEq (queued.map (·.kleisNarrow)) #[["services: diff-reviewer"]]
+      "with its token narrowed to the platform: nothing of GitHub, not even git"
+    ++ checkEq job.isolated (some true) "decided isolated: the pull request's head is the commit"
     ++ check ((queued[0]?.map (·.toJson.getObjVal? "kleis_narrow" |>.isOk)).getD false)
       "the narrowing is in the request orchestra is sent"
     ++ checkEq (queued.map (·.checkout))
@@ -721,6 +733,64 @@ def aRateLimitedPostWaits : Test := withTempDb do
     ++ checkStatus posted 200 "and it is posted"
     ++ checkEq (← gh.posted.get).size 1 "once"
 
+/-- The narrowing each kind of job is queued with, pinned: a review's token is the client
+    spec's; a calibration job's and a proposal's reach the platform and nothing of GitHub — no API
+    and no git, so that no later commit can be fetched — since orchestra prepares their checkout. -/
+def narrowingsByKind : Test := do
+  let job (kind : Option JobKind) : Job :=
+    { id := "j", owner := "acme", name := "widgets", prNumber := 13, createdAt := ""
+    , updatedAt := "", kindRaw := kind.map (·.toString) }
+  return checkEq (Workers.narrowingFor (job none)) [] "a review: none"
+    ++ checkEq (Workers.narrowingFor (job (some .calibration))) ["services: diff-reviewer"]
+      "a calibration job: the platform only"
+    ++ checkEq (Workers.narrowingFor (job (some .proposal))) ["services: diff-reviewer"]
+      "a proposal: the platform only"
+    ++ checkEq (Workers.narrowingFor (job (some .review))) [] "a review named as one: none"
+
+/-- A sample whose pull request was force-pushed after the review: its head no longer reaches the
+    reviewed commit, which orchestra would refuse to check out, so the job runs without a checkout,
+    from the diff, and says so; its score is counted unless asked, and left out with
+    `?unisolated=exclude`. -/
+def aForcePushedSampleRunsUnisolated : Test := withTempDb do
+  let f ← FakeHistory.new
+  let orch ← FakeOrchestra.new
+  let svc ← services f orch
+  let st ← State.new cfg svc
+  let _ ← imported st svc f
+  f.closed.modify (·.map fun p => if p.number == 13 then { p with headSha := headB } else p)
+  f.compareStatus.set "diverged"
+  let made ← runOf st [← sampleId st 301]
+  let runId := (field made "id").getD ""
+  let jobId := ((resultsOf made).head?.bind (str · ["jobId"])).getD ""
+  Workers.queuePending svc
+  let queued ← orch.queued.get
+  let prompt := (queued[0]?.map (·.prompt)).getD ""
+  let _ ← routeAgent st (agentReq .get "" (pr := 13))
+  let submitted ← routeAgent st
+    (agentReq .post "/review" (submission jobHead agentReview) (pr := 13))
+  let some job ← Platform.findJob jobId | return #["the calibration job is gone"]
+  let run := bodyJson (← route st (req .get s!"{repoPath}/calibration/runs/{runId}"))
+  let excluded := bodyJson (← route st
+    { req .get s!"{repoPath}/calibration/runs/{runId}" with query := "unisolated=exclude" })
+  let summary := bodyJson (← route st
+    { req .get s!"{repoPath}/calibration/summary" with query := "unisolated=exclude" })
+  let result := ((((run.getObjVal? "results").toOption.bind (·.getArr?.toOption)).bind
+    (·[0]?))).getD .null
+  return checkEq job.isolated (some false) "not isolated"
+    ++ checkStatus submitted 200 "the submission"
+    ++ checkEq (queued.map (·.checkout)) #[none] "queued without a checkout"
+    ++ checkEq (queued.map (·.kleisNarrow)) #[["services: diff-reviewer"]]
+      "and with GitHub closed to it all the same"
+    ++ check ((prompt.splitOn "git show <headSha>:<path>").length > 1 &&
+        (prompt.splitOn "at a later state than that commit").length > 1)
+      "the prompt: the default branch, read at the commit"
+    ++ check (result.getObjVal? "isolated" matches .ok (.bool false)) "the run says so"
+    ++ check (result.getObjVal? "scoreUnisolated" matches .ok (.bool true)) "and of its score"
+    ++ checkEq (num run ["aggregate", "unisolatedScores"]) (some 1) "counted"
+    ++ checkEq (num run ["aggregate", "scored"]) (some 1) "in the aggregate"
+    ++ checkEq (num excluded ["aggregate", "scored"]) (some 0) "left out when asked"
+    ++ checkEq (num summary ["overall", "scored"]) (some 0) "from the summary too"
+
 def all : List (String × Test) :=
   [("trustedReviewersAreASetting", trustedReviewersAreASetting),
    ("commentsAreMatchedByPlace", commentsAreMatchedByPlace),
@@ -731,6 +801,8 @@ def all : List (String × Test) :=
    ("calibrationJobsStandApart", calibrationJobsStandApart),
    ("aSupersededJobIsNotRun", aSupersededJobIsNotRun),
    ("runsAreAggregated", runsAreAggregated),
-   ("aRateLimitedPostWaits", aRateLimitedPostWaits)]
+   ("aRateLimitedPostWaits", aRateLimitedPostWaits),
+   ("narrowingsByKind", narrowingsByKind),
+   ("aForcePushedSampleRunsUnisolated", aForcePushedSampleRunsUnisolated)]
 
 end DiffReviewerTest.Calibration

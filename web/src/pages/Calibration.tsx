@@ -64,6 +64,42 @@ export function useDerived(): [boolean, (on: boolean) => void] {
   return [derived, set];
 }
 
+/**
+ * Whether only the scores of jobs checked out isolated at their commit are counted:
+ * `?unisolated=exclude` on the page, as on the API.
+ */
+export function useIsolatedOnly(): [boolean, (on: boolean) => void] {
+  const [params, setParams] = useSearchParams();
+  const only = params.get("unisolated") === "exclude";
+  const set = (on: boolean) =>
+    setParams(
+      (p) => {
+        const n = new URLSearchParams(p);
+        if (on) n.set("unisolated", "exclude");
+        else n.delete("unisolated");
+        return n;
+      },
+      { replace: true },
+    );
+  return [only, set];
+}
+
+export function IsolatedToggle({
+  only,
+  onChange,
+}: {
+  only: boolean;
+  onChange: (on: boolean) => void;
+}) {
+  return (
+    <label className="check">
+      <input type="checkbox" checked={only} onChange={(e) => onChange(e.target.checked)} />
+      Leave out scores of jobs not checked out isolated (run on the default branch, which may hold
+      the change as merged)
+    </label>
+  );
+}
+
 export function DerivedToggle({
   derived,
   onChange,
@@ -170,6 +206,7 @@ function CalibrationView({
 }) {
   const [stale, setStale] = useStale();
   const [derived, setDerived] = useDerived();
+  const [isolatedOnly, setIsolatedOnly] = useIsolatedOnly();
   // Bumped by anything that changes what the sections show: a new run, a deleted sample.
   const [nonce, setNonce] = useState(0);
   const changed = () => setNonce((n) => n + 1);
@@ -199,12 +236,14 @@ function CalibrationView({
       <Limits />
       <StaleToggle stale={stale} onChange={setStale} />
       <DerivedToggle derived={derived} onChange={setDerived} />
+      <IsolatedToggle only={isolatedOnly} onChange={setIsolatedOnly} />
 
       <Summary
         owner={owner}
         name={name}
         stale={stale}
         derived={derived}
+        isolatedOnly={isolatedOnly}
         nonce={nonce}
         onUnauthorized={onUnauthorized}
       />
@@ -213,6 +252,7 @@ function CalibrationView({
         name={name}
         stale={stale}
         derived={derived}
+        isolatedOnly={isolatedOnly}
         nonce={nonce}
         selected={selected}
         onStarted={() => {
@@ -239,6 +279,7 @@ function Summary({
   name,
   stale,
   derived,
+  isolatedOnly,
   nonce,
   onUnauthorized,
 }: {
@@ -246,12 +287,13 @@ function Summary({
   name: string;
   stale: boolean;
   derived: boolean;
+  isolatedOnly: boolean;
   nonce: number;
   onUnauthorized: () => void;
 }) {
   const fetch = useCallback(
-    () => api.calibrationSummary(owner, name, stale, derived),
-    [owner, name, stale, derived, nonce],
+    () => api.calibrationSummary(owner, name, stale, derived, isolatedOnly),
+    [owner, name, stale, derived, isolatedOnly, nonce],
   );
   const { data: s, error } = useLoad(fetch, onUnauthorized);
   return (
@@ -366,6 +408,7 @@ function Runs({
   name,
   stale,
   derived,
+  isolatedOnly,
   nonce,
   selected,
   onStarted,
@@ -375,6 +418,7 @@ function Runs({
   name: string;
   stale: boolean;
   derived: boolean;
+  isolatedOnly: boolean;
   nonce: number;
   selected: string[];
   onStarted: () => void;
@@ -382,8 +426,8 @@ function Runs({
 }) {
   const [offset, setOffset] = useState(0);
   const fetch = useCallback(
-    () => api.calibrationRuns(owner, name, 50, offset, stale, derived),
-    [owner, name, offset, stale, derived, nonce],
+    () => api.calibrationRuns(owner, name, 50, offset, stale, derived, isolatedOnly),
+    [owner, name, offset, stale, derived, isolatedOnly, nonce],
   );
   const { data, error, reload } = useLoad(fetch, onUnauthorized);
   usePoll(reload, data?.items.some(runLive) ?? false);
@@ -540,7 +584,7 @@ function Runs({
                   <tr key={r.id}>
                     <td>
                       <Link
-                        to={`${repoPath(owner, name)}/calibration/runs/${encodeURIComponent(r.id)}${scoreQuery(stale, derived, "?")}`}
+                        to={`${repoPath(owner, name)}/calibration/runs/${encodeURIComponent(r.id)}${scoreQuery(stale, derived, "?", isolatedOnly)}`}
                         className="data"
                       >
                         {r.createdAt}

@@ -47,6 +47,10 @@ export function AggregateFigures({ a }: { a: CalibrationAggregate }) {
           (a.derivedIncluded === true
             ? `${a.derivedScores} derived ${a.derivedScores === 1 ? "score is" : "scores are"} counted.`
             : `${a.derivedScores} derived ${a.derivedScores === 1 ? "score is" : "scores are"} left out.`)}{" "}
+        {(a.unisolatedScores ?? 0) > 0 &&
+          (a.unisolatedIncluded === false
+            ? `${a.unisolatedScores} ${a.unisolatedScores === 1 ? "score" : "scores"} of jobs not checked out isolated left out.`
+            : `${a.unisolatedScores} ${a.unisolatedScores === 1 ? "score" : "scores"} of jobs not checked out isolated counted.`)}{" "}
         Matcher version <span className="data">{a.matcherVersion}</span>.
       </p>
     </>
@@ -336,10 +340,12 @@ export function Limits({ open = false }: { open?: boolean }) {
           changes. Both count for their decision only.
         </li>
         <li>
-          <strong>What isolation is not.</strong> The agent's checkout is the reviewed commit and
-          its history only, with no branch, no remote and nothing after it, and it cannot read
-          GitHub's API; but it still has the network, and could fetch the pull request's later
-          commits from GitHub by their URL. It is told to fetch nothing.
+          <strong>Isolation.</strong> The agent's checkout is the reviewed commit and its history
+          only, with no branch, no remote and nothing after it, and its token reaches nothing of
+          GitHub, neither the API nor git. A commit a force-push left unreached by its pull
+          request's head cannot be checked out so: that job runs on the default branch, which may
+          hold the change as merged, and is marked <em>not isolated</em>; so is every job run
+          before checkouts. Their scores are counted unless you leave them out.
         </li>
         <li>
           <strong>Stale scores.</strong> A review imported after a run scored its sample joins the

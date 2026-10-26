@@ -104,12 +104,20 @@ inductive QueueError where
   | failed (why : String)
   deriving Repr, BEq
 
-/-- Whether refusal `why` is of the request's `checkout` — orchestra's words when its backend
-    does not make one (`ExecutionConfig.checkoutRefusal?`: they name the checkout, `'isolate'` or
-    a task "checked out at a commit") — rather than of a field the client file does not allow, a
-    repository its `queue_policy` does not list say, which the operator may yet add. -/
+/-- What orchestra says when its backend does not make a checkout
+    (`ExecutionConfig.checkoutRefusal?` in orchestra's `Config.lean`): on `merger` or `triage`,
+    `isolate` on `local`, and any checkout on a backend that runs hooks on the host. Phrases of
+    its refusals, word for word. -/
+def checkoutRefusals : List String :=
+  ["runs no agent on a checkout; 'checkout' is for tasks that do",
+   "'isolate' is refused on the 'local' execution backend",
+   "a task checked out at a commit runs its repository's hooks in that commit's tree"]
+
+/-- Whether refusal `why` is of the request's `checkout` (`checkoutRefusals`), rather than of a
+    field the client file does not allow — a repository its `queue_policy` does not list, say,
+    which the operator may yet add, and whose name may well have "checkout" in it. -/
 def refusesCheckout (why : String) : Bool :=
-  ["checkout", "'isolate'", "checked out"].any fun w => (why.splitOn w).length > 1
+  checkoutRefusals.any fun w => (why.splitOn w).length > 1
 
 instance : ToString QueueError where
   toString

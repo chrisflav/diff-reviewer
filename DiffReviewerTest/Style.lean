@@ -252,8 +252,8 @@ def aProposalIsWrittenAndAccepted : Test := withTempDb do
       "and no issue_number in what orchestra is sent"
     ++ checkEq (q.map (·.externalId)) (some jobId) "its external id is the job's"
     ++ checkEq (q.map (·.upstream)) (some "acme/widgets") "of the repository"
-    ++ checkEq (q.map (·.kleisNarrow)) (some ["github: only discover, fetch"])
-      "with GitHub's API closed to it"
+    ++ checkEq (q.map (·.kleisNarrow)) (some ["services: diff-reviewer"])
+      "with GitHub closed to it"
     ++ check (q.any fun q => (q.prompt.splitOn "agent proposal show acme/widgets").length > 1 &&
         (q.prompt.splitOn "advisory").length > 1) "the prompt: the task, and that it is advisory"
     ++ check (q.any fun q => (q.goal.splitOn "proposal submit").length > 1) "the goal: a submission"
