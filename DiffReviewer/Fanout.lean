@@ -484,9 +484,11 @@ inductive Settled where
 
 /-- Settle fan-out job `jobId`: once every current sub-run is final, merge their partial reviews
     into its draft — written as the agent's, the first revision of its history, which is what a
-    calibration job is scored on — or, when none submitted one, fail it. The job must still be
+    calibration job is scored on, after `finish` (an incremental re-review's follow-up line) — or,
+    when none submitted one, fail it. The job must still be
     `queued` or `running` at the version read, which keeps two settlements from both writing. -/
-def settle (jobId : String) : IO Settled := do
+def settle (jobId : String) (finish : Job → Review → IO Review := fun _ r => pure r) :
+    IO Settled := do
   let some job ← Platform.findJob jobId | return .waiting
   unless job.status? == some .queued || job.status? == some .running do return .waiting
   let subs ← current jobId
@@ -515,7 +517,7 @@ def settle (jobId : String) : IO Settled := do
                                     error := some s!"every sub-run failed ({why})" } with
     | some j => return .failed j
     | none => return .waiting
-  let merged ← (merge parts).assignIds
+  let merged ← finish job (← (merge parts).assignIds)
   if let .error e := merged.validate then
     match ← write fun j => { j with statusRaw := JobStatus.failed.toString
                                     error := some s!"the sub-runs' reviews do not merge: {e}" } with

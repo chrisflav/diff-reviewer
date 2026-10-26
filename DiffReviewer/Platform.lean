@@ -115,6 +115,9 @@ structure Repo where
   /-- The most sub-runs one fan-out review may make; a review that would make more is refused
       (`failed`, with why). -/
   maxFanout  : Nat := defaultMaxFanout
+  /-- Whether a new head of a pull request whose review was posted is reviewed incrementally: the
+      changes since the posted review only, with that review in the agent's context. -/
+  incremental : Bool := true
   /-- Incremented by every write of the settings, so that a stale page is refused (`409`) rather
       than overwriting what it never saw. -/
   version    : Nat := 1
@@ -130,6 +133,7 @@ def Repo.toJson (r : Repo) : Json :=
           ("styleNotes", r.styleNotes), ("evalShare", r.evalShare),
           ("styleNotesVersion", r.styleNotesVersion),
           ("prType", (r.prType.map Json.str).getD .null), ("maxFanout", r.maxFanout),
+          ("incremental", r.incremental),
           ("version", r.version), ("createdAt", r.createdAt)]
 
 /-- The strings a column holding a JSON array of strings holds; anything else is none. -/
@@ -153,6 +157,7 @@ private def Repo.ofRow (row : Store.RepoRow) : Repo :=
   , styleNotesVersion := (row.style_notes_version.getD 0).toNat
   , prType := row.pr_type.filter (!·.isEmpty)
   , maxFanout := (row.max_fanout.map (·.toNat)).getD defaultMaxFanout
+  , incremental := row.incremental.getD true
   , version := (row.version.getD 1).toNat }
 
 /-- The repository as its row, for a write. -/
@@ -162,7 +167,8 @@ private def Repo.toRow (r : Repo) : Store.RepoRow :=
   , trusted_reviewers := some (Json.arr (r.trustedReviewers.map Json.str).toArray).compress
   , style_notes := some r.styleNotes, eval_share := some r.evalShare
   , style_notes_version := some r.styleNotesVersion, pr_type := r.prType
-  , max_fanout := some r.maxFanout, version := some r.version }
+  , max_fanout := some r.maxFanout, incremental := some r.incremental
+  , version := some r.version }
 
 /-! ## Provenance -/
 
@@ -326,6 +332,16 @@ structure Job where
   /-- The round of sub-runs the job's current attempt is reviewed by (`DiffReviewer.Fanout`), or
       `none` when it is run as one run: a sub-run of any other round is history. -/
   fanoutRound : Option Nat := none
+  /-- An incremental re-review: the job whose posted review it follows up, the head that review
+      was of, from which the diff it reviews starts, and the commits since, as stored (a JSON
+      array of `{"sha", "message"}`). -/
+  previousJob : Option String := none
+  incrementalSince : Option String := none
+  incrementalCommitsRaw : Option String := none
+  /-- Why a review that would have been incremental is a full one (a force-push). -/
+  fullReviewReason : Option String := none
+  /-- The head the incremental decision was made at: it is made once a head. -/
+  incrementalHead : Option String := none
 
 def Job.status? (j : Job) : Option JobStatus := JobStatus.ofString? j.statusRaw
 
@@ -368,7 +384,12 @@ def Job.toJson (j : Job) : Json :=
     | none            => (.null, .null)
     | some (.ok r)    => (r.toJson, .null)
     | some (.error e) => (.null, .str e)
-  .mkObj [
+  let incremental : List (String × Json) :=
+    [("previousJob", optStr j.previousJob), ("incrementalSince", optStr j.incrementalSince),
+     ("incrementalCommits",
+       (j.incrementalCommitsRaw.bind (Json.parse · |>.toOption)).getD .null),
+     ("fullReviewReason", optStr j.fullReviewReason)]
+  let known : List (String × Json) := [
     ("id", j.id), ("owner", j.owner), ("name", j.name), ("prNumber", j.prNumber),
     ("headSha", optStr j.headSha), ("status", j.statusRaw),
     ("queueEntry", optStr j.queueEntry), ("review", review), ("reviewError", reviewError),
@@ -383,6 +404,7 @@ def Job.toJson (j : Job) : Json :=
     ("kind", j.kindRaw.getD JobKind.review.toString), ("sampleId", optStr j.sampleId),
     ("runId", optStr j.runId),
     ("notesVersion", (j.notesVersion.map fun v => (v : Json)).getD .null)]
+  .mkObj (known ++ incremental)
 
 def Job.ofRow (row : Store.JobRow) : Job :=
   { id := row.id, owner := row.owner, name := row.name, prNumber := row.pr_number.toNat
@@ -396,7 +418,10 @@ def Job.ofRow (row : Store.JobRow) : Job :=
   , directPosts := (row.direct_posts.getD 0).toNat, postDirect := row.post_direct.getD false
   , kindRaw := row.kind, sampleId := row.sample_id, runId := row.run_id
   , notesVersion := row.notes_version.map (·.toNat)
-  , fanoutRound := row.fanout_round.map (·.toNat) }
+  , fanoutRound := row.fanout_round.map (·.toNat)
+  , previousJob := row.previous_job, incrementalSince := row.incremental_since
+  , incrementalCommitsRaw := row.incremental_commits, fullReviewReason := row.full_review_reason
+  , incrementalHead := row.incremental_head }
 
 def Job.toRow (j : Job) : Store.JobRow :=
   { id := j.id, owner := j.owner, name := j.name, pr_number := j.prNumber
@@ -410,7 +435,10 @@ def Job.toRow (j : Job) : Store.JobRow :=
   , direct_posts := some j.directPosts, post_direct := some j.postDirect
   , kind := j.kindRaw, sample_id := j.sampleId, run_id := j.runId
   , notes_version := j.notesVersion.map Int.ofNat
-  , fanout_round := j.fanoutRound.map Int.ofNat }
+  , fanout_round := j.fanoutRound.map Int.ofNat
+  , previous_job := j.previousJob, incremental_since := j.incrementalSince
+  , incremental_commits := j.incrementalCommitsRaw, full_review_reason := j.fullReviewReason
+  , incremental_head := j.incrementalHead }
 
 /-- The largest pull request number accepted: what fits a 32-bit column with room to spare. -/
 def maxPrNumber : Nat := 2147483647
@@ -553,6 +581,7 @@ structure RepoUpdate where
   /-- The fixed pull request type: `some none` clears it. -/
   prType           : Option (Option String) := none
   maxFanout        : Option Nat := none
+  incremental      : Option Bool := none
   /-- Run first in the write's transaction: what the style notes written are derived from (a
       rubric proposal they came from, which it marks accepted), or why nothing is to be written —
       `invalid` for a request that names no such proposal, `conflict` for one it may not use. -/
@@ -651,7 +680,8 @@ were read (version {v}, now {current}); reload them"
       { old with mode := u.mode.getD old.mode, autoReview := u.autoReview.getD old.autoReview
                  trustedReviewers := trusted, styleNotes := u.styleNotes.getD old.styleNotes
                  evalShare := u.evalShare.getD old.evalShare, prType := u.prType.getD old.prType
-                 maxFanout := u.maxFanout.getD old.maxFanout, version := old.version + 1 }
+                 maxFanout := u.maxFanout.getD old.maxFanout
+                 incremental := u.incremental.getD old.incremental, version := old.version + 1 }
     let prov ← match ← u.provenance with
       | .ok p => pure p
       | .error why => return .error why
@@ -779,7 +809,8 @@ def jobsSince (owner name since : String) : IO Nat :=
 /-- The statuses in which a job still has a use for its diff. -/
 def liveStatuses : List JobStatus := [.pending, .queued, .running, .draft, .approved]
 
-/-- Drop the kept diffs no live job is of, and every one fetched before `before`. Answers how many
+/-- Drop the kept diffs no live job is of — its own, or an incremental review's of the changes
+    since its previous review — and every one fetched before `before`. Answers how many
     were dropped. -/
 def pruneDiffs (before : String) : IO Nat := do
   -- `before` is an instant this process formatted, and the statuses are constants: nothing in the
@@ -787,9 +818,11 @@ def pruneDiffs (before : String) : IO Nat := do
   let live := ", ".intercalate (liveStatuses.map fun st => s!"'{st.toString}'")
   Store.run do
     let db ← read
+    -- An incremental review's diff is from the head its previous review was of.
     SQLite.exec db s!"DELETE FROM pull_diff WHERE fetched_at < '{before}' OR NOT EXISTS \
 (SELECT 1 FROM review_job j WHERE j.owner = pull_diff.owner AND j.name = pull_diff.name AND \
-j.base_sha = pull_diff.base_sha AND j.head_sha = pull_diff.head_sha AND j.status IN ({live}))"
+(j.base_sha = pull_diff.base_sha OR j.incremental_since = pull_diff.base_sha) AND \
+j.head_sha = pull_diff.head_sha AND j.status IN ({live}))"
     return (← db.changes).toInt.toNat
 
 /-- The diff kept for a pull request with base `base` at head `head`. -/

@@ -44,6 +44,15 @@ it to its category; following follows each, runs one that ended without a submis
 and merges the partial reviews into the job's draft once every sub-run has submitted or failed
 (`settleFanout`). Retiring the job cancels its sub-runs' runs.
 
+A review job of a pull request whose review was posted, at a new head, is an **incremental
+re-review** — unless its repository turns that off (`incremental`). Queueing decides it
+(`incrementalOf`): it compares the head the posted review was of with the new one, and when the
+old descends into the new, the job records the posted review's job, that head and the commits
+since, and the agent is shown the posted review and asked for the changes since — their diff
+(`rangeDiffOf`) is what every comment must be on (`checkDiffs`), and the posted body names the
+earlier review (`followUp`). A force-push, where the old head is no ancestor of the new, falls back
+to a full review, with why on the job (`fullReviewReason`).
+
 And it drops the kept diffs no live job needs. On request: fetching a diff (`diffOf`, cached per
 commit) and posting an approved review (`postJob`), which a person asks for, or the agent's
 submission does for a `direct` repository.
@@ -179,6 +188,22 @@ def agentRef (job : Job) (scope : Option Scope) : String :=
   | some sc => sc.ref
   | none => job.id
 
+/-- What the prompt of an incremental re-review adds to its second step: what it follows up, and
+    that it reviews the changes since, without repeating what the earlier review said. -/
+private def incrementalNote (job : Job) (ref : String) : String :=
+  match job.incrementalSince with
+  | none => ""
+  | some since =>
+    let slug := s!"{job.owner}/{job.name}"
+    s!"
+
+   This pull request was reviewed before, at `{since}`, and that review was posted: `agent show` \
+prints it as GitHub holds it (`incremental.postedReview`, with its comments) and the commits since \
+(`incremental.commits`). Review the new changes only: \
+`diff-reviewer agent diff {slug} {job.prNumber} --since {since} --job {ref}` prints their diff, \
+and every inline comment must be on a line of it. Do not repeat a point the earlier review made; \
+say in the summary which of its points the new commits resolve."
+
 /-- The step of `prompt` that has the agent check out the commit under review. A calibration
     job's commit is of a pull request that has since been closed. The task's checkout is the
     repository's default branch, mounted read-only — which may well hold the change as it was
@@ -200,7 +225,7 @@ GitHub only through git, not through its API."
   else
     s!"2. The repository is checked out read-only in your working directory. Check out the head \
 commit it names (`git fetch origin pull/{job.prNumber}/head && git checkout <headSha>`) and read \
-the change in context. {diff}"
+the change in context. {diff}{incrementalNote job ref}"
 
 /-- The prompt's last line: who posts the review, which for a calibration job is nobody. -/
 private def postingLine (job : Job) : String :=
@@ -447,6 +472,29 @@ def DiffError.message : DiffError → String
   | .unavailable => "GitHub is not configured (DIFF_REVIEWER_GITHUB_TOKEN_FILE)"
   | .tooLarge why | .github why => why
 
+/-- The diff of `base...head` of `owner/name`, from the cache or from GitHub, then cached; past
+    `maxDiffBytes` it is refused. -/
+private def fetchDiff (s : Services) (owner name base head : String) :
+    IO (Except DiffError String) := do
+  if let some d ← Platform.cachedDiff owner name base head then return .ok d
+  let some gh := s.github | return .error .unavailable
+  match ← gh.diff owner name base head with
+  | .error (.tooLarge n) => return .error (.tooLarge (GitHub.Error.tooLarge n).message)
+  | .error e => return .error (.github e.message)
+  | .ok d =>
+    if d.utf8ByteSize > s.limits.maxDiffBytes then
+      return .error (.tooLarge (GitHub.Error.tooLarge s.limits.maxDiffBytes).message)
+    Platform.cacheDiff owner name base head d
+    return .ok d
+
+/-- The diff an incremental re-review reviews: from the head its previous review was of to its
+    own, cached as the pull request's diffs are. -/
+def rangeDiffOf (s : Services) (job : Job) : IO (Except DiffError String) := do
+  let some head := job.headSha | return .error .noHead
+  let some since := job.incrementalSince
+    | return .error (.github s!"job {job.id} is not an incremental review")
+  fetchDiff s job.owner job.name since head
+
 /-- The head commit and diff of `job`: from the cache, or from GitHub, then cached. A job that does
     not know its base yet takes the pull request's current one. -/
 def diffOf (s : Services) (job : Job) : IO (Except DiffError (String × String)) := do
@@ -459,15 +507,28 @@ def diffOf (s : Services) (job : Job) : IO (Except DiffError (String × String))
     | none => match ← gh.getPull job.owner job.name job.prNumber with
       | .ok p => pure p.baseSha
       | .error e => return .error (.github e.message)
-  if let some d ← Platform.cachedDiff job.owner job.name base head then return .ok (head, d)
-  match ← gh.diff job.owner job.name base head with
-  | .error (.tooLarge n) => return .error (.tooLarge (GitHub.Error.tooLarge n).message)
-  | .error e => return .error (.github e.message)
-  | .ok d =>
-    if d.utf8ByteSize > s.limits.maxDiffBytes then
-      return .error (.tooLarge (GitHub.Error.tooLarge s.limits.maxDiffBytes).message)
-    Platform.cacheDiff job.owner job.name base head d
-    return .ok (head, d)
+  return (← fetchDiff s job.owner job.name base head).map (head, ·)
+
+/-- Why `r` has a comment GitHub would refuse against `job`'s diff, or — for an incremental
+    re-review — one off the diff of the changes since its previous review, if it has one. A diff
+    that cannot be had is not checked on submission, which posting checks again; posting
+    (`strict`) refuses an incremental review whose diff since cannot be had, since nothing else
+    keeps its comments to the new lines. -/
+def checkDiffs (s : Services) (job : Job) (r : Review) (strict := false) :
+    IO (Except String Unit) := do
+  if let .ok (_, d) ← diffOf s job then
+    if let .error e := Diff.check r d then return .error e
+  if let some since := job.incrementalSince then
+    match ← rangeDiffOf s job with
+    | .ok d =>
+      if let .error e := Diff.check r d then
+        return .error s!"{e} — this review follows up the one of {since}, and comments only on \
+the changes since it (`diff-reviewer agent diff … --since {since}`)"
+    | .error e =>
+      if strict then
+        return .error s!"the diff since the review of {since} could not be read to check the \
+comments against it ({e.message})"
+  return .ok ()
 
 /-! ## Posting -/
 
@@ -482,6 +543,34 @@ inductive PostError where
 
 /-- The marker the posted body of job `id`'s review ends with, by which it is found again. -/
 def marker (id : String) : String := s!"<!-- diff-reviewer job {id} -->"
+
+/-- `body` without the marker of job `id` it ends with, if it ends with one. -/
+def stripMarker (id body : String) : String :=
+  let m := marker id
+  if body.endsWith ("\n\n" ++ m) then (body.dropEnd (m.length + 2)).toString
+  else if body.endsWith m then (body.dropEnd m.length).toString
+  else body
+
+/-- The longest review body GitHub takes, in characters. -/
+def maxReviewBodyChars : Nat := 65536
+
+/-- An incremental re-review's draft, as it is drafted — the agent's submission, or its sub-runs'
+    merge — so that a person reads, edits and approves it: its body ends with a line naming the
+    earlier review it follows up, with a link to it on GitHub, unless it links it already. The
+    line is left out when it would take the body, with the marker posting adds, past what GitHub
+    takes. Any other review as it is. -/
+def followUp (job : Job) (r : Review) : IO Review := do
+  let (some prevId, some since) := (job.previousJob, job.incrementalSince) | return r
+  let url := (← Platform.findJob prevId).bind (·.postedUrl)
+  if url.any fun u => (r.body.splitOn u).length > 1 then return r
+  let short := (since.take 12).toString
+  let line := match url with
+    | some u => s!"Follow-up to [the earlier review]({u}) of {short}: this review covers the \
+commits since."
+    | none => s!"Follow-up to the earlier review of {short}: this review covers the commits since."
+  let body := if r.body.trimAscii.isEmpty then line else r.body ++ "\n\n" ++ line
+  if body.length + (marker job.id).length + 2 > maxReviewBodyChars then return r
+  return { r with body }
 
 /-- The review as it is posted: its body, then the marker. -/
 def withMarker (id : String) (r : Review) : Review :=
@@ -518,11 +607,7 @@ does not let its author approve it or request changes")
     failing that, the event it was posted as when that is known. The comments are the job's: the
     claim kept them from being edited meanwhile. -/
 def postedRevision (job : Job) (r : GitHub.PostedReview) (event : Option Decision) : String :=
-  let m := marker job.id
-  let body :=
-    if r.body.endsWith ("\n\n" ++ m) then (r.body.dropEnd (m.length + 2)).toString
-    else if r.body.endsWith m then (r.body.dropEnd m.length).toString
-    else r.body
+  let body := stripMarker job.id r.body
   let base := (job.reviewRaw.bind (Json.parse · |>.toOption)).getD (.mkObj [])
   let base := if base.getObj?.isOk then base else .mkObj []
   let base := base.setObjVal! "body" body
@@ -577,9 +662,8 @@ def postJob (s : Services) (id : String) (version : Option Nat := none) (direct 
     let some head := job.headSha
       | return .error (.conflict s!"job {id} names no head commit to pin the review to")
     let some gh := s.github | return .error .unavailable
-    if let .ok (_, d) ← diffOf s job then
-      if let .error e := Diff.check review d then
-        return .error (.conflict s!"job {id}'s review would be refused by GitHub: {e}")
+    if let .error e ← checkDiffs s job review (strict := true) then
+      return .error (.conflict s!"job {id}'s review would be refused: {e}")
     let markPosted (r : GitHub.PostedReview) (note : Option String)
         (event : Option Decision := none) : IO (Except PostError Job) :=
       recordPosted s job r note event
@@ -725,7 +809,7 @@ def afterDraft (s : Services) (job : Job) : IO Job := do
 /-- Settle fan-out job `jobId` (`Fanout.settle`): merged into its draft once every sub-run is in,
     then on as any draft (`afterDraft`), or failed when every sub-run failed. -/
 def settleFanout (s : Services) (jobId : String) : IO Unit := do
-  match ← Fanout.settle jobId with
+  match ← Fanout.settle jobId (finish := followUp) with
   | .drafted j =>
     s.log s!"merged the sub-runs of job {j.id} into its draft"
     let _ ← afterDraft s j
@@ -811,6 +895,55 @@ heads wait"
     seen with the entry it already made. -/
 def externalId (id : String) (attempts : Nat) : String :=
   if attempts == 0 then id else s!"{id}.{attempts + 1}"
+
+/-- The most commits of an incremental re-review's range kept for the agent, and the longest
+    message of one. -/
+def maxIncrementalCommits : Nat := 100
+
+def maxCommitMessageChars : Nat := 1000
+
+/-- Whether review job `job`, read for queueing, is an incremental re-review, as a change of its
+    fields: it is when `repo` reviews incrementally, a review of another head of its pull request
+    was posted (the newest such), and GitHub says the head that review was of is an ancestor of
+    this one — then it records that job, that head and the commits since, and the diff between is
+    fetched. A head that is not an ancestor — a force-push — or that GitHub refuses to compare
+    makes it a full review, with why (`fullReviewReason`). An error to wait on, and record, when
+    GitHub could not be asked. -/
+def incrementalOf (s : Services) (repo : Repo) (job : Job) : IO (Except String (Job → Job)) := do
+  let full (reason : Option String) (j : Job) : Job :=
+    { j with previousJob := none, incrementalSince := none, incrementalCommitsRaw := none
+             fullReviewReason := reason }
+  let some head := job.headSha | return .ok (full none)
+  unless repo.incremental && job.isReview do return .ok (full none)
+  let some gh := s.github | return .ok (full none)
+  -- Newest first: the review posted last is the one the new head follows.
+  let posted := (← Platform.jobsOfPull job.owner job.name job.prNumber).filter fun j =>
+    j.isReview && j.status? == some .posted && j.id != job.id && j.headSha.isSome &&
+      j.headSha != some head
+  let some prev := posted[0]? | return .ok (full none)
+  let some since := prev.headSha | return .ok (full none)
+  match ← gh.compare job.owner job.name since head with
+  | .error (.definite why) =>
+    return .ok (full (some s!"the head the last posted review was of, {since}, could not be \
+compared with {head} ({why}); reviewed in full"))
+  | .error e => return .error s!"comparing the last reviewed head {since} with {head}: {e.message}"
+  | .ok c =>
+    unless c.status == "ahead" do
+      return .ok (full (some s!"the head the last posted review was of, {since}, is not an \
+ancestor of {head} — a force-push (GitHub compares them as {c.status}); reviewed in full"))
+    -- The newest: GitHub lists them oldest first, and the latest say most of what changed.
+    let newest := c.commits.extract (c.commits.size - maxIncrementalCommits) c.commits.size
+    let commits := newest.map fun (sha, msg) =>
+      Json.mkObj [("sha", sha), ("message", (msg.take maxCommitMessageChars).toString)]
+    let inc (j : Job) : Job :=
+      { j with previousJob := some prev.id, incrementalSince := some since
+               incrementalCommitsRaw := some (Json.arr commits).compress, fullReviewReason := none }
+    match ← rangeDiffOf s (inc job) with
+    | .ok _ => return .ok inc
+    | .error (.tooLarge why) =>
+      return .ok (full (some s!"the diff since the last posted review is too large ({why}); \
+reviewed in full"))
+    | .error e => return .error s!"reading the diff since the last posted review: {e.message}"
 
 /-- The fan-out plan of a review of `repo` under its current rubric, and that rubric's version;
     `none` when it is one run — or when the rubric cannot be read, which the agent is told when it
@@ -908,6 +1041,26 @@ and GitHub is not configured to read them"
         | .error e =>
           recordError job.id .pending s!"reading the diff: {e.message}"
           continue
+    -- A new head of a pull request whose review was posted: the changes since, when they follow.
+    -- Decided once a head, and kept on the job: a job waiting on anything else does not ask
+    -- GitHub to compare on every pass.
+    if job.isReview && job.incrementalHead != job.headSha then
+      match ← incrementalOf s repo job with
+      | .error why =>
+        recordError job.id .pending why
+        continue
+      | .ok f =>
+        let decided := { f job with incrementalHead := job.headSha }
+        match ← Platform.updateJob job.id fun j => do
+            unless j.status? == some .pending && j.version == job.version do
+              throw (.conflict "moved on")
+            return { j with previousJob := decided.previousJob
+                            incrementalSince := decided.incrementalSince
+                            incrementalCommitsRaw := decided.incrementalCommitsRaw
+                            fullReviewReason := decided.fullReviewReason
+                            incrementalHead := decided.incrementalHead } with
+        | .ok j => job := { decided with version := j.version, updatedAt := j.updatedAt }
+        | .error _ => continue
     -- A rubric that asks for fan-out: the job's sub-runs are queued, not the job.
     if !proposal then
       if let some (plan, version) ← fanoutPlanOf repo then
@@ -922,7 +1075,10 @@ default and {plan.categories.length} categories), more than {repo.slug}'s maxFan
           else Fanout.reviewChargeIn job plan.size s.limits.maxJobsPerDay since
         let learnt (j : Job) : Job :=
           { j with headSha := job.headSha, baseSha := job.baseSha, title := job.title
-                   prBody := job.prBody }
+                   prBody := job.prBody, previousJob := job.previousJob
+                   incrementalSince := job.incrementalSince
+                   incrementalCommitsRaw := job.incrementalCommitsRaw
+                   fullReviewReason := job.fullReviewReason }
         match ← Fanout.begin job learnt plan version (externalId job.id job.attempts) charge with
         | .error .moved => s.log s!"job {job.id} changed while it was fanned out"
         | .error (.capped why) => recordError job.id .pending why
@@ -947,7 +1103,10 @@ default and {plan.categories.length} categories), more than {repo.slug}'s maxFan
         return { j with headSha := job.headSha, baseSha := job.baseSha, title := job.title
                         prBody := job.prBody, statusRaw := JobStatus.queued.toString
                         queueEntry := some entry.id, attempts := j.attempts + 1, error := none
-                        fanoutRound := none }
+                        fanoutRound := none
+                        previousJob := job.previousJob, incrementalSince := job.incrementalSince
+                        incrementalCommitsRaw := job.incrementalCommitsRaw
+                        fullReviewReason := job.fullReviewReason }
       match r with
       | .ok _ => s.log s!"queued job {job.id} as orchestra entry {entry.id}"
       | .error _ =>

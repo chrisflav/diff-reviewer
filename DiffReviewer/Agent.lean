@@ -110,8 +110,16 @@ private def call (method slug pr suffix : String) (body : Option String) (pretty
 def showPull (slug pr : String) (job : Option String := none) : IO UInt32 :=
   call "GET" slug pr "" none true job
 
-def printDiff (slug pr : String) (job : Option String := none) : IO UInt32 :=
-  call "GET" slug pr "/diff" none false job
+/-- Print the diff under review; with `since`, an incremental re-review's diff of the changes since
+    its previous review, which the platform answers only for the head that review was of. -/
+def printDiff (slug pr : String) (job : Option String := none) (since : Option String := none) :
+    IO UInt32 := do
+  match since with
+  | none => call "GET" slug pr "/diff" none false job
+  | some sha =>
+    unless !sha.isEmpty && sha.all (fun c => c.isDigit || ('a' ≤ c.toLower && c.toLower ≤ 'f')) do
+      return ← fail s!"'{sha}' is not a commit id"
+    call "GET" slug pr s!"/diff?since={sha.toLower}" none false job
 
 /-- Submit the review in `path` (`-` for standard input). -/
 def submit (slug pr path : String) (job : Option String := none) : IO UInt32 := do
@@ -172,6 +180,13 @@ def submitProposal (slug path job : String) : IO UInt32 := do
     a request that names its job. -/
 def jobFlag : List String → Option (Option String)
   | ["--job", id] => some (some id)
+  | _ => none
+
+/-- `agent diff`'s flags: `--job <id>`, after `--since <sha>` for an incremental re-review's diff of
+    the changes since its previous review. -/
+def diffFlags : List String → Option (Option String × Option String)
+  | ["--since", sha, "--job", id] => some (some sha, some id)
+  | ["--job", id] => some (none, some id)
   | _ => none
 
 end DiffReviewer.Agent

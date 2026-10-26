@@ -4,7 +4,7 @@ A platform for agentic reviews of GitHub pull requests (taxis #588), grown out o
 tool. Agents draft reviews; you read and edit them against the diff, approve them, and they are
 posted to the pull request under your name.
 
-It is built in milestones. The first five are here:
+It is built in milestones. The first six are here:
 
 - **A review format** (`DiffReviewer/Types.lean`): a decision (comment, approve, request changes),
   a summary, and at most 200 inline comments on file line ranges with optional suggestions. Each
@@ -28,7 +28,8 @@ It is built in milestones. The first five are here:
   `POST /api/v1/jobs/{id}/reconcile` would, and logs what it found. Kept diffs no live job needs,
   and any older than 30 days, are dropped.
 - **The agent API** (`/api/agent/v1/repos/{owner}/{name}/pulls/{pr}…`) and **the agent CLI**
-  (`diff-reviewer agent show|diff|submit … --job <id>`): what the reviewing agent reads and how
+  (`diff-reviewer agent show|diff|submit … --job <id>`, `agent diff … --since <sha>` for an
+  [incremental re-review](#incremental-re-review)): what the reviewing agent reads and how
   it submits. A submission is checked as GitHub would check it — its comments must be on the
   diff's new side — and becomes a `draft`; in a `direct` repository it is posted at once, always
   as a comment.
@@ -69,13 +70,16 @@ It is built in milestones. The first five are here:
 - **Fan-out**: a pull request type — or the rubric, for every review — may ask for its reviews to
   be run as one sub-run per category plus one by the default rubric, side by side, and merged into
   one draft. See [Fan-out](#fan-out).
+- **Incremental re-review**: a new head of a pull request whose review was posted is reviewed for
+  the changes since, with the posted review in the agent's context. See
+  [Incremental re-review](#incremental-re-review).
 - **A web front-end** (`web/`): sign in, register repositories, request a review, read a review,
   edit it, approve or reject it. Every write names the version of the job it was made on, so a
   stale page is refused rather than overwriting.
 - **The command-line tools** it started as: `diff-reviewer github` posts a review JSON to a pull
   request, and `diff-reviewer from-git` turns a commit range into one.
 
-Next: incremental re-review, and the front-end for style, proposals and fan-out.
+Next: the front-end for style, proposals, fan-out and incremental re-review.
 
 ## Running it
 
@@ -698,6 +702,46 @@ what no category covers. Each is an orchestra task of its own.
 - **Calibration** jobs fan out as review jobs do — each sub-run narrowed and told it is not
   posted — and are scored on the merged draft.
 
+## Incremental re-review
+
+A pull request that moves on after its review was posted does not need the whole review again: the
+agent is asked for the changes since, told what was already said, and the review posted names the
+one it follows.
+
+- **When.** Queueing decides it, for a review job: if a review job of another head of the same pull
+  request is `posted` (the newest such), and GitHub's compare of that head with the new one says
+  `ahead` — the old head is an ancestor of the new — the job is incremental. It records the posted
+  job (`previousJob`), the head that review was of (`incrementalSince`) and the commits since
+  (`incrementalCommits`, the newest 100, each message at most 1000 characters), and the diff
+  between the two heads is fetched and kept like any diff. The decision is made once for the
+  job's head and kept on the job: a job waiting on anything else does not ask GitHub again on
+  every pass. Calibration jobs are never incremental.
+- **A force-push** — the old head not an ancestor of the new (`diverged`, `behind`) — falls back to a
+  full review, and the job says why (`fullReviewReason`); so does an old head GitHub refuses to
+  compare (it may be gone), and a diff since too large. GitHub not answering, or its rate limit,
+  leaves the job `pending` with why, recorded once, as any other read queueing waits on.
+- **What the agent gets.** `agent show` adds `incremental`: the head it follows, the earlier review
+  as GitHub holds it (`postedReview`, without the platform's hidden marker) with the inline
+  comments it was posted with, the commits
+  since, and the command for their diff, `diff-reviewer agent diff <owner/name> <pr> --since <sha>
+  --job <id>` (`GET /api/agent/v1/repos/{o}/{n}/pulls/{pr}/diff?since=<sha>`; `since` must be the
+  job's own `incrementalSince`, or the answer is a `400` naming it). The prompt and the
+  instructions ask it to review the changes since, not to repeat a point the earlier review made,
+  and to say in the summary which of those points the new commits resolve. A [fan-out](#fan-out)'s
+  sub-runs of an incremental review are told the same.
+- **Only the new lines.** Every inline comment must lie in a hunk of the diff since — and, as
+  always, of the pull request's diff, since GitHub takes comments only there: a submission off it
+  is a `400` saying which hunks there are, and posting checks it again — strictly: when the diff
+  since cannot be read, the post is refused rather than made unchecked.
+- **The draft** ends with a line naming the earlier review and linking it on GitHub ("Follow-up
+  to [the earlier review](…) of <sha>: this review covers the commits since."), unless the body
+  links it already: added when the agent's review — or a fan-out's merge — is drafted, so that a
+  person reads, edits and approves it with the rest. It is left out when it would take the body
+  past what GitHub takes (65536 characters).
+- **Off.** `PUT /api/v1/repos/{owner}/{name}` with `"incremental": false` reviews every head in
+  full; it is on by default — repositories registered before it included — and kept by a write
+  that leaves it out.
+
 ## Tests
 
 ```sh
@@ -727,7 +771,11 @@ version and by pull request, left out; the two agent tokens kept apart; the plat
 own posts kept out of the samples; the job header required — fan-out: planned from the fixed type or the document, queued as sub-runs
 under their own external ids and cancelled with their job, each bound to its job and itself on the
 agent API, merged by the rules above, one failing and all failing, run again, `maxFanout` and the
-day's cap, and calibration scored on the merged draft — and that `docs/openapi.json`
+day's cap, and calibration scored on the merged draft — incremental re-review: the context of the
+posted review and the commits since, the diff since bound to the job, comments only on it, the
+follow-up line in the draft, posting refused unchecked, the decision made once, a force-push and
+a refused compare reviewed in full, GitHub not answering waited on once, and the setting — and
+that `docs/openapi.json`
 documents exactly the routes the server answers. Nothing in it reaches the network.
 
 `docs/openapi.json` is embedded in the binary with `include_str`, and Lake rebuilds a module when

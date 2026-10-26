@@ -2,8 +2,8 @@
   "openapi": "3.1.0",
   "info": {
     "title": "diff-reviewer platform API",
-    "version": "0.7.0",
-    "description": "The review platform: the repositories whose pull requests it reviews, and one review job per review. A job moves `pending → queued → running → draft → approved → posted`; `rejected` is a discarded draft, `stale` a draft whose pull request has moved on, and `failed` a run that ended without a review.\n\nThree credentials, none standing in for another. The password (`$DIFF_REVIEWER_PASSWORD`) is accepted only by `POST /api/login`, which sets the session cookie; failed password logins are rate-limited (an immediate `429` with `Retry-After`), and the API token signs in there too, unlimited. Every route under `/api/v1/` needs the session cookie or the API token (`$DIFF_REVIEWER_API_TOKEN_FILE`) as `Authorization: Bearer <token>`. Every route under `/api/agent/v1/` needs the agent token (`$DIFF_REVIEWER_AGENT_TOKEN_FILE`) as a bearer, and nothing else reaches it; an agent's requests go through kleis, which supplies it.\n\nEvery write must be `application/json` (`415` otherwise). Every write to a job under `/api/v1/` names the job's `version` as last read, and is a `409` if the job has changed since. A request the server fails on is a `500` whose reason goes to the server log; a method a route does not answer is a `405`. Collections answer `{\"items\": [...]}`. Instants are RFC 3339 in UTC; an absent value is `null`.\n\nEach repository has a rubric document — a default rubric and the pull request types its reviews tell apart, each with a rubric and the categories its comments are filed under — written whole and versioned (`/api/v1/repos/{owner}/{name}/rubrics`). Every write of a job's review, by the agent, a person or (once posted) GitHub, is kept as a revision (`/api/v1/jobs/{id}/revisions`).\n\nCalibration (`/api/v1/repos/{owner}/{name}/calibration/…`) compares the agent's reviews with the reviews the repository's `trustedReviewers` wrote on its closed pull requests: an import stores each such review as a sample, a run makes one `calibration` job per sample at the sample's commit, and each job's draft is scored against its sample. A `calibration` job is queued and run like any other, but is never approved, claimed or posted.\n\nLearned review style: the agent's `examples` are inline comments the repository's trusted reviewers wrote, picked from its calibration samples — never of the pull request under review — and its instructions end with the repository's `styleNotes`. A rubric proposal (`/api/v1/repos/{owner}/{name}/proposals`) is a `proposal` job of the repository, of no pull request: an agent reads the rubric, the style notes, calibration's results and people's edits of the agent's drafts (`/api/agent/v1/repos/{owner}/{name}/proposals/{jobId}`), and proposes a rubric document, which a person accepts as the next rubric version or rejects. A `proposal` job is never approved, claimed or posted.\n\nFan-out: a pull request type, or the rubric document for every review, may set `fanout`: a review under it is run as sub-runs side by side, one per category and one by the default rubric, each an orchestra task of its own that submits a partial review through the agent API naming itself `X-Diff-Reviewer-Job: <job>.<key>`; the platform merges them into the job's draft. The type must be known before anything is queued, so it is the repository's fixed `prType`. A job is `running` until merged, and shows its sub-runs (`subRuns`)."
+    "version": "0.8.0",
+    "description": "The review platform: the repositories whose pull requests it reviews, and one review job per review. A job moves `pending → queued → running → draft → approved → posted`; `rejected` is a discarded draft, `stale` a draft whose pull request has moved on, and `failed` a run that ended without a review.\n\nThree credentials, none standing in for another. The password (`$DIFF_REVIEWER_PASSWORD`) is accepted only by `POST /api/login`, which sets the session cookie; failed password logins are rate-limited (an immediate `429` with `Retry-After`), and the API token signs in there too, unlimited. Every route under `/api/v1/` needs the session cookie or the API token (`$DIFF_REVIEWER_API_TOKEN_FILE`) as `Authorization: Bearer <token>`. Every route under `/api/agent/v1/` needs the agent token (`$DIFF_REVIEWER_AGENT_TOKEN_FILE`) as a bearer, and nothing else reaches it; an agent's requests go through kleis, which supplies it.\n\nEvery write must be `application/json` (`415` otherwise). Every write to a job under `/api/v1/` names the job's `version` as last read, and is a `409` if the job has changed since. A request the server fails on is a `500` whose reason goes to the server log; a method a route does not answer is a `405`. Collections answer `{\"items\": [...]}`. Instants are RFC 3339 in UTC; an absent value is `null`.\n\nEach repository has a rubric document — a default rubric and the pull request types its reviews tell apart, each with a rubric and the categories its comments are filed under — written whole and versioned (`/api/v1/repos/{owner}/{name}/rubrics`). Every write of a job's review, by the agent, a person or (once posted) GitHub, is kept as a revision (`/api/v1/jobs/{id}/revisions`).\n\nCalibration (`/api/v1/repos/{owner}/{name}/calibration/…`) compares the agent's reviews with the reviews the repository's `trustedReviewers` wrote on its closed pull requests: an import stores each such review as a sample, a run makes one `calibration` job per sample at the sample's commit, and each job's draft is scored against its sample. A `calibration` job is queued and run like any other, but is never approved, claimed or posted.\n\nLearned review style: the agent's `examples` are inline comments the repository's trusted reviewers wrote, picked from its calibration samples — never of the pull request under review — and its instructions end with the repository's `styleNotes`. A rubric proposal (`/api/v1/repos/{owner}/{name}/proposals`) is a `proposal` job of the repository, of no pull request: an agent reads the rubric, the style notes, calibration's results and people's edits of the agent's drafts (`/api/agent/v1/repos/{owner}/{name}/proposals/{jobId}`), and proposes a rubric document, which a person accepts as the next rubric version or rejects. A `proposal` job is never approved, claimed or posted.\n\nFan-out: a pull request type, or the rubric document for every review, may set `fanout`: a review under it is run as sub-runs side by side, one per category and one by the default rubric, each an orchestra task of its own that submits a partial review through the agent API naming itself `X-Diff-Reviewer-Job: <job>.<key>`; the platform merges them into the job's draft. The type must be known before anything is queued, so it is the repository's fixed `prType`. A job is `running` until merged, and shows its sub-runs (`subRuns`).\n\nIncremental re-review: a review job of a pull request whose review was posted, at a new head descending from the posted one, reviews the changes since. The job records what it follows (`previousJob`, `incrementalSince`, `incrementalCommits`); its agent is given the posted review and reads the diff since (`…/diff?since=<sha>`), every comment must be on that diff, and the draft ends with a line linking the earlier review, which a person reads and approves with it. A force-push falls back to a full review, with why in `fullReviewReason`. Per repository, `incremental` (on by default)."
   },
   "security": [
     {
@@ -239,6 +239,10 @@
                     "minimum": 1,
                     "maximum": 51,
                     "description": "The most sub-runs one fan-out review may make; kept when left out."
+                  },
+                  "incremental": {
+                    "type": "boolean",
+                    "description": "Incremental re-review on or off; kept when left out."
                   },
                   "version": {
                     "type": "integer",
@@ -617,7 +621,7 @@
       ],
       "post": {
         "summary": "Post an approved review to GitHub",
-        "description": "Posts the job's review to its pull request — submitted, pinned to `headSha` with every comment on the right-hand side, its body ending in the marker `<!-- diff-reviewer job <id> -->` — and then marks the job `posted`, recording GitHub's id, URL and body of the review in `postedReview`. The event is the review's decision, except on a pull request the operator (`DIFF_REVIEWER_GITHUB_LOGIN`) wrote, where an approval or a request for changes is posted as a comment and `postNote` says so. The job must be `approved` and at the `version` named, its review valid and its comments on the diff (`409` otherwise). Posting is claimed (`postStartedAt`) immediately before the request to GitHub; a claim less than three times that request's timeout old is a `409`, as a post that may still be under way. An older claim is settled first: the pull request's reviews by the operator are searched for the marker, and a review found is recorded rather than posted again. A `4xx` from GitHub clears the claim and leaves the job `approved` with the reason in `error` (a `502` that carries the job). No answer, a `5xx` or GitHub's rate limit keeps the claim — a rate-limited post is not made again until the claim is settled, after the limit has had time to reset — even when the review is not found yet, so the next attempt looks again before posting. `503` when the platform has no GitHub token. A `calibration` job is never posted: `409`.",
+        "description": "Posts the job's review to its pull request — submitted, pinned to `headSha` with every comment on the right-hand side, its body ending in the marker `<!-- diff-reviewer job <id> -->` — and then marks the job `posted`, recording GitHub's id, URL and body of the review in `postedReview`. The event is the review's decision, except on a pull request the operator (`DIFF_REVIEWER_GITHUB_LOGIN`) wrote, where an approval or a request for changes is posted as a comment and `postNote` says so. The job must be `approved` and at the `version` named, its review valid and its comments on the diff (`409` otherwise). Posting is claimed (`postStartedAt`) immediately before the request to GitHub; a claim less than three times that request's timeout old is a `409`, as a post that may still be under way. An older claim is settled first: the pull request's reviews by the operator are searched for the marker, and a review found is recorded rather than posted again. A `4xx` from GitHub clears the claim and leaves the job `approved` with the reason in `error` (a `502` that carries the job). No answer, a `5xx` or GitHub's rate limit keeps the claim — a rate-limited post is not made again until the claim is settled, after the limit has had time to reset — even when the review is not found yet, so the next attempt looks again before posting. `503` when the platform has no GitHub token. A `calibration` job is never posted: `409`. An incremental re-review's comments are checked against the diff since its earlier review too; when that diff cannot be read, the post is refused (`409`) rather than made unchecked.",
         "operationId": "postJob",
         "requestBody": {
           "required": true,
@@ -857,11 +861,20 @@
             "type": "string"
           },
           "description": "The job the agent's prompt named (`--job`): a review or calibration job of the pull request, queued or running. Required: a request that names none is a `400`, and one naming a job of another kind (a rubric proposal) or not being run a `404`. Naming a job of a commit another active job of the same pull request was made for later (to the second) is a `409`: only the newest job of a commit is run. A fan-out job's sub-run is named `<job>.<key>`, its `n`th run `<job>.<key>.<n>`; it must be of the job's current attempt, a run the platform made, and not submitted, failed or cancelled (`404`); naming a fan-out job alone is a `409`."
+        },
+        {
+          "name": "since",
+          "in": "query",
+          "required": false,
+          "schema": {
+            "type": "string"
+          },
+          "description": "For an incremental re-review: the head its earlier review was of (`incremental.sinceSha`), for the diff of the changes since. Any other commit, or `since` on a full review, is a `400` saying which."
         }
       ],
       "get": {
         "summary": "The diff under review",
-        "description": "The running job's diff, as `GET /api/v1/jobs/{id}/diff` gives it, as plain text.",
+        "description": "The running job's diff, as `GET /api/v1/jobs/{id}/diff` gives it, as plain text; with `since`, an incremental re-review's diff of the changes since its earlier review.",
         "operationId": "agentDiff",
         "security": [
           {
@@ -942,7 +955,7 @@
       ],
       "post": {
         "summary": "Submit the review",
-        "description": "The job must be `running` and `headSha` must be its head (`409` otherwise). The review must be one GitHub would take (`400`, saying what to fix): at most 200 inline comments, a summary unless it approves, and every comment's lines in one hunk of the diff's new side. `prType` must be one of the rubric's pull request types, or null when it names none, and each comment's `category` one of that type's categories (see `InlineComment`) (`400`). Comments without an `id` are given one. The job becomes a `draft`, recording `prType` and the rubric's version (0 for none), and the review is the first of its revisions. For a repository in `direct` mode the platform then posts it — always as a comment, whatever its decision, which the job keeps; if posting fails the job is left `approved` with the reason in `error`, and the submission still stands; when the post's outcome was unknown and it is found not to have reached GitHub, the workers post it again, if the pull request is still open at the job's head, up to 3 posts in all. When the repository fixes its type (`prType`), `prType` must name it. A sub-run of a fan-out review submits a partial review instead: checked the same way against the rubric version its job fanned out under, with `prType` the job's, and — for a category's sub-run — every comment of its category (`400`). It is kept on the sub-run; once every sub-run has submitted or failed, the platform merges them into the job's draft (the agent's one revision), which then goes on as above.",
+        "description": "The job must be `running` and `headSha` must be its head (`409` otherwise). The review must be one GitHub would take (`400`, saying what to fix): at most 200 inline comments, a summary unless it approves, and every comment's lines in one hunk of the diff's new side. `prType` must be one of the rubric's pull request types, or null when it names none, and each comment's `category` one of that type's categories (see `InlineComment`) (`400`). Comments without an `id` are given one. The job becomes a `draft`, recording `prType` and the rubric's version (0 for none), and the review is the first of its revisions. For a repository in `direct` mode the platform then posts it — always as a comment, whatever its decision, which the job keeps; if posting fails the job is left `approved` with the reason in `error`, and the submission still stands; when the post's outcome was unknown and it is found not to have reached GitHub, the workers post it again, if the pull request is still open at the job's head, up to 3 posts in all. When the repository fixes its type (`prType`), `prType` must name it. A sub-run of a fan-out review submits a partial review instead: checked the same way against the rubric version its job fanned out under, with `prType` the job's, and — for a category's sub-run — every comment of its category (`400`). It is kept on the sub-run; once every sub-run has submitted or failed, the platform merges them into the job's draft (the agent's one revision), which then goes on as above. An incremental re-review's comments must also lie in a hunk of the diff since its earlier review (`400`, saying so). An incremental re-review's draft ends with a line linking the earlier review (unless its body links it already), added when it is drafted — or when its sub-runs are merged.",
         "operationId": "agentSubmit",
         "security": [
           {
@@ -2764,6 +2777,7 @@
           "styleNotesVersion",
           "prType",
           "maxFanout",
+          "incremental",
           "version",
           "createdAt"
         ],
@@ -2821,6 +2835,10 @@
             "maximum": 51,
             "description": "The most sub-runs one fan-out review may make, the default's among them; 8 by default. A review that would make more fails, saying so."
           },
+          "incremental": {
+            "type": "boolean",
+            "description": "Whether a new head of a pull request whose review was posted is reviewed incrementally — the changes since the posted review, with that review in the agent's context. On by default."
+          },
           "version": {
             "type": "integer",
             "minimum": 1,
@@ -2877,7 +2895,11 @@
           "kind",
           "sampleId",
           "runId",
-          "notesVersion"
+          "notesVersion",
+          "previousJob",
+          "incrementalSince",
+          "incrementalCommits",
+          "fullReviewReason"
         ],
         "properties": {
           "id": {
@@ -3075,6 +3097,49 @@
               "$ref": "#/components/schemas/SubRun"
             },
             "description": "The sub-runs of a fan-out review, of its latest attempt, in merge order (the default first); empty for a job that is not fanned out. In `GET /api/v1/jobs` and `GET /api/v1/jobs/{id}`. A fan-out job is `queued` until a sub-run starts, `running` until every sub-run has submitted or failed, and then a `draft` holding the merged review — or `failed`, when every sub-run failed. Only the round of the job's current attempt: a job fanned out before and run again as one run shows none."
+          },
+          "previousJob": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "An incremental re-review: the job whose posted review it follows up. Null for a full review. Decided once for the job's head when it is first queued."
+          },
+          "incrementalSince": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "An incremental re-review: the head the earlier review was of, from which the diff it reviews starts."
+          },
+          "incrementalCommits": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "object",
+              "required": [
+                "sha",
+                "message"
+              ],
+              "properties": {
+                "sha": {
+                  "type": "string"
+                },
+                "message": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "An incremental re-review: the newest 100 of the commits since the earlier review, oldest first, each message cut at 1000 characters."
+          },
+          "fullReviewReason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why a review that would have been incremental is a full one: the head the last posted review was of is not an ancestor of this one (a force-push), GitHub refused to compare them, or the diff since is too large."
           }
         }
       },
@@ -3281,6 +3346,58 @@
                   "type": "string"
                 },
                 "description": "The categories the other sub-runs review."
+              }
+            }
+          },
+          "incremental": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "An incremental re-review's context; null for a full review. Its `instructions` end with what to do with it: review the changes since, every comment on their diff, not repeating the earlier review's points, and say which of them are resolved.",
+            "required": [
+              "previousJobId",
+              "sinceSha",
+              "postedReview",
+              "postedComments",
+              "commits",
+              "diffCommand"
+            ],
+            "properties": {
+              "previousJobId": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "sinceSha": {
+                "type": "string",
+                "description": "The head the earlier review was of."
+              },
+              "postedReview": {
+                "type": [
+                  "object",
+                  "null"
+                ],
+                "description": "The earlier review as GitHub holds it: `{id, url, body}`, the body without the platform's hidden marker."
+              },
+              "postedComments": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/InlineComment"
+                },
+                "description": "The inline comments it was posted with."
+              },
+              "commits": {
+                "type": "array",
+                "items": {
+                  "type": "object"
+                },
+                "description": "The commits since, `{sha, message}`."
+              },
+              "diffCommand": {
+                "type": "string",
+                "description": "The command that prints the diff since: `diff-reviewer agent diff … --since <sinceSha> --job <id>`."
               }
             }
           }
