@@ -124,10 +124,13 @@ def ReviewComment.ofJson (j : Json) : Except String ReviewComment := do
 structure Comparison where
   status  : String
   commits : Array (String × String) := #[]
+  /-- How many commits there are in all (`total_commits`): a page holds 100 at most. -/
+  totalCommits : Nat := commits.size
   deriving Repr, BEq
 
 def Comparison.ofJson (j : Json) : Except String Comparison := do
   let status ← j.getObjValAs? String "status"
+  let total := (j.getObjValAs? Nat "total_commits").toOption
   let commits := match j.getObjVal? "commits" >>= (·.getArr?) with
     | .ok xs => xs.filterMap fun c =>
       match c.getObjValAs? String "sha" with
@@ -136,7 +139,31 @@ def Comparison.ofJson (j : Json) : Except String Comparison := do
         some (sha.toLower, msg.getD "")
       | .error _ => none
     | .error _ => #[]
-  return { status, commits }
+  return { status, commits, totalCommits := total.getD commits.size }
+
+/-- The comparison of two commits with its newest `keep` commits (at most 100), from `fetch`,
+    which answers page `n` of the comparison as GitHub does: 100 commits a page, oldest first, and
+    `total_commits` in all. The first page says how many there are; the newest are on the last
+    page and, when that one is short, the page before it. -/
+def compareNewest (fetch : Nat → IO (Except Error Comparison)) (keep : Nat := 100) :
+    IO (Except Error Comparison) := do
+  let first ← match ← fetch 1 with
+    | .ok c => pure c
+    | .error e => return .error e
+  let total := first.totalCommits
+  if total ≤ 100 then
+    return .ok { first with commits := first.commits.extract (first.commits.size - keep) }
+  let last := (total + 99) / 100
+  let lastPage ← match ← fetch last with
+    | .ok c => pure c.commits
+    | .error e => return .error e
+  let before ← if lastPage.size ≥ keep then pure #[]
+    else if last == 2 then pure first.commits
+    else match ← fetch (last - 1) with
+      | .ok c => pure c.commits
+      | .error e => return .error e
+  let all := before ++ lastPage
+  return .ok { first with commits := all.extract (all.size - keep) }
 
 /-- Seconds before a request to GitHub is given up. -/
 def requestTimeout : Nat := 60
@@ -233,8 +260,8 @@ structure Client where
       `head`. -/
   mergeBase : (owner name base head : String) → IO (Except Error String) :=
     fun _ _ _ _ => return .error (.definite "comparing commits is not supported")
-  /-- How `head` stands to `base`, and the commits between: whether a pull request's new head
-      descends from the head reviewed last. -/
+  /-- How `head` stands to `base`, and the newest 100 commits between (`compareNewest`): whether
+      a pull request's new head descends from the head reviewed last. -/
   compare : (owner name base head : String) → IO (Except Error Comparison) :=
     fun _ _ _ _ => return .error (.definite "comparing commits is not supported")
   /-- What GitHub last said of the rate limit, if it has said anything. -/
@@ -341,9 +368,11 @@ def Client.curl (token : String) (api : String) (maxDiffBytes : Nat := defaultMa
       return (← call "GET" s!"/repos/{owner}/{name}/compare/{base}...{head}?per_page=1").bind
         (parse fun j => do
           return (← (← j.getObjVal? "merge_base_commit").getObjValAs? String "sha").toLower)
-    compare := fun owner name base head => do
-      return (← call "GET" s!"/repos/{owner}/{name}/compare/{base}...{head}?per_page=100").bind
-        (parse Comparison.ofJson)
+    compare := fun owner name base head =>
+      compareNewest fun page => do
+        return (← call "GET"
+            s!"/repos/{owner}/{name}/compare/{base}...{head}?per_page=100&page={page}").bind
+          (parse Comparison.ofJson)
     rateLimit := lastRateLimit.get }
 
 /-- The client configured by the environment: the token in `DIFF_REVIEWER_GITHUB_TOKEN_FILE`, or

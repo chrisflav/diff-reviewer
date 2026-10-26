@@ -41,6 +41,13 @@ initialize rangeFails : IO.Ref Bool ← IO.mkRef false
 def commitsSince : Array (String × String) :=
   ((Array.range 149).map fun i => (s!"c{i}", s!"Commit {i}")).push (headB, "Fix the names")
 
+/-- Page `page` of a comparison of `commits`, as GitHub answers `?per_page=100&page=…`: 100 a page,
+    oldest first, and how many there are in all. -/
+def pageOf (status : String) (commits : Array (String × String)) (page : Nat) :
+    IO (Except GitHub.Error GitHub.Comparison) :=
+  return .ok { status, commits := commits.extract ((page - 1) * 100) (page * 100)
+             , totalCommits := commits.size }
+
 /-- `gh`'s client, comparing as `cmp` says and answering the diff from `headA` as `rangeDiff`. -/
 def client (gh : FakeGitHub) (cmp : IO.Ref Compare) : GitHub.Client :=
   { gh.client with
@@ -53,7 +60,7 @@ def client (gh : FakeGitHub) (cmp : IO.Ref Compare) : GitHub.Client :=
     compare := fun _ _ _ _ => do
       compareCalls.modify (· + 1)
       match ← cmp.get with
-      | .ahead => return .ok { status := "ahead", commits := commitsSince }
+      | .ahead => GitHub.compareNewest (pageOf "ahead" commitsSince)
       | .diverged => return .ok { status := "diverged", commits := #[] }
       | .refused => return .error (.definite "GitHub answered 404: No common ancestor")
       | .unreachable => return .error (.indefinite "GitHub answered 502") }
@@ -249,6 +256,35 @@ def incrementalIsASetting : Test := withTempDb do
     ++ checkEq first.statusRaw "queued" "a first review"
     ++ checkEq first.incrementalSince none "is a full one"
 
+/-- The newest commits are read from the last pages, as GitHub pages a comparison. -/
+def compareReadsTheNewestPages : Test := do
+  let commits (n : Nat) : Array (String × String) := (Array.range n).map fun i => (s!"c{i}", "")
+  let pages ← IO.mkRef #[]
+  let read (n : Nat) : IO (Option (Nat × Option String × Option String)) := do
+    pages.set #[]
+    let fetch (p : Nat) := do
+      pages.modify (·.push p)
+      pageOf "ahead" (commits n) p
+    match ← GitHub.compareNewest fetch with
+    | .ok c => return some (c.commits.size, c.commits[0]?.map (·.1), c.commits.back?.map (·.1))
+    | .error _ => return none
+  let few ← read 40
+  let fewPages ← pages.get
+  let two ← read 150
+  let twoPages ← pages.get
+  let many ← read 250
+  let manyPages ← pages.get
+  let round ← read 300
+  let roundPages ← pages.get
+  return checkEq few (some (40, some "c0", some "c39")) "one page"
+    ++ checkEq fewPages #[1] "read once"
+    ++ checkEq two (some (100, some "c50", some "c149")) "two pages: the newest 100"
+    ++ checkEq twoPages #[1, 2] "from the first and the last"
+    ++ checkEq many (some (100, some "c150", some "c249")) "three pages"
+    ++ checkEq manyPages #[1, 3, 2] "the last, and the one before it"
+    ++ checkEq round (some (100, some "c200", some "c299")) "a full last page"
+    ++ checkEq roundPages #[1, 3] "alone"
+
 /-- The agent CLI's `--since`, and the prompt of a fan-out's sub-run of an incremental re-review. -/
 def theAgentAsksForTheChangesSince : Test := do
   let job : Job := { id := "j1", owner := "acme", name := "widgets", prNumber := 7
@@ -273,6 +309,7 @@ def all : List (String × Test) :=
   [("anIncrementalReReview", anIncrementalReReview),
    ("aForcePushIsReviewedInFull", aForcePushIsReviewedInFull),
    ("incrementalIsASetting", incrementalIsASetting),
-   ("theAgentAsksForTheChangesSince", theAgentAsksForTheChangesSince)]
+   ("theAgentAsksForTheChangesSince", theAgentAsksForTheChangesSince),
+   ("compareReadsTheNewestPages", compareReadsTheNewestPages)]
 
 end DiffReviewerTest.Incremental
