@@ -160,6 +160,7 @@ export function notesAdoptionEdits(repo: Repo, p: RubricProposal): RepoEdits | s
 export function rubricUnchanged(d: RubricProposalDiff): boolean {
   return (
     d.defaultRubric === null &&
+    (d.fanout ?? null) === null &&
     d.typesAdded.length === 0 &&
     d.typesRemoved.length === 0 &&
     d.typesChanged.length === 0
@@ -170,6 +171,8 @@ export function rubricUnchanged(d: RubricProposalDiff): boolean {
 export function diffCounts(d: RubricProposalDiff): string {
   const parts: string[] = [];
   if (d.defaultRubric !== null) parts.push("the default rubric");
+  // Fan-out multiplies what every review costs: never counted as "no changes".
+  if (d.fanout) parts.push(`fan-out turned ${d.fanout.after ? "on" : "off"}`);
   const n = (k: number, one: string, many: string) => `${k} ${k === 1 ? one : many}`;
   if (d.typesAdded.length > 0) parts.push(`${n(d.typesAdded.length, "type", "types")} added`);
   if (d.typesRemoved.length > 0) parts.push(`${n(d.typesRemoved.length, "type", "types")} removed`);

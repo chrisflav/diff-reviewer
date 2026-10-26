@@ -4,7 +4,7 @@ A platform for agentic reviews of GitHub pull requests (taxis #588), grown out o
 tool. Agents draft reviews; you read and edit them against the diff, approve them, and they are
 posted to the pull request under your name.
 
-It is built in milestones. The first four are here:
+It is built in milestones. The first five are here:
 
 - **A review format** (`DiffReviewer/Types.lean`): a decision (comment, approve, request changes),
   a summary, and at most 200 inline comments on file line ranges with optional suggestions. Each
@@ -66,13 +66,16 @@ It is built in milestones. The first four are here:
 - **Rubric proposals** (`/api/v1/repos/{owner}/{name}/proposals`): an agent reads the calibration
   data and the people's edits of the agent's drafts and proposes a rubric, which a person accepts
   as the next rubric version or rejects. See [Rubric proposals](#rubric-proposals).
+- **Fan-out**: a pull request type — or the rubric, for every review — may ask for its reviews to
+  be run as one sub-run per category plus one by the default rubric, side by side, and merged into
+  one draft. See [Fan-out](#fan-out).
 - **A web front-end** (`web/`): sign in, register repositories, request a review, read a review,
   edit it, approve or reject it. Every write names the version of the job it was made on, so a
   stale page is refused rather than overwriting.
 - **The command-line tools** it started as: `diff-reviewer github` posts a review JSON to a pull
   request, and `diff-reviewer from-git` turns a commit range into one.
 
-Next: the front-end for style and proposals.
+Next: incremental re-review, and the front-end for style, proposals and fan-out.
 
 ## Running it
 
@@ -93,7 +96,8 @@ It listens on `127.0.0.1:8090` (`--host`, `--port`) and runs the workers every 6
 `--secure-cookie`, and name the reverse proxy with `--trusted-proxy <ip>`: failed logins are
 counted per client address — an IPv6 client per /64 — which is the socket's peer unless the
 request comes from that proxy, when it is the last address of `X-Forwarded-For`. `--max-jobs-per-day` (default 50) bounds the
-jobs discovery makes per repository, `--max-calibration-jobs-per-day` (default 20) the calibration
+jobs discovery makes per repository — each sub-run of a [fan-out](#fan-out) counting as one, and
+checked when a review fans out — `--max-calibration-jobs-per-day` (default 20) the calibration
 jobs runs make (and their retries) per repository, apart from it, `--github-reserve` (default 500)
 the GitHub requests calibration imports leave for discovery and posting, `--max-proposals-per-day`
 (default 2) the rubric proposals a person may ask for per repository, and `--max-diff-bytes`
@@ -166,7 +170,8 @@ with `diff_reviewer_token` in orchestra's `secrets.json` and the same value in t
 on the platform: orchestra refuses (`400`) a repository it does not list, and the job stays
 `pending` with that reason in its `error`. Each request names the prompt, a goal, the upstream,
 the pull request (`issue_number`) and the job id as `external_id` — `<id>.2`, `<id>.3`, … for a
-retry, since orchestra answers an `external_id` it has seen with the entry it already made. When a
+retry, since orchestra answers an `external_id` it has seen with the entry it already made; a
+[fan-out](#fan-out)'s sub-runs are `<id>.<key>` (`<id>.<key>.2` run again). When a
 pull request moves on, the platform cancels the runs of its older heads
 (`POST /api/v1/queue/{id}/cancel`). The
 agent needs `curl` and the `diff-reviewer` binary from a release on its `PATH`: see the next
@@ -631,6 +636,68 @@ person reads it beside the rubric and accepts or rejects it.
    (the snapshot is taken then, not on submission).
    `POST …/proposals/{id}/reject` with `{}` records the decision and writes nothing else.
 
+## Fan-out
+
+A rubric with many categories asks one run to keep all of them in mind, and those it reaches last
+get the least of it. A pull request type that sets `"fanout": true` — or the document, beside its
+`defaultRubric`, for every review — is reviewed by **sub-runs** instead: one per category, each told
+to look at its category only and to file every comment under it, and one by the default rubric for
+what no category covers. Each is an orchestra task of its own.
+
+```json
+{"version": 3, "defaultRubric": "…", "prTypes": [
+  {"name": "feature", "fanout": true, "categories": [{"name": "correctness"}, {"name": "naming"}]}]}
+```
+
+- **The type is fixed per repository.** The agent picks a pull request's type while it reviews it,
+  which is too late: the sub-runs, one per category of the type, are queued before any agent has
+  read the change. Of the ways out — a cheap classifying run first, then the fan-out; fanning out
+  by the default rubric's categories, which it has none of; the operator fixing the type — the last
+  is the simplest that is correct: nothing runs twice, nothing waits, and the type is known when
+  the job is queued. `PUT /api/v1/repos/{owner}/{name}` takes `"prType": "feature"` (a type of the
+  current rubric; `""` for none). The agent is then shown that type and must submit it, fanned out
+  or not. Without a fixed type, a type's `fanout` does nothing — the agent picks and reviews in one
+  run — while the document's fans every review out over every category of the document, as a
+  review of no type may use. A fixed type the rubric has since dropped is not fixed.
+- **Sub-runs.** Queueing makes them in one transaction with the check of the day's cap, and the
+  job becomes `queued` with no queue entry of its own; `running` once a sub-run starts. Each is
+  queued under `<job>.<key>`, its key made of its category's name (`default` for the default
+  review), and its prompt names it so: `--job <job>.<key>`, sent as `X-Diff-Reviewer-Job`. The
+  agent API binds every request to the job and the sub-run: the job alone is refused (`409`), and
+  a sub-run must be queued or running. `agent show` gives it the rubric version the job fanned out
+  under, its scope (`subRun`, and at the end of its `instructions`) and the type (`prType`). Its
+  submission is a partial review, checked as a review is, with every comment of its category for a
+  category's sub-run, and kept on the sub-run. A run that ends without a submission is run once
+  more (`<job>.<key>.2`, which its agent is named by too), charged against the day's cap like the
+  first — past it, the sub-run fails instead; then the sub-run has failed. A run given up on may
+  still submit, and the run that replaced it is then cancelled. The sub-runs are those of the job's
+  current attempt (`fanoutRound`): a job run again — fanned out anew, or as one run when the rubric
+  no longer fans out — leaves the old round as history, shown nowhere and naming nothing. The job's answers show its sub-runs
+  (`subRuns`): key, category, status, attempts, error, how many comments.
+- **The merge.** When every sub-run has submitted or failed, their reviews are merged into the
+  job's draft — the agent's one revision, which a calibration job is scored on — and it goes on as
+  any draft: edited, approved, posted (at once, as a comment, in a `direct` repository). The
+  comments are the union, the default's first and then each category's in the rubric's order. Two
+  are one when they are on the same file, their lines overlap, and their bodies are near-identical
+  — of all the words of the two (lower case, letters and digits), at least four fifths are in both
+  — and the more severe is kept, in the first's place. Ids stay unique: a later comment repeating
+  an id is given a fresh one. The summary is the default's, then each category's after its name;
+  a sub-run that failed is named as not reviewed. The decision is the strictest — a request for
+  changes, then a comment, then an approval — and never an approval when a sub-run failed. Past
+  200 comments, the least severe are dropped first (no severity counting as the least), the last
+  first, and the summary says how many of which. When every sub-run failed, the job fails.
+- **Spend.** Every sub-run counts against the day's cap — `--max-jobs-per-day` for a review, in
+  place of the one its job counted for; `--max-calibration-jobs-per-day` for a calibration job,
+  whose run is charged for every sub-run it will make (`429` past it). Past the cap a fan-out
+  waits, `pending`, saying why. A repository's `maxFanout` (8 by default, 1 to 51) bounds the
+  sub-runs of one review, the default's among them: a review that would make more fails, saying
+  so — raise it, or fix a type with fewer categories. Running a failed job again fans it out anew.
+- **Rubric proposals** show a change of `fanout`, of the document or of a type, in their diff: a
+  proposal that turns fan-out on multiplies what reviews cost, and one that turns it off drops
+  what a person set.
+- **Calibration** jobs fan out as review jobs do — each sub-run narrowed and told it is not
+  posted — and are scored on the merged draft.
+
 ## Tests
 
 ```sh
@@ -657,7 +724,10 @@ applied only when asked and only over the notes the agent read, rejecting, cance
 fields refused, `fromProposal` keeping provenance — the held-out split by pull request, fixed
 once made, held-out pull requests teaching nothing, and derived scores, by rubric and notes
 version and by pull request, left out; the two agent tokens kept apart; the platform's
-own posts kept out of the samples; the job header required — and that `docs/openapi.json`
+own posts kept out of the samples; the job header required — fan-out: planned from the fixed type or the document, queued as sub-runs
+under their own external ids and cancelled with their job, each bound to its job and itself on the
+agent API, merged by the rules above, one failing and all failing, run again, `maxFanout` and the
+day's cap, and calibration scored on the merged draft — and that `docs/openapi.json`
 documents exactly the routes the server answers. Nothing in it reaches the network.
 
 `docs/openapi.json` is embedded in the binary with `include_str`, and Lake rebuilds a module when

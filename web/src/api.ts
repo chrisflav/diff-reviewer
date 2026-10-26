@@ -67,6 +67,13 @@ export interface Repo {
    * before API 0.6.0.
    */
   styleNotesVersion?: number;
+  /**
+   * The pull request type every review of the repository is of, fixed by the operator (null: the
+   * agent picks). A type with `fanout` fans out only when fixed. Absent before API 0.7.0.
+   */
+  prType?: string | null;
+  /** The most sub-runs one fan-out review may make (1 to 51, 8 by default). API 0.7.0. */
+  maxFanout?: number;
   /** Incremented by every write of the settings; sent back to have a stale write refused (409). */
   version: number;
   createdAt: string;
@@ -89,6 +96,10 @@ export interface RepoSettings {
   evalShare?: number;
   /** The rubric proposal the style notes written were taken from: records its provenance. */
   fromProposal?: string;
+  /** A type of the current rubric to fix, or "" for none; kept when left out. */
+  prType?: string;
+  /** 1 to 51; kept when left out. */
+  maxFanout?: number;
   version?: number;
   [field: string]: unknown;
 }
@@ -136,6 +147,11 @@ export interface PrType {
   /** How to review a pull request of this type, in markdown, on top of the default rubric. */
   rubric: string;
   categories: Category[];
+  /**
+   * Whether its reviews run as one sub-run per category plus the default, merged into one draft;
+   * only when the repository fixes this type. Absent is false (API 0.7.0).
+   */
+  fanout?: boolean;
   [field: string]: unknown;
 }
 
@@ -157,6 +173,8 @@ export interface RubricDocument {
   derivedFrom?: string[];
   /** The pull requests (`owner/name#pr`) it was derived from. Absent before API 0.6.0. */
   derivedFromPulls?: string[];
+  /** Whether every review fans out, over the fixed type's categories (API 0.7.0). */
+  fanout?: boolean;
   [field: string]: unknown;
 }
 
@@ -224,6 +242,26 @@ export interface Job {
   runId?: string | null;
   /** The style notes version the agent was given when it read the job (API 0.6.0). */
   notesVersion?: number | null;
+  /**
+   * The sub-runs of a fan-out review, default first; empty when not fanned out. Only in the
+   * answers of `GET /api/v1/jobs` and `GET /api/v1/jobs/{id}` (API 0.7.0).
+   */
+  subRuns?: SubRun[];
+}
+
+/** One sub-run of a fan-out review (API 0.7.0). */
+export interface SubRun {
+  /** `default`, or made of the category's name; the agent names it `<job>.<key>`. */
+  key: string;
+  /** The category it reviews; null for the default review. */
+  category: string | null;
+  status: "pending" | "queued" | "running" | "submitted" | "failed" | "cancelled" | string;
+  queueEntry: string | null;
+  attempts: number;
+  error: string | null;
+  /** How many comments its partial review has, once submitted. */
+  comments: number | null;
+  updatedAt: string;
 }
 
 /** `proposal`: a rubric proposal of the repository (`prNumber` 0), never posted (API 0.6.0). */
@@ -452,9 +490,14 @@ export type RubricProposalStatus = "pending" | "accepted" | "rejected";
 /** `{before, after}` of a text a proposal changes; null when unchanged. */
 export type TextChange = { before: string; after: string } | null;
 
+/** A flag before and after, or null when it is the same. */
+export type FlagChange = { before: boolean; after: boolean } | null;
+
 /** What a proposal changes of the rubric version it was written from. */
 export interface RubricProposalDiff {
   defaultRubric: TextChange;
+  /** The document's `fanout`, when the proposal changes it (API 0.7.0). */
+  fanout?: FlagChange;
   typesAdded: PrType[];
   /** Their names. */
   typesRemoved: string[];
@@ -462,6 +505,8 @@ export interface RubricProposalDiff {
     name: string;
     description: TextChange;
     rubric: TextChange;
+    /** The type's `fanout`, when the proposal changes it (API 0.7.0). */
+    fanout?: FlagChange;
     categoriesAdded: Category[];
     categoriesRemoved: string[];
     /** Categories whose description changed. */

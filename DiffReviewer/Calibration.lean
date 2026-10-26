@@ -802,15 +802,53 @@ private def charge (owner name jobId now : String) : Sqlite.M Unit := do
   HasModel.save ({ id := ← randomHex 8, owner, name, job_id := jobId, charged_at := now }
     : Store.ChargeRow)
 
+private def capMessage (slug : String) (made more cap : Nat) : String :=
+  s!"{slug} has run {made} calibration job(s) in the last 24 hours; {more} more would pass the \
+most allowed, {cap} (--max-calibration-jobs-per-day)"
+
 private def capError (slug : String) (made more cap : Nat) : RunError :=
-  .capped s!"{slug} has run {made} calibration job(s) in the last 24 hours; {more} more would pass \
-the most allowed, {cap} (--max-calibration-jobs-per-day)"
+  .capped (capMessage slug made more cap)
+
+/-- How many charges a calibration job of `repo` will cost: the sub-runs it fans out to under
+    the current rubric (`Rubric.fanoutPlan`), or one. -/
+private def fanoutWeightIn (repo : Repo) : Sqlite.M Nat := do
+  let some v ← Platform.fetchCurrentRubric repo.owner repo.name | return 1
+  let .ok doc := v.rubric? | return 1
+  match doc.fanoutPlan repo.prType with
+  | some plan => if plan.size ≤ repo.maxFanout then return plan.size else return 1
+  | none => return 1
+
+/-- The charges a calibration job fanned out to `size` sub-runs costs beyond the one it was
+    charged when it was made or run again, inside the transaction that fans it out: why not when
+    they would pass `cap`. -/
+def chargeFanoutIn (job : Job) (size cap : Nat) : Sqlite.M (Except String Unit) := do
+  let now ← nowIso
+  let since := isoOfEpoch ((← nowEpoch) - 86400)
+  let made ← chargesSince job.owner job.name since
+  let more := size - 1
+  if made + more > cap then
+    let why := capMessage s!"{job.owner}/{job.name}" made more cap
+    return .error s!"{why}; its {size} sub-runs wait"
+  for _ in [0:more] do charge job.owner job.name job.id now
+  return .ok ()
+
+/-- The charge for running a sub-run of calibration job `job` again, inside a transaction: why
+    not when it would pass `cap`. -/
+def chargeRetryIn (job : Job) (cap : Nat) : Sqlite.M (Except String Unit) := do
+  let now ← nowIso
+  let made ← chargesSince job.owner job.name (isoOfEpoch ((← nowEpoch) - 86400))
+  if made + 1 > cap then
+    let why := capMessage s!"{job.owner}/{job.name}" made 1 cap
+    return .error s!"{why}; the sub-run is not run again"
+  charge job.owner job.name job.id now
+  return .ok ()
 
 /-- A run of `repo` over `sampleIds`: one `pending` calibration job for each, at the sample's
     commit and with its base. In one transaction with the checks that every sample is the
     repository's, not deleted and not being reviewed by a live calibration job already — one
     sample is one job at a time — and that the jobs fit in what is left of `cap`, the charges on
-    the repository's cap in the last 24 hours; each job is a charge. Every sample must be of
+    the repository's cap in the last 24 hours; each job is a charge, and one that will fan out
+    is counted for each of its sub-runs. Every sample must be of
     `split`: `eval`, what calibration measures by, unless the run is asked of the `pool`, whose
     scores give rubric proposals evidence and are never in an aggregate. -/
 def createRun (repo : Repo) (sampleIds : List String) (cap : Nat) (split := "eval") :
@@ -836,7 +874,11 @@ which calibration does not measure by" else ""}")
         return .error (.conflict s!"sample {sid} is being reviewed already, by job {j.id}")
       picked := picked.push s
     let made ← chargesSince repo.owner repo.name since
-    if made + picked.size > cap then return .error (capError repo.slug made picked.size cap)
+    -- A job that will fan out is charged for each of its sub-runs: one now, the rest when it is
+    -- fanned out (`chargeFanoutIn`); a run that cannot pay for all of them is refused now.
+    let weight ← fanoutWeightIn repo
+    if made + picked.size * weight > cap then
+      return .error (capError repo.slug made (picked.size * weight) cap)
     let jobs : Array Job := Array.zipWith (fun (s : Sample) id =>
       ({ id := id, owner := repo.owner, name := repo.name, prNumber := s.prNumber
        , headSha := some s.commitId, baseSha := some s.baseSha, title := some s.title
@@ -876,7 +918,7 @@ here")
     if made + 1 > cap then return .error (capError s!"{job.owner}/{job.name}" made 1 cap)
     let next := { job with statusRaw := JobStatus.pending.toString, queueEntry := none
                            error := none, postDirect := false, version := job.version + 1
-                           updatedAt := now }
+                           updatedAt := now, fanoutRound := none }
     HasModel.save next.toRow
     charge job.owner job.name id now
     return .ok next

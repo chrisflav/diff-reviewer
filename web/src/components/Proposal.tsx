@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import type { Category, PrType, RubricProposalDiff, TextChange } from "../api";
+import type { Category, FlagChange, PrType, RubricProposalDiff, TextChange } from "../api";
 import { parseRationale, rubricUnchanged, type Block, type Inline } from "../proposals";
 import { TextDiff } from "./History";
 
@@ -89,6 +89,24 @@ function Change({ label, change, code }: { label: string; change: TextChange; co
   );
 }
 
+/**
+ * A flag before and after — fan-out, which multiplies what a review costs — or nothing when it did
+ * not change.
+ */
+function FlagChangeView({ label, change }: { label: string; change: FlagChange | undefined }) {
+  if (change === null || change === undefined) return null;
+  const word = (b: boolean) => (b ? "on" : "off");
+  return (
+    <div className="change">
+      <h5>{label}</h5>
+      <p className="body">
+        <span className="diff-removed">{word(change.before)}</span> →{" "}
+        <span className="diff-added">{word(change.after)}</span>
+      </p>
+    </div>
+  );
+}
+
 function Categories({ cs }: { cs: Category[] }) {
   if (cs.length === 0) return <p className="mute small-text">No categories: free text.</p>;
   return (
@@ -121,8 +139,8 @@ function ShownType({ t, added }: { t: PrType; added: boolean }) {
 
 /**
  * What a proposal changes of the rubric it was written from, as the server worked it out: the
- * default rubric's text, the types added and removed, and each type changed — its description,
- * its rubric and its categories. All of it text.
+ * default rubric's text and fan-out, the types added and removed, and each type changed — its
+ * description, its rubric, its fan-out and its categories. All of it text.
  */
 export function ProposalDiffView({ diff }: { diff: RubricProposalDiff }) {
   if (rubricUnchanged(diff))
@@ -134,6 +152,7 @@ export function ProposalDiffView({ diff }: { diff: RubricProposalDiff }) {
       ) : (
         <Change label="Default rubric" change={diff.defaultRubric} />
       )}
+      <FlagChangeView label="Fan-out of every review" change={diff.fanout} />
       {diff.typesAdded.length > 0 && (
         <section aria-labelledby="types-added-h">
           <h4 id="types-added-h">Types added ({diff.typesAdded.length})</h4>
@@ -163,6 +182,7 @@ export function ProposalDiffView({ diff }: { diff: RubricProposalDiff }) {
               <h5 className="data">{t.name}</h5>
               <Change label={`Description of ${t.name}`} change={t.description} />
               <Change label={`Rubric of ${t.name}`} change={t.rubric} />
+              <FlagChangeView label={`Fan-out of ${t.name}`} change={t.fanout} />
               {t.categoriesAdded.length > 0 && (
                 <div className="change">
                   <h5>Categories added</h5>

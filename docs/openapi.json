@@ -2,8 +2,8 @@
   "openapi": "3.1.0",
   "info": {
     "title": "diff-reviewer platform API",
-    "version": "0.6.0",
-    "description": "The review platform: the repositories whose pull requests it reviews, and one review job per review. A job moves `pending → queued → running → draft → approved → posted`; `rejected` is a discarded draft, `stale` a draft whose pull request has moved on, and `failed` a run that ended without a review.\n\nThree credentials, none standing in for another. The password (`$DIFF_REVIEWER_PASSWORD`) is accepted only by `POST /api/login`, which sets the session cookie; failed password logins are rate-limited (an immediate `429` with `Retry-After`), and the API token signs in there too, unlimited. Every route under `/api/v1/` needs the session cookie or the API token (`$DIFF_REVIEWER_API_TOKEN_FILE`) as `Authorization: Bearer <token>`. Every route under `/api/agent/v1/` needs the agent token (`$DIFF_REVIEWER_AGENT_TOKEN_FILE`) as a bearer, and nothing else reaches it; an agent's requests go through kleis, which supplies it.\n\nEvery write must be `application/json` (`415` otherwise). Every write to a job under `/api/v1/` names the job's `version` as last read, and is a `409` if the job has changed since. A request the server fails on is a `500` whose reason goes to the server log; a method a route does not answer is a `405`. Collections answer `{\"items\": [...]}`. Instants are RFC 3339 in UTC; an absent value is `null`.\n\nEach repository has a rubric document — a default rubric and the pull request types its reviews tell apart, each with a rubric and the categories its comments are filed under — written whole and versioned (`/api/v1/repos/{owner}/{name}/rubrics`). Every write of a job's review, by the agent, a person or (once posted) GitHub, is kept as a revision (`/api/v1/jobs/{id}/revisions`).\n\nCalibration (`/api/v1/repos/{owner}/{name}/calibration/…`) compares the agent's reviews with the reviews the repository's `trustedReviewers` wrote on its closed pull requests: an import stores each such review as a sample, a run makes one `calibration` job per sample at the sample's commit, and each job's draft is scored against its sample. A `calibration` job is queued and run like any other, but is never approved, claimed or posted.\n\nLearned review style: the agent's `examples` are inline comments the repository's trusted reviewers wrote, picked from its calibration samples — never of the pull request under review — and its instructions end with the repository's `styleNotes`. A rubric proposal (`/api/v1/repos/{owner}/{name}/proposals`) is a `proposal` job of the repository, of no pull request: an agent reads the rubric, the style notes, calibration's results and people's edits of the agent's drafts (`/api/agent/v1/repos/{owner}/{name}/proposals/{jobId}`), and proposes a rubric document, which a person accepts as the next rubric version or rejects. A `proposal` job is never approved, claimed or posted."
+    "version": "0.7.0",
+    "description": "The review platform: the repositories whose pull requests it reviews, and one review job per review. A job moves `pending → queued → running → draft → approved → posted`; `rejected` is a discarded draft, `stale` a draft whose pull request has moved on, and `failed` a run that ended without a review.\n\nThree credentials, none standing in for another. The password (`$DIFF_REVIEWER_PASSWORD`) is accepted only by `POST /api/login`, which sets the session cookie; failed password logins are rate-limited (an immediate `429` with `Retry-After`), and the API token signs in there too, unlimited. Every route under `/api/v1/` needs the session cookie or the API token (`$DIFF_REVIEWER_API_TOKEN_FILE`) as `Authorization: Bearer <token>`. Every route under `/api/agent/v1/` needs the agent token (`$DIFF_REVIEWER_AGENT_TOKEN_FILE`) as a bearer, and nothing else reaches it; an agent's requests go through kleis, which supplies it.\n\nEvery write must be `application/json` (`415` otherwise). Every write to a job under `/api/v1/` names the job's `version` as last read, and is a `409` if the job has changed since. A request the server fails on is a `500` whose reason goes to the server log; a method a route does not answer is a `405`. Collections answer `{\"items\": [...]}`. Instants are RFC 3339 in UTC; an absent value is `null`.\n\nEach repository has a rubric document — a default rubric and the pull request types its reviews tell apart, each with a rubric and the categories its comments are filed under — written whole and versioned (`/api/v1/repos/{owner}/{name}/rubrics`). Every write of a job's review, by the agent, a person or (once posted) GitHub, is kept as a revision (`/api/v1/jobs/{id}/revisions`).\n\nCalibration (`/api/v1/repos/{owner}/{name}/calibration/…`) compares the agent's reviews with the reviews the repository's `trustedReviewers` wrote on its closed pull requests: an import stores each such review as a sample, a run makes one `calibration` job per sample at the sample's commit, and each job's draft is scored against its sample. A `calibration` job is queued and run like any other, but is never approved, claimed or posted.\n\nLearned review style: the agent's `examples` are inline comments the repository's trusted reviewers wrote, picked from its calibration samples — never of the pull request under review — and its instructions end with the repository's `styleNotes`. A rubric proposal (`/api/v1/repos/{owner}/{name}/proposals`) is a `proposal` job of the repository, of no pull request: an agent reads the rubric, the style notes, calibration's results and people's edits of the agent's drafts (`/api/agent/v1/repos/{owner}/{name}/proposals/{jobId}`), and proposes a rubric document, which a person accepts as the next rubric version or rejects. A `proposal` job is never approved, claimed or posted.\n\nFan-out: a pull request type, or the rubric document for every review, may set `fanout`: a review under it is run as sub-runs side by side, one per category and one by the default rubric, each an orchestra task of its own that submits a partial review through the agent API naming itself `X-Diff-Reviewer-Job: <job>.<key>`; the platform merges them into the job's draft. The type must be known before anything is queued, so it is the repository's fixed `prType`. A job is `running` until merged, and shows its sub-runs (`subRuns`)."
   },
   "security": [
     {
@@ -229,6 +229,16 @@
                     "minimum": 0,
                     "maximum": 100,
                     "description": "Percent of new samples held out; kept when left out. Changes only the samples split after it."
+                  },
+                  "prType": {
+                    "type": "string",
+                    "description": "Fix the pull request type of the repository's reviews: a type of its current rubric (`400` otherwise), or `\"\"` for none — the agent picks. Left out (or null), it is kept."
+                  },
+                  "maxFanout": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 51,
+                    "description": "The most sub-runs one fan-out review may make; kept when left out."
                   },
                   "version": {
                     "type": "integer",
@@ -774,7 +784,7 @@
           "schema": {
             "type": "string"
           },
-          "description": "The job the agent's prompt named (`--job`): a review or calibration job of the pull request, queued or running. Required: a request that names none is a `400`, and one naming a job of another kind (a rubric proposal) or not being run a `404`. Naming a job of a commit another active job of the same pull request was made for later (to the second) is a `409`: only the newest job of a commit is run."
+          "description": "The job the agent's prompt named (`--job`): a review or calibration job of the pull request, queued or running. Required: a request that names none is a `400`, and one naming a job of another kind (a rubric proposal) or not being run a `404`. Naming a job of a commit another active job of the same pull request was made for later (to the second) is a `409`: only the newest job of a commit is run. A fan-out job's sub-run is named `<job>.<key>`, its `n`th run `<job>.<key>.<n>`; it must be of the job's current attempt, a run the platform made, and not submitted, failed or cancelled (`404`); naming a fan-out job alone is a `409`."
         }
       ],
       "get": {
@@ -846,7 +856,7 @@
           "schema": {
             "type": "string"
           },
-          "description": "The job the agent's prompt named (`--job`): a review or calibration job of the pull request, queued or running. Required: a request that names none is a `400`, and one naming a job of another kind (a rubric proposal) or not being run a `404`. Naming a job of a commit another active job of the same pull request was made for later (to the second) is a `409`: only the newest job of a commit is run."
+          "description": "The job the agent's prompt named (`--job`): a review or calibration job of the pull request, queued or running. Required: a request that names none is a `400`, and one naming a job of another kind (a rubric proposal) or not being run a `404`. Naming a job of a commit another active job of the same pull request was made for later (to the second) is a `409`: only the newest job of a commit is run. A fan-out job's sub-run is named `<job>.<key>`, its `n`th run `<job>.<key>.<n>`; it must be of the job's current attempt, a run the platform made, and not submitted, failed or cancelled (`404`); naming a fan-out job alone is a `409`."
         }
       ],
       "get": {
@@ -927,12 +937,12 @@
           "schema": {
             "type": "string"
           },
-          "description": "The job the agent's prompt named (`--job`): a review or calibration job of the pull request, queued or running. Required: a request that names none is a `400`, and one naming a job of another kind (a rubric proposal) or not being run a `404`. Naming a job of a commit another active job of the same pull request was made for later (to the second) is a `409`: only the newest job of a commit is run."
+          "description": "The job the agent's prompt named (`--job`): a review or calibration job of the pull request, queued or running. Required: a request that names none is a `400`, and one naming a job of another kind (a rubric proposal) or not being run a `404`. Naming a job of a commit another active job of the same pull request was made for later (to the second) is a `409`: only the newest job of a commit is run. A fan-out job's sub-run is named `<job>.<key>`, its `n`th run `<job>.<key>.<n>`; it must be of the job's current attempt, a run the platform made, and not submitted, failed or cancelled (`404`); naming a fan-out job alone is a `409`."
         }
       ],
       "post": {
         "summary": "Submit the review",
-        "description": "The job must be `running` and `headSha` must be its head (`409` otherwise). The review must be one GitHub would take (`400`, saying what to fix): at most 200 inline comments, a summary unless it approves, and every comment's lines in one hunk of the diff's new side. `prType` must be one of the rubric's pull request types, or null when it names none, and each comment's `category` one of that type's categories (see `InlineComment`) (`400`). Comments without an `id` are given one. The job becomes a `draft`, recording `prType` and the rubric's version (0 for none), and the review is the first of its revisions. For a repository in `direct` mode the platform then posts it — always as a comment, whatever its decision, which the job keeps; if posting fails the job is left `approved` with the reason in `error`, and the submission still stands; when the post's outcome was unknown and it is found not to have reached GitHub, the workers post it again, if the pull request is still open at the job's head, up to 3 posts in all.",
+        "description": "The job must be `running` and `headSha` must be its head (`409` otherwise). The review must be one GitHub would take (`400`, saying what to fix): at most 200 inline comments, a summary unless it approves, and every comment's lines in one hunk of the diff's new side. `prType` must be one of the rubric's pull request types, or null when it names none, and each comment's `category` one of that type's categories (see `InlineComment`) (`400`). Comments without an `id` are given one. The job becomes a `draft`, recording `prType` and the rubric's version (0 for none), and the review is the first of its revisions. For a repository in `direct` mode the platform then posts it — always as a comment, whatever its decision, which the job keeps; if posting fails the job is left `approved` with the reason in `error`, and the submission still stands; when the post's outcome was unknown and it is found not to have reached GitHub, the workers post it again, if the pull request is still open at the job's head, up to 3 posts in all. When the repository fixes its type (`prType`), `prType` must name it. A sub-run of a fan-out review submits a partial review instead: checked the same way against the rubric version its job fanned out under, with `prType` the job's, and — for a category's sub-run — every comment of its category (`400`). It is kept on the sub-run; once every sub-run has submitted or failed, the platform merges them into the job's draft (the agent's one revision), which then goes on as above.",
         "operationId": "agentSubmit",
         "security": [
           {
@@ -986,13 +996,21 @@
                     },
                     "status": {
                       "type": "string",
-                      "description": "`draft`, or `posted` (or `approved`, if posting failed) in `direct` mode."
+                      "description": "`draft`, or `posted` (or `approved`, if posting failed) in `direct` mode. After a sub-run's submission, `running` while other sub-runs are still to submit."
                     },
                     "error": {
                       "type": [
                         "string",
                         "null"
                       ]
+                    },
+                    "subRun": {
+                      "type": "string",
+                      "description": "A sub-run's submission: its key."
+                    },
+                    "subRunStatus": {
+                      "type": "string",
+                      "description": "A sub-run's submission: `submitted`."
                     }
                   }
                 }
@@ -2744,6 +2762,8 @@
           "styleNotes",
           "evalShare",
           "styleNotesVersion",
+          "prType",
+          "maxFanout",
           "version",
           "createdAt"
         ],
@@ -2787,6 +2807,19 @@
             "type": "integer",
             "minimum": 0,
             "description": "The version of the style notes, 0 before any. Each version records what it was derived from, kept by name across a delete and a registration again; a job records the version its agent was given (`notesVersion`)."
+          },
+          "prType": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The pull request type every review of the repository is of, fixed by the operator: the agent does not pick one, and must submit this one. A type with `fanout` fans out, which needs the type before the job is queued. Null lets the agent pick. A type the rubric has since dropped is not fixed."
+          },
+          "maxFanout": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 51,
+            "description": "The most sub-runs one fan-out review may make, the default's among them; 8 by default. A review that would make more fails, saying so."
           },
           "version": {
             "type": "integer",
@@ -3035,6 +3068,13 @@
             ],
             "minimum": 0,
             "description": "The version of the style notes the agent was given when it read the job, as `rubricVersion` records the rubric: a score is `derived` when either was derived from its sample's pull request."
+          },
+          "subRuns": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SubRun"
+            },
+            "description": "The sub-runs of a fan-out review, of its latest attempt, in merge order (the default first); empty for a job that is not fanned out. In `GET /api/v1/jobs` and `GET /api/v1/jobs/{id}`. A fan-out job is `queued` until a sub-run starts, `running` until every sub-run has submitted or failed, and then a `draft` holding the merged review — or `failed`, when every sub-run failed. Only the round of the job's current attempt: a job fanned out before and run again as one run shows none."
           }
         }
       },
@@ -3196,6 +3236,53 @@
             "type": "integer",
             "minimum": 0,
             "description": "The version of the rubric document these come from; 0 when the repository has none."
+          },
+          "prType": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The type the review is of, when the platform fixed it — the repository's `prType`, or a sub-run's job's — which the submission must name."
+          },
+          "subRun": {
+            "type": "object",
+            "description": "For a sub-run of a fan-out review: what it covers, which its `instructions` end with.",
+            "required": [
+              "key",
+              "id",
+              "category",
+              "description",
+              "others"
+            ],
+            "properties": {
+              "key": {
+                "type": "string"
+              },
+              "id": {
+                "type": "string",
+                "description": "`<job>.<key>`, what it is named by."
+              },
+              "category": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "The one category it reviews and files every comment under; null for the default review, of what no category covers."
+              },
+              "description": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "others": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "The categories the other sub-runs review."
+              }
+            }
           }
         }
       },
@@ -3247,6 +3334,10 @@
               "$ref": "#/components/schemas/Category"
             },
             "description": "What a comment of a review of this type is filed under. Names are unique within the type."
+          },
+          "fanout": {
+            "type": "boolean",
+            "description": "Whether a review of this type is run as sub-runs, one per category and one by the default rubric, merged into one draft. Written only when true; absent is false. Only a type the repository fixes (`prType`) fans out: the agent picks a type while it reviews, too late to fan out by."
           }
         },
         "description": "Fields this build does not know are kept as they are and written back, a `PUT` of the document included."
@@ -3325,6 +3416,10 @@
               "type": "string"
             },
             "description": "The pull requests (`owner/name#pr`) it was derived from: those its proposal's context drew on — misses, unmatched comments, people's edits — and every earlier version's. A score of any sample of them, under this version, is `derived`. Ignored when sent back."
+          },
+          "fanout": {
+            "type": "boolean",
+            "description": "Whether every review of the repository fans out: one sub-run per category of the repository's fixed type (`prType`) — of every type, when it fixes none — and one by the default rubric. Absent is false."
           }
         }
       },
@@ -4446,6 +4541,21 @@
                     }
                   },
                   "description": "Categories whose description changed."
+                },
+                "fanout": {
+                  "type": [
+                    "object",
+                    "null"
+                  ],
+                  "properties": {
+                    "before": {
+                      "type": "boolean"
+                    },
+                    "after": {
+                      "type": "boolean"
+                    }
+                  },
+                  "description": "The type's `fanout` `{before, after}`, or null when unchanged. A change of it alone makes the type changed."
                 }
               }
             }
@@ -4464,6 +4574,21 @@
                 "type": "string"
               }
             }
+          },
+          "fanout": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "properties": {
+              "before": {
+                "type": "boolean"
+              },
+              "after": {
+                "type": "boolean"
+              }
+            },
+            "description": "The document's `fanout` `{before, after}`, or null when unchanged: turning fan-out on multiplies the runs a review is charged for, so it is always shown."
           }
         }
       },
@@ -4774,6 +4899,73 @@
                 }
               }
             }
+          }
+        }
+      },
+      "SubRun": {
+        "type": "object",
+        "required": [
+          "key",
+          "category",
+          "status",
+          "queueEntry",
+          "attempts",
+          "error",
+          "comments",
+          "updatedAt"
+        ],
+        "description": "One sub-run of a fan-out review.",
+        "properties": {
+          "key": {
+            "type": "string",
+            "description": "Unique within the job, made of the category's name (`default` for the default review). The agent of its first run names it `<job>.<key>`, of its `n`th run `<job>.<key>.<n>`; its orchestra `external_id` is `<job>.<key>` (`<job>.<key>.<n>` for its `n`th run; `<job>.<m>.<key>` when the job is in its `m`th attempt)."
+          },
+          "category": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The category it reviews; null for the default review."
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "queued",
+              "running",
+              "submitted",
+              "failed",
+              "cancelled"
+            ],
+            "description": "A run that ends without a submission is run once more, charged against the day's cap (past it, the sub-run fails); then the sub-run has `failed`, and the review is merged without it. A run given up on may still submit, and the run that replaced it is then cancelled."
+          },
+          "queueEntry": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "attempts": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "How many times it has been run; each run counts against the day's cap."
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "comments": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "How many comments its partial review has, once submitted."
+          },
+          "updatedAt": {
+            "type": "string",
+            "format": "date-time"
           }
         }
       }

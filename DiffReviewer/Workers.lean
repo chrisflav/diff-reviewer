@@ -4,6 +4,7 @@ import DiffReviewer.Orchestra
 import DiffReviewer.Diff
 import DiffReviewer.Calibration
 import DiffReviewer.Proposal
+import DiffReviewer.Fanout
 
 open Lean (Json)
 
@@ -35,6 +36,13 @@ What `serve` does without being asked, on a loop every `--interval` seconds (`st
     is posted again — as a comment, as every direct post is — if its pull request is still open
     at the job's head (otherwise the job is `stale`), up to `maxDirectPostAttempts` posts by the
     platform; then it is left `approved`, with why, for a person.
+
+A job whose rubric asks for fan-out (`DiffReviewer.Fanout`) is not queued itself: queueing makes
+its sub-runs — one per category and one for the default — in one transaction with the check of
+the day's cap, and queues each as a task of its own (`queueSubRuns`), with a prompt that narrows
+it to its category; following follows each, runs one that ended without a submission once more,
+and merges the partial reviews into the job's draft once every sub-run has submitted or failed
+(`settleFanout`). Retiring the job cancels its sub-runs' runs.
 
 And it drops the kept diffs no live job needs. On request: fetching a diff (`diffOf`, cached per
 commit) and posting an approved review (`postJob`), which a person asks for, or the agent's
@@ -155,15 +163,31 @@ def Services.logOnce (s : Services) (key msg : String) : IO Unit := do
 
 /-! ## What the agent is told -/
 
+/-- What one sub-run of a fan-out review is to look at (`DiffReviewer.Fanout`). -/
+structure Scope where
+  sub      : Fanout.SubRun
+  /-- The category it reviews, with what belongs in it; `none` for the default review. -/
+  category : Option Category
+  /-- The categories the other sub-runs review. -/
+  others   : List String
+  /-- What its agent names it by: `<job>.<key>`, and `<job>.<key>.<n>` for its `n`th run. -/
+  ref      : String
+
+/-- The id the agent names its job by: the job's, or the sub-run's (`Scope.ref`). -/
+def agentRef (job : Job) (scope : Option Scope) : String :=
+  match scope with
+  | some sc => sc.ref
+  | none => job.id
+
 /-- The step of `prompt` that has the agent check out the commit under review. A calibration
     job's commit is of a pull request that has since been closed. The task's checkout is the
     repository's default branch, mounted read-only — which may well hold the change as it was
     merged, after the review — so the agent reviews from the platform's diff, reads files at the
     commit with `git show` where the clone has it, and is told to read no other ref; what was said
     of the pull request on GitHub its token's narrowing (`calibrationNarrowing`) keeps from it. -/
-private def checkoutStep (job : Job) : String :=
+private def checkoutStep (job : Job) (ref : String) : String :=
   let slug := s!"{job.owner}/{job.name}"
-  let diff := s!"`diff-reviewer agent diff {slug} {job.prNumber} --job {job.id}` prints the diff \
+  let diff := s!"`diff-reviewer agent diff {slug} {job.prNumber} --job {ref}` prints the diff \
 under review."
   if job.kind? == some .calibration then
     s!"2. Review the change as it stands at the head commit it names, as if the pull request were \
@@ -209,28 +233,63 @@ The proposal is advisory: a person reads it beside the current rubric and accept
 Do not change the repository, and do not comment on, review or otherwise write to anything on \
 GitHub."
 
-/-- The prompt of the orchestra task that reviews `job`. It names no head commit: the agent asks the
-    platform which one (`agent show`), so a prompt never disagrees with the job. A calibration job's
-    differs only in how the commit is read (`checkoutStep`) and in who posts the review
-    (`postingLine`), and says nothing of the review it is scored against. -/
-def prompt (job : Job) : String :=
+/-- The step of `prompt` that says what to review by: the type the agent picks, or for a sub-run
+    of a fan-out review, its one category — or, for the default sub-run, what no category
+    covers. -/
+private def reviewStep (scope : Option Scope) : String :=
+  let style := "Write your comments in the style of the `examples` it printed — comments the \
+repository's trusted reviewers wrote on other pull requests — but do not copy them."
+  let severity := "a `severity` (`nit`, `minor`, `major` or `blocker`)"
+  match scope with
+  | none =>
+    s!"3. Pick the pull request type, of the `prTypes` it printed, whose description fits the \
+change, and review the change by that type's `rubric` together with the `instructions` (with no \
+`prTypes`, by the `instructions` alone). Give every inline comment {severity} and a `category`: \
+one of that type's `categories`, or, when it lists none, a word or two of your own. {style}"
+  | some sc =>
+    let n := sc.others.length + 1
+    let side := if n == 1 then "This review is run on its own, as a fan-out review of no \
+categories." else s!"This review is one of {n} run side by side, which the platform merges into \
+one."
+    let typeLine := "the `rubric` of the type `agent show` names as `prType` (none, when it names \
+none)"
+    match sc.category with
+    | some c =>
+      let what := if c.description.trimAscii.isEmpty then "" else s!" — {c.description}"
+      s!"3. {side} Yours covers only the category `{c.name}`{what}. Review the change by the \
+`instructions` and {typeLine} only as they bear on `{c.name}`, and leave everything else to the \
+other reviews. Give every inline comment the `category` `{c.name}` and {severity}. {style}"
+    | none =>
+      let others := if sc.others.isEmpty then "" else
+        s!" The others each cover one category: {", ".intercalate (sc.others.map (s!"`{·}`"))}; \
+leave those to them."
+      s!"3. {side} Yours is the general review, by the `instructions` and {typeLine}: what \
+matters in the change that no category covers.{others} Give every inline comment {severity} and \
+a `category`: one of the type's `categories`, or, when it lists none, a word or two of your own. \
+{style}"
+
+/-- The prompt of the orchestra task that reviews `job` — or, with `scope`, one sub-run of its
+    fan-out. It names no head commit: the agent asks the platform which one (`agent show`), so a
+    prompt never disagrees with the job. A calibration job's differs only in how the commit is
+    read (`checkoutStep`) and in who posts the review (`postingLine`), and says nothing of the
+    review it is scored against. A sub-run's names it by `<job>.<key>`, and narrows the review to
+    its category (`reviewStep`). -/
+def prompt (job : Job) (scope : Option Scope := none) : String :=
   if job.kind? == some .proposal then proposalPrompt job else
   let slug := s!"{job.owner}/{job.name}"
-  s!"Review pull request #{job.prNumber} of {slug} for the diff-reviewer platform (job {job.id}).
+  let ref := agentRef job scope
+  let prTypeLine := if scope.isSome then "`prType` the type `agent show` names (null when it \
+names none)" else "`prType` the name of the type you picked (or null when there are no `prTypes`)"
+  s!"Review pull request #{job.prNumber} of {slug} for the diff-reviewer platform (job {ref}).
 
-1. Run `diff-reviewer agent show {slug} {job.prNumber} --job {job.id}`. It prints the pull \
+1. Run `diff-reviewer agent show {slug} {job.prNumber} --job {ref}`. It prints the pull \
 request — its head and base commits, title and description — and the instructions for the \
 review; follow them.
-{checkoutStep job}
-3. Pick the pull request type, of the `prTypes` it printed, whose description fits the change, \
-and review the change by that type's `rubric` together with the `instructions` (with no `prTypes`, \
-by the `instructions` alone). Give every inline comment a `severity` (`nit`, `minor`, `major` or \
-`blocker`) and a `category`: one of that type's `categories`, or, when it lists none, a word or \
-two of your own. Write your comments in the style of the `examples` it printed — comments the \
-repository's trusted reviewers wrote on other pull requests — but do not copy them.
+{checkoutStep job ref}
+{reviewStep scope}
 4. Write the review as a JSON file `\{\"headSha\": …, \"prType\": …, \"review\": …}`, with \
-`prType` the name of the type you picked (or null when there are no `prTypes`), and submit it with \
-`diff-reviewer agent submit {slug} {job.prNumber} <file> --job {job.id}`. Fix what it reports and \
+{prTypeLine}, and submit it with \
+`diff-reviewer agent submit {slug} {job.prNumber} <file> --job {ref}`. Fix what it reports and \
 submit again until it is accepted.
 
 A review may carry at most {maxInlineComments} inline comments; merge or drop the least \
@@ -323,6 +382,45 @@ def instructionsFor (doc : Option Rubric) (styleNotes : String := "") : String :
     | none => instructions
   if styleNotes.trimAscii.isEmpty then withRubric
   else withRubric ++ "\n\n# How reviews of this repository are written\n\n" ++ styleNotes
+
+/-- What the `instructions` of a sub-run of a fan-out review end with: its scope, as its prompt
+    says it. -/
+def scopeInstructions (scope : Scope) : String :=
+  let others := if scope.others.isEmpty then "" else
+    s!" The other reviews each cover one category: {", ".intercalate scope.others}."
+  match scope.category with
+  | some c =>
+    let what := if c.description.trimAscii.isEmpty then "" else s!" ({c.description})"
+    s!"\n\n# This review's scope\n\nThis review is one of several of the change, run side by \
+side and merged by the platform. It covers only the category `{c.name}`{what}: review the change \
+for that alone, and give every inline comment the `category` `{c.name}`; leave everything else to \
+the other reviews.{others} Submit with `prType` as `prType` names it here."
+  | none =>
+    s!"\n\n# This review's scope\n\nThis review is one of several of the change, run side by \
+side and merged by the platform. It is the general review: what matters that no category of the \
+others covers.{others} Submit with `prType` as `prType` names it here."
+
+/-- The category named `name` of `doc`, for a review of type `prType`: the type's, or any of the
+    document's for a review of none. -/
+def categoryOf (doc : Rubric) (prType : Option String) (name : String) : Option Category :=
+  match prType.bind doc.findType? with
+  | some t => t.categories.find? (·.name == name)
+  | none => (doc.prTypes.flatMap (·.categories)).find? (·.name == name)
+
+/-- The scope of each of `subs`, the sub-runs of `job`, under the rubric version the job fanned
+    out by; named for the run about to be queued (`next`), or for the latest. -/
+def scopesOf (job : Job) (subs : Array Fanout.SubRun) (next := true) : IO (Array Scope) := do
+  let doc ← match job.rubricVersion with
+    | some v => pure ((← Platform.rubricAt job.owner job.name v).bind (·.rubric?.toOption))
+    | none => pure none
+  let cats := (subs.filterMap (·.category)).toList
+  return subs.map fun sub =>
+    let category := sub.category.map fun name =>
+      ((doc.bind (categoryOf · job.prType name)).getD { name })
+    { sub, category, others := match sub.category with
+        | some c => cats.filter (· != c)
+        | none => cats
+      ref := if next then sub.agentIdFor (sub.attempts + 1) else sub.agentId }
 
 /-! ## Pull request metadata and diffs -/
 
@@ -609,6 +707,31 @@ def postDirect (s : Services) (id : String) (version : Nat) : IO (Except PostErr
   | .error (.conflict why) | .error (.invalid why) => return .error (.conflict why)
   | .ok j => postJob s id (some j.version) (direct := true)
 
+/-- What follows a job's draft, the agent's or the merge of its sub-runs': a calibration job is
+    scored, and a `direct` repository's review posted. Answers the job as it then is. -/
+def afterDraft (s : Services) (job : Job) : IO Job := do
+  if job.kind? == some .calibration then
+    try
+      let _ ← Calibration.scoreJob job
+    catch e =>
+      -- The workers score it on their next pass.
+      s.log s!"scoring job {job.id}: {e}"
+  let some repo ← Platform.findRepo job.owner job.name | return job
+  if repo.mode != .direct || !job.isReview then return job
+  match ← postDirect s job.id job.version with
+  | .ok j => return j
+  | .error _ => return (← Platform.findJob job.id).getD job
+
+/-- Settle fan-out job `jobId` (`Fanout.settle`): merged into its draft once every sub-run is in,
+    then on as any draft (`afterDraft`), or failed when every sub-run failed. -/
+def settleFanout (s : Services) (jobId : String) : IO Unit := do
+  match ← Fanout.settle jobId with
+  | .drafted j =>
+    s.log s!"merged the sub-runs of job {j.id} into its draft"
+    let _ ← afterDraft s j
+  | .failed j => s.log s!"job {j.id} is failed: {j.error.getD ""}"
+  | .waiting => pure ()
+
 /-! ## The loop -/
 
 /-- Record `why` as job `id`'s error while it is still `status`, unless it is the error already
@@ -623,16 +746,23 @@ private def recordError (id : String) (status : JobStatus) (why : String) : IO U
 
 /-- Move `job` to `to` (`stale` or `failed`) with `why`, if it is still in the status it was read
     in. A queued or running job's orchestra run is cancelled first: nothing more is to be spent on
-    it. -/
+    it; so are its sub-runs' runs, once it has moved. -/
 def retire (s : Services) (job : Job) (to : JobStatus) (why : String) : IO Unit := do
   if job.status? == some .queued || job.status? == some .running then
     if let (some orch, some entry) := (s.orchestraFor job, job.queueEntry) then
       if let .error e ← orch.cancel entry then
         s.log s!"cancelling entry {entry} of job {job.id}: {e}"
-  let _ ← Platform.updateJob job.id fun j => do
+  let retired ← Platform.updateJob job.id fun j => do
     unless j.statusRaw == job.statusRaw do throw (.conflict "moved on")
     if let some why := j.claimBlocks then throw (.conflict why)
     return { j with statusRaw := to.toString, error := some why }
+  -- A fan-out's sub-runs go with it: nothing more is spent on any of them.
+  if retired matches .ok _ then
+    let entries ← Fanout.cancelLive job.id s!"job {job.id} is {to.toString}"
+    if let some orch := s.orchestraFor job then
+      for entry in entries do
+        if let .error e ← orch.cancel entry then
+          s.log s!"cancelling entry {entry} of a sub-run of job {job.id}: {e}"
   s.log s!"job {job.id} is {to.toString}: {why}"
 
 /-- The statuses in which a job of a superseded head is made `stale`. -/
@@ -654,7 +784,8 @@ repositories with autoReview are not searched for pull requests"
     | .error e => s.log s!"discovery on {repo.slug}: {e.message}"
     | .ok pulls =>
       let now ← nowEpoch
-      let mut made ← Platform.jobsSince repo.owner repo.name (isoOfEpoch (now - 86400))
+      -- A fan-out's sub-runs count, each in place of the one job (`Fanout.reviewSpend`).
+      let mut made ← Fanout.reviewSpend repo.owner repo.name (isoOfEpoch (now - 86400))
       for p in pulls do
         if p.draft then continue
         let jobs := (← Platform.jobsOfPull repo.owner repo.name p.number).filter (·.isReview)
@@ -681,6 +812,46 @@ heads wait"
 def externalId (id : String) (attempts : Nat) : String :=
   if attempts == 0 then id else s!"{id}.{attempts + 1}"
 
+/-- The fan-out plan of a review of `repo` under its current rubric, and that rubric's version;
+    `none` when it is one run — or when the rubric cannot be read, which the agent is told when it
+    reads the job. -/
+private def fanoutPlanOf (repo : Repo) : IO (Option (FanoutPlan × Nat)) := do
+  let some v ← Platform.currentRubric repo.owner repo.name | return none
+  let .ok doc := v.rubric? | return none
+  return (doc.fanoutPlan repo.prType).map (·, v.version)
+
+/-- Queue every `pending` sub-run of fan-out job `job` on orchestra, each a task of its own under
+    `<base>.<key>`, with a prompt narrowed to its category. A failure is recorded on the sub-run,
+    once, and it is queued again on the next pass. -/
+def queueSubRuns (s : Services) (job : Job) : IO Unit := do
+  let some orch := s.orchestraFor job | return
+  let subs ← Fanout.current job.id
+  for scope in ← scopesOf job subs do
+    let sub := scope.sub
+    unless sub.status == "pending" do continue
+    let req : Orchestra.QueueRequest :=
+      { prompt := prompt job (some scope), goal := goal job, upstream := s!"{job.owner}/{job.name}"
+      , issueNumber := some job.prNumber, externalId := sub.externalId
+      , kleisNarrow := narrowingFor job, checkout := none }
+    match ← orch.queue req with
+    | .error e => Fanout.recordError sub "pending" s!"queueing on orchestra: {e}"
+    | .ok entry =>
+      let r ← Fanout.update sub.id fun j cur => do
+        unless cur.status == "pending" do throw "moved on"
+        unless j.status? == some .queued || j.status? == some .running do throw "moved on"
+        return { cur with status := "queued", queueEntry := some entry.id
+                          attempts := cur.attempts + 1, error := none }
+      match r with
+      | .ok _ => s.log s!"queued sub-run {scope.ref} as orchestra entry {entry.id}"
+      | .error _ =>
+        -- Retired, or submitted by a run given up on, meanwhile: the run is not wanted — unless
+        -- another process recorded this very entry.
+        let now := (← Fanout.current job.id).find? (·.id == sub.id)
+        unless now.any (·.queueEntry == some entry.id) do
+          if let .error e ← orch.cancel entry.id then
+            s.log s!"cancelling entry {entry.id} of sub-run {scope.ref}: {e}"
+        s.log s!"sub-run {scope.ref} changed while it was queued as entry {entry.id}"
+
 /-- Queueing: every `pending` job of a registered repository whose head is still its pull
     request's, onto orchestra, once its diff has been fetched and found small enough. A calibration
     job is of a past commit of a closed pull request, which it knows with its base from its
@@ -692,7 +863,7 @@ def queuePending (s : Services) : IO Unit := do
   let jobs ← Platform.jobsWithStatus [.pending]
   if jobs.isEmpty then return
   for job in jobs do
-    if (← Platform.findRepo job.owner job.name).isNone then continue
+    let some repo ← Platform.findRepo job.owner job.name | continue
     if job.kind?.isNone then continue
     let proposal := job.kind? == some .proposal
     let some orch := s.orchestraFor job
@@ -737,6 +908,28 @@ and GitHub is not configured to read them"
         | .error e =>
           recordError job.id .pending s!"reading the diff: {e.message}"
           continue
+    -- A rubric that asks for fan-out: the job's sub-runs are queued, not the job.
+    if !proposal then
+      if let some (plan, version) ← fanoutPlanOf repo then
+        if plan.size > repo.maxFanout then
+          retire s job .failed s!"the review would fan out to {plan.size} sub-runs (the \
+default and {plan.categories.length} categories), more than {repo.slug}'s maxFanout, \
+{repo.maxFanout}; raise it, or set a type with fewer categories"
+          continue
+        let since := isoOfEpoch ((← nowEpoch) - 86400)
+        let charge := if job.kind? == some .calibration then
+            Calibration.chargeFanoutIn job plan.size s.limits.maxCalibrationJobsPerDay
+          else Fanout.reviewChargeIn job plan.size s.limits.maxJobsPerDay since
+        let learnt (j : Job) : Job :=
+          { j with headSha := job.headSha, baseSha := job.baseSha, title := job.title
+                   prBody := job.prBody }
+        match ← Fanout.begin job learnt plan version (externalId job.id job.attempts) charge with
+        | .error .moved => s.log s!"job {job.id} changed while it was fanned out"
+        | .error (.capped why) => recordError job.id .pending why
+        | .ok (j, subs) =>
+          s.log s!"fanned job {job.id} out to {subs.size} sub-runs"
+          queueSubRuns s j
+        continue
     let req : Orchestra.QueueRequest :=
       { prompt := prompt job, goal := goal job, upstream := s!"{job.owner}/{job.name}"
       , issueNumber := if proposal then none else some job.prNumber
@@ -753,10 +946,24 @@ and GitHub is not configured to read them"
         unless j.status? == some .pending do throw (.conflict "moved on")
         return { j with headSha := job.headSha, baseSha := job.baseSha, title := job.title
                         prBody := job.prBody, statusRaw := JobStatus.queued.toString
-                        queueEntry := some entry.id, attempts := j.attempts + 1, error := none }
+                        queueEntry := some entry.id, attempts := j.attempts + 1, error := none
+                        fanoutRound := none }
       match r with
       | .ok _ => s.log s!"queued job {job.id} as orchestra entry {entry.id}"
-      | .error _ => s.log s!"job {job.id} changed while it was queued as entry {entry.id}"
+      | .error _ =>
+        -- Retired meanwhile: the run is not wanted — unless another process recorded this entry.
+        let now ← Platform.findJob job.id
+        unless now.any (·.queueEntry == some entry.id) do
+          if let .error e ← orch.cancel entry.id then
+            s.log s!"cancelling entry {entry.id} of job {job.id}: {e}"
+        s.log s!"job {job.id} changed while it was queued as entry {entry.id}"
+
+/-- The sub-runs still to queue of the fan-out jobs under way: one queueing failed, or a run ended
+    without a submission and is run again. -/
+def queueRetries (s : Services) : IO Unit := do
+  for job in ← Platform.jobsWithStatus [.queued, .running] do
+    if job.queueEntry.isSome then continue
+    if (← Fanout.current job.id).any (·.status == "pending") then queueSubRuns s job
 
 /-- The entry that `id` has become, following `continuedBy` (a bounded number of times, so that a
     cycle cannot hold the loop). -/
@@ -797,6 +1004,61 @@ def follow (s : Services) : IO Unit := do
 {if j.kind? == some .proposal then "a proposal" else "a review"}" }
         | some st => return { j with statusRaw := st.toString }
         | none => return j
+
+/-- Mark fan-out job `id` `running`, if it is still `queued`: one of its sub-runs has started. -/
+private def markRunning (id : String) : IO Unit := do
+  let some job ← Platform.findJob id | return
+  unless job.status? == some .queued do return
+  let _ ← Platform.updateJob id fun j => do
+    unless j.status? == some .queued do throw (.conflict "moved on")
+    return { j with statusRaw := JobStatus.running.toString }
+
+/-- The charge for running a sub-run of `job` again, against its day's cap, inside the transaction
+    that makes it `pending`: why not, past it. -/
+private def chargeRetryIn (s : Services) (job : Job) (since : String) :
+    Sqlite.M (Except String Unit) :=
+  if job.kind? == some .calibration then
+    Calibration.chargeRetryIn job s.limits.maxCalibrationJobsPerDay
+  else Fanout.reviewRetryChargeIn job s.limits.maxJobsPerDay since
+
+/-- Following the sub-runs of every fan-out job under way, as `follow` follows a job: `running`
+    when its run starts; when it ends without a submission, `pending` to run again while it has
+    had fewer than `Fanout.maxAttempts` runs, and `failed` after. Then each job is settled: merged
+    once every sub-run is in (`settleFanout`). -/
+def followSubRuns (s : Services) : IO Unit := do
+  for job in ← Platform.jobsWithStatus [.queued, .running] do
+    let subs ← Fanout.current job.id
+    if subs.isEmpty then continue
+    if let some orch := s.orchestraFor job then
+      for sub in subs do
+        unless sub.status == "queued" || sub.status == "running" do continue
+        let some entryId := sub.queueEntry | continue
+        match ← latestEntry orch entryId with
+        | .error e => s.log s!"following sub-run {sub.agentId} (entry {entryId}): {e}"
+        | .ok e =>
+          let ended := Orchestra.terminal e.status
+          let starts := e.status == "running" && sub.status == "queued"
+          if !ended && !starts && e.id == entryId then continue
+          -- Running it again costs a run more, charged like the first — checked and reserved in
+          -- the transaction that makes it pending: past the cap it fails.
+          let since := isoOfEpoch ((← nowEpoch) - 86400)
+          let r ← Fanout.updateM sub.id fun j cur => do
+            unless cur.status == "queued" || cur.status == "running" do return .error "moved on"
+            let cur := { cur with queueEntry := some e.id }
+            if ended then
+              let why := s!"the run ended ({e.status}) without submitting a review"
+              if cur.attempts < Fanout.maxAttempts then
+                match ← chargeRetryIn s j since with
+                | .ok () =>
+                  return .ok { cur with status := "pending"
+                                        error := some s!"{why}; it is run again" }
+                | .error capped =>
+                  return .ok { cur with status := "failed", error := some s!"{why}; {capped}" }
+              return .ok { cur with status := "failed", error := some why }
+            if starts then return .ok { cur with status := "running" }
+            return .ok cur
+          if r matches .ok { status := "running", .. } then markRunning job.id
+    settleFanout s job.id
 
 /-- Settling: every claim to post older than its window, settled as a person's
     `POST /api/v1/jobs/{id}/reconcile` settles it — found on GitHub, the job is `posted`; not
@@ -872,7 +1134,8 @@ def tick (s : Services) : IO Unit := do
     let n ← Calibration.scorePending
     if n > 0 then s.log s!"scored {n} calibration job(s)"
   for (what, step) in [("discovery", discover s), ("queueing", queuePending s),
-                       ("following", follow s), ("settling claims", settleClaims s),
+                       ("queueing sub-runs", queueRetries s), ("following", follow s),
+                       ("following sub-runs", followSubRuns s), ("settling claims", settleClaims s),
                        ("calibration", calibrate), ("pruning diffs", prune)] do
     try step catch e => s.log s!"{what}: {e}"
 

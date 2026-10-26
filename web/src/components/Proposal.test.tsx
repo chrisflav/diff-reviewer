@@ -64,6 +64,37 @@ describe("ProposalDiffView", () => {
     expect(html).toContain("&lt;img src=x onerror=alert(1)&gt;");
   });
 
+  it("shows fan-out turned on or off, for the document and for a type", () => {
+    const flips = renderToStaticMarkup(
+      <ProposalDiffView
+        diff={{
+          defaultRubric: null,
+          fanout: { before: false, after: true },
+          typesAdded: [],
+          typesRemoved: [],
+          typesChanged: [
+            {
+              name: "feature",
+              description: null,
+              rubric: null,
+              fanout: { before: true, after: false },
+              categoriesAdded: [],
+              categoriesRemoved: [],
+              categoriesChanged: [],
+            },
+          ],
+          styleNotes: null,
+        }}
+      />,
+    );
+    expect(flips).not.toContain("changes nothing of the rubric");
+    expect(flips).toContain("Fan-out of every review");
+    expect(flips).toMatch(/diff-removed">off<.*diff-added">on</);
+    expect(flips).toContain("Fan-out of feature");
+    expect(flips).toMatch(/Fan-out of feature<\/h5>.*diff-removed">on<.*diff-added">off</);
+    expect(html).not.toContain("Fan-out");
+  });
+
   it("says when the rubric is unchanged", () => {
     const none = renderToStaticMarkup(
       <ProposalDiffView

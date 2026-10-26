@@ -396,13 +396,19 @@ def reject (repo : Repo) (id : String) : IO (Except DecideError Proposal) := do
 private def change (before after : String) : Json :=
   if before == after then .null else .mkObj [("before", before), ("after", after)]
 
+/-- `{"before", "after"}` of a flag, or `null` when it is the same. -/
+private def flagChange (before after : Bool) : Json :=
+  if before == after then .null else .mkObj [("before", before), ("after", after)]
+
 private def names {α : Type} (f : α → String) (xs : List α) : Json :=
   .arr (xs.map fun x => Json.str (f x)).toArray
 
-/-- What `after` changes of `before`: the default rubric's text; the pull request types added,
-    removed and changed — a type by its name, changed in its description, its rubric or its
-    categories (added, removed, or with another description) — and the style notes, when
-    `notes` has both. -/
+/-- What `after` changes of `before`: the default rubric's text and the document's `fanout`; the
+    pull request types added, removed and changed — a type by its name, changed in its
+    description, its rubric, its `fanout` or its categories (added, removed, or with another
+    description) — and the style notes, when `notes` has both. Fan-out is shown on its own: turning
+    it on multiplies the runs a review is charged for, and turning it off drops what a person set,
+    so neither may pass unseen. -/
 def diffJson (before after : Rubric) (notes : Option (String × String) := none) : Json :=
   let typeChange (b a : PrType) : Option Json :=
     let added := a.categories.filter fun c => !b.categories.any (·.name == c.name)
@@ -412,10 +418,11 @@ def diffJson (before after : Rubric) (notes : Option (String × String) := none)
       if old.description == c.description then none
       else some (Json.mkObj [("name", c.name), ("before", old.description),
                              ("after", c.description)])
-    if b.description == a.description && b.rubric == a.rubric && added.isEmpty &&
-        removed.isEmpty && changed.isEmpty then none
+    if b.description == a.description && b.rubric == a.rubric && b.fanout == a.fanout &&
+        added.isEmpty && removed.isEmpty && changed.isEmpty then none
     else some (.mkObj [("name", a.name), ("description", change b.description a.description),
                        ("rubric", change b.rubric a.rubric),
+                       ("fanout", flagChange b.fanout a.fanout),
                        ("categoriesAdded", .arr (added.map Category.toJson).toArray),
                        ("categoriesRemoved", names (·.name) removed),
                        ("categoriesChanged", .arr changed.toArray)])
@@ -423,6 +430,7 @@ def diffJson (before after : Rubric) (notes : Option (String × String) := none)
   let removed := before.prTypes.filter fun t => (after.findType? t.name).isNone
   let changed := after.prTypes.filterMap fun t => do typeChange (← before.findType? t.name) t
   .mkObj [("defaultRubric", change before.defaultRubric after.defaultRubric),
+          ("fanout", flagChange before.fanout after.fanout),
           ("typesAdded", .arr (added.map PrType.toJson).toArray),
           ("typesRemoved", names (·.name) removed),
           ("typesChanged", .arr changed.toArray),
@@ -593,7 +601,10 @@ submit changes anything until they do.
 
 - `rubric`: the current rubric document and its `version` — a `defaultRubric` and the `prTypes`,
   each with a `description` (how an agent recognises it), a `rubric` and the `categories` its
-  comments are filed under.
+  comments are filed under. A type, or the document, may carry `fanout: true`: its reviews run
+  as one sub-run per category plus one by the default rubric, each charged as a run of its own.
+  Keep `fanout` as it is unless the evidence is about it, and say so in the rationale when you
+  change it: a person sees every change of it.
 - `styleNotes`: what the operator says of how reviews here are written.
 - `calibration`: the aggregates of the scored calibration runs — precision (how much of what the
   agent says a person also commented on), recall (how much of what people raised the agent
