@@ -194,8 +194,8 @@ calibration job is checked for that before it is queued, and runs without a chec
 [Their limits](#their-limits)).
 
 **Upgrading.** `checkout` needs orchestra with per-task checkouts (orchestra PR #222): an older
-orchestra refuses the field (`400`), and every review and calibration job then fails with that
-reason. On orchestra's `landrun` or `local` execution backends every checkout is refused unless
+orchestra refuses the field (`400`), and every review and calibration job then stays pending
+with that reason recorded. On orchestra's `landrun` or `local` execution backends every checkout is refused unless
 the operator sets `execution.allow_checkout_hooks_on_host` (which runs a pull request's hooks on
 the host, so only for a deployment where everyone who can open a pull request is trusted), and
 `isolate` is refused on `local` whatever it says: so on those backends every review and

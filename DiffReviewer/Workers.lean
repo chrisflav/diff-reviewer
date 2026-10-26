@@ -217,8 +217,8 @@ private def checkoutStep (job : Job) (ref : String) : String :=
   let slug := s!"{job.owner}/{job.name}"
   let diff := s!"`diff-reviewer agent diff {slug} {job.prNumber} --job {ref}` prints the diff \
 under review."
-  let noGitHub := "Do not fetch anything. Do not read the pull request's reviews or comments; this \
-task cannot reach GitHub."
+  let noGitHub := "Do not fetch anything, and do not use GitHub in any way, not even anonymously: \
+the pull request's later commits, reviews and comments must stay unread."
   if job.kind? == some .calibration then
     let intro := s!"2. Review the change as it stands at the head commit it names, as if the pull \
 request were open for review now. {diff} Read that diff first."
@@ -255,8 +255,8 @@ reviewers raised that the reviewing agent missed, what the agent said that nobod
 people changed in the agent's drafts before posting them, with the instructions for the proposal; \
 follow them.
 2. The repository is checked out read-only in your working directory, at its default branch: read \
-its code and documentation where they help you judge the evidence. This task cannot reach GitHub; \
-read nothing else.
+its code and documentation where they help you judge the evidence. Do not use GitHub in any way, \
+not even anonymously; read nothing else.
 3. Write the rubric document you propose — the whole of it — with a rationale, as the \
 instructions describe, and submit it with \
 `diff-reviewer agent proposal submit {slug} <file> --job {job.id}`. Fix what it reports and submit \
