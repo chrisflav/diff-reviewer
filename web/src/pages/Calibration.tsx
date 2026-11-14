@@ -9,11 +9,13 @@ import {
   type CalibrationRun,
   type CalibrationSample,
   type Page,
+  type RubricAggregate,
 } from "../api";
 import { importLive, importState, importStats, MAX_RUN_SAMPLES, scopeMeans } from "../calibration";
 import { AggregateBreakdown, AggregateFigures, Limits } from "../components/CalibrationParts";
 import { Ratio } from "../components/Ratio";
 import { RunChart } from "../components/RunChart";
+import { rubricLabel, rubricPath } from "../rubric";
 import { useLoad } from "../useLoad";
 
 /** Where a repository's pages are. */
@@ -316,13 +318,14 @@ function Summary({
           </p>
           <AggregateFigures a={s.overall} />
           <AggregateBreakdown a={s.overall} />
-          {s.byRubricVersion.length > 0 && (
+          {s.byRubric.length > 0 && (
             <>
-              <h3>By rubric version</h3>
+              <h3>By rubric</h3>
               <p className="mute small-text">
-                The rubric version each job was reviewed against, newest first: whether a rubric
-                change moved the numbers. Stale scores are {stale ? "counted" : "left out"}, derived
-                ones {derived ? "counted" : "left out"}.
+                The rubric commit each job was reviewed against, newest first, then the versions of
+                jobs from before the rubrics repository: whether a rubric change moved the numbers.
+                Stale scores are {stale ? "counted" : "left out"}, derived ones{" "}
+                {derived ? "counted" : "left out"}.
               </p>
               <div className="table-scroll">
                 <table>
@@ -336,33 +339,33 @@ function Summary({
                     </tr>
                   </thead>
                   <tbody>
-                    {s.byRubricVersion.map(({ rubricVersion: v, aggregate: a }) => (
-                      <tr key={String(v)}>
+                    {s.byRubric.map((r) => (
+                      <tr key={byRubricKey(r)}>
                         <th scope="row">
-                          {v === null ? (
-                            <span className="mute">unrecorded</span>
-                          ) : v === 0 ? (
-                            <span className="mute">none</span>
-                          ) : (
-                            <Link to={`${repoPath(owner, name)}/rubric?version=${v}`}>
-                              version {v}
-                            </Link>
-                          )}
+                          <RubricName owner={owner} name={name} r={r} />
                         </th>
                         <td className="data">
-                          {a.scored} ({a.commentsScored} full)
-                        </td>
-                        <td>
-                          <Ratio num={a.matched} den={a.agentComments} value={a.precision} />
-                        </td>
-                        <td>
-                          <Ratio num={a.matched} den={a.humanComments} value={a.recall} />
+                          {r.aggregate.scored} ({r.aggregate.commentsScored} full)
                         </td>
                         <td>
                           <Ratio
-                            num={a.decisions.agreed}
-                            den={a.decisions.compared}
-                            value={a.decisions.agreement}
+                            num={r.aggregate.matched}
+                            den={r.aggregate.agentComments}
+                            value={r.aggregate.precision}
+                          />
+                        </td>
+                        <td>
+                          <Ratio
+                            num={r.aggregate.matched}
+                            den={r.aggregate.humanComments}
+                            value={r.aggregate.recall}
+                          />
+                        </td>
+                        <td>
+                          <Ratio
+                            num={r.aggregate.decisions.agreed}
+                            den={r.aggregate.decisions.compared}
+                            value={r.aggregate.decisions.agreement}
                           />
                         </td>
                       </tr>
@@ -370,14 +373,13 @@ function Summary({
                   </tbody>
                 </table>
               </div>
-              {s.byRubricVersion.map(({ rubricVersion: v, aggregate: a }) => (
-                <details key={String(v)} className="by-version">
+              {s.byRubric.map((r) => (
+                <details key={byRubricKey(r)} className="by-version">
                   <summary>
-                    Rubric {v === null ? "unrecorded" : v === 0 ? "none" : `version ${v}`}: by
-                    category, severity and decision
+                    Rubric {rubricLabel(r) ?? "unrecorded"}: by category, severity and decision
                   </summary>
-                  <AggregateFigures a={a} />
-                  <AggregateBreakdown a={a} />
+                  <AggregateFigures a={r.aggregate} />
+                  <AggregateBreakdown a={r.aggregate} />
                 </details>
               ))}
             </>
@@ -385,6 +387,29 @@ function Summary({
         </>
       )}
     </section>
+  );
+}
+
+/** A row of the summary by rubric: its commit, or its legacy version. */
+function byRubricKey(r: RubricAggregate): string {
+  return r.rubricSha ?? `v${String(r.rubricVersion)}`;
+}
+
+/** A rubric of the summary: its commit, linked to the rubric at it, or its legacy version. */
+function RubricName({ owner, name, r }: { owner: string; name: string; r: RubricAggregate }) {
+  const label = rubricLabel(r);
+  if (r.rubricSha !== null)
+    return (
+      <Link className="data" to={rubricPath(owner, name, r.rubricSha)} title={r.rubricSha}>
+        {label}
+      </Link>
+    );
+  if (label === null) return <span className="mute">unrecorded</span>;
+  if (label === "none") return <span className="mute">none</span>;
+  return (
+    <span className="data" title="A version from before the rubrics repository">
+      {label}
+    </span>
   );
 }
 

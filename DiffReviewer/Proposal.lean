@@ -1,5 +1,6 @@
 import Lean.Data.Json
 import DiffReviewer.Calibration
+import DiffReviewer.Rubrics
 
 open Lean (Json)
 
@@ -10,37 +11,34 @@ Calibration says where the agent's reviews and the trusted reviewers' part — w
 raised that the agent missed, what the agent said that nobody did, which categories and
 severities land — and the review history says what a person changed in the agent's drafts before
 posting them. A **rubric proposal** is an agent reading all of that and writing the rubric
-document, and the style notes, it thinks the repository should have, with why. It is advisory: a
-person reads it against the rubric it was written from and accepts it, as the next rubric version,
-or rejects it.
+document, and the style notes, it thinks the repository should have, with why. It is advisory: the
+platform opens it as a pull request on the rubrics repository (`DiffReviewer.Rubrics`), and a
+person merges it — accepting it — or closes it, rejecting it.
 
   * **Asked for by a person** (`POST /api/v1/repos/{owner}/{name}/proposals`, `createJob`): a
     `proposal` job of the repository — `prNumber` 0, of no pull request — queued on orchestra as
     a task of the repository with no `issue_number`, and never posted. At most one is live per
-    repository — a job pending, queued or running, or a proposal it wrote still pending — and at
-    most `maxProposalsPerDay` are made per repository in 24 hours; both are checked in the
-    transaction that makes the job.
-  * **What the agent reads** (`contextJson`): the current rubric and its version, the style
-    notes, calibration's aggregates of the pool (by category and severity among them), the
-    people's comments the agent missed and the agent's that nobody matched in recent runs, and
-    what people changed in the agent's drafts before posting them — each at most
-    `maxContextItems`, and none of a pull request with an `eval` sample. Its first read records
-    the style notes it was given; every read, the samples and pull requests it drew on
-    (`Store.ContextRow`): the provenance every rubric and notes version made from the proposal
-    records (`Platform.Provenance`).
-  * **What it submits** (`submit`): a whole rubric document, checked as a rubric `PUT` is, new
-    style notes if it has any, and a rationale; stored as a `pending` proposal against the rubric
-    version it was written from. The job is then a `draft`, its output written.
-  * **Accepting** (`accept`) is a versioned write of the rubric: the person names the rubric
-    version they read, and if the rubric has moved since the proposal's base — or since they read
-    it — nothing is written and both versions are given back (`AcceptError.moved`), so that they
-    rebase it in the editor rather than overwrite a change the proposal never saw — and save the
-    result with `fromProposal` (`saveRubricFrom`, `adoptIn`), which records the proposal's
-    provenance and marks it accepted. Accepting writes the style notes too only when asked
-    (`applyStyleNotes`), and only if the repository's are still the ones the agent was given at its
-    first read (`conflict`). One transaction: the rubric, the notes and the proposal's decision are
-    written together or not at all. **Rejecting** (`reject`) records the decision and writes
-    nothing else.
+    repository — a job pending, queued or running, or a proposal it wrote still pending, its pull
+    request open or still to be opened — and at most `maxProposalsPerDay` are made per repository
+    in 24 hours; both are checked in the transaction that makes the job. The job is pinned, as a
+    review is, to the commit of the rubrics repository in use when it is queued.
+  * **What the agent reads** (`contextJson`): the rubric and the style notes at that commit,
+    calibration's aggregates of the pool (by category and severity among them), the people's
+    comments the agent missed and the agent's that nobody matched in recent runs, and what people
+    changed in the agent's drafts before posting them — each at most `maxContextItems`, and none
+    of a pull request with an `eval` sample. Its first read records the style notes it was given;
+    every read, the samples and pull requests it drew on (`Store.ContextRow`): the provenance its
+    merge commit records (`Rubrics.recordProvenanceIn`).
+  * **What it submits** (`submit`): a whole rubric document, checked as rubric files are, new
+    style notes if it has any, and a rationale; stored as a `pending` proposal over the commit its
+    job was pinned to. The job is then a `draft`, its output written.
+  * **Its pull request** (`openPull`): the document rendered as files (`RubricFiles.render`), a
+    commit of them over its base on the branch `diff-reviewer/proposal/<owner>/<name>/<id>`, and a
+    pull request into the rubrics branch whose body is the rationale. Made by the platform's
+    GitHub token, never the agent's: the agent writes nothing to the rubrics repository.
+  * **Its decision follows the pull request** (`followPulls`): merged, the proposal is `accepted`
+    and its merge commit carries what the proposal drew on; closed unmerged, it is `rejected`. A
+    person edits the branch, or merges part of it, on GitHub; nothing is decided on the platform.
 
 The agent's routes are of the repository and the job (`/api/agent/v1/repos/{owner}/{name}/
 proposals/{jobId}`): kleis binds them to the task's repository, and the platform to the job, which
@@ -77,32 +75,47 @@ structure Proposal where
   owner       : String
   name        : String
   jobId       : String
-  baseVersion : Nat
+  /-- The commit of the rubrics repository it was written from: its job's. -/
+  baseSha     : Option String := none
+  /-- The rubric version it was written from, for a proposal of before rubrics lived in git. -/
+  baseVersion : Nat := 0
   documentRaw : String
   styleNotes  : Option String
-  /-- The style notes its agent was given at its first read of its context (`ContextRow`), which
-      applying its notes checks are still the repository's. -/
+  /-- The style notes its agent was given at its first read of its context (`ContextRow`). -/
   baseStyleNotes : Option String
   /-- The calibration samples and pull requests its context drew on. -/
   context : Provenance := {}
   rationale   : String
-  /-- `pending`, `accepted` or `rejected`. -/
+  /-- `pending`, `accepted` or `rejected`: what became of its pull request — open, merged, closed
+      unmerged. -/
   status      : String
   createdAt   : String
   decidedAt   : Option String
-  acceptedVersion : Option Nat
+  acceptedVersion : Option Nat := none
+  /-- Its branch in the rubrics repository, the commit on it, and the pull request opened from
+      it: number, page and state (`open`, `merged`, `closed`); and the commit its merge made. -/
+  branch      : Option String := none
+  commitSha   : Option String := none
+  prNumber    : Option Nat := none
+  prUrl       : Option String := none
+  prState     : Option String := none
+  mergeSha    : Option String := none
+  /-- Why the pull request is not open yet: the workers try again. -/
+  prError     : Option String := none
 
 def Proposal.rubric? (p : Proposal) : Except String Rubric :=
   (Json.parse p.documentRaw).bind Rubric.ofJson
 
 private def Proposal.ofRow (r : Store.ProposalRow) : Proposal :=
-  { id := r.id, owner := r.owner, name := r.name, jobId := r.job_id
+  { id := r.id, owner := r.owner, name := r.name, jobId := r.job_id, baseSha := r.base_sha
   , baseVersion := r.base_version.toNat, documentRaw := r.document, styleNotes := r.style_notes
   , baseStyleNotes := r.base_style_notes
   , context := { samples := stringsOfRaw r.context_samples, prs := stringsOfRaw r.context_prs }
   , rationale := r.rationale, status := r.status
   , createdAt := r.created_at, decidedAt := r.decided_at
-  , acceptedVersion := r.accepted_version.map (·.toNat) }
+  , acceptedVersion := r.accepted_version.map (·.toNat), branch := r.branch
+  , commitSha := r.commit_sha, prNumber := r.pr_number.map (·.toNat), prUrl := r.pr_url
+  , prState := r.pr_state, mergeSha := r.merge_sha, prError := r.pr_error }
 
 private def Proposal.toRow (p : Proposal) : Store.ProposalRow :=
   { id := p.id, owner := p.owner, name := p.name, job_id := p.jobId
@@ -112,7 +125,9 @@ private def Proposal.toRow (p : Proposal) : Store.ProposalRow :=
   , context_prs := some (rawOfStrings p.context.prs), rationale := p.rationale
   , status := p.status
   , created_at := p.createdAt, decided_at := p.decidedAt
-  , accepted_version := p.acceptedVersion.map Int.ofNat }
+  , accepted_version := p.acceptedVersion.map Int.ofNat, base_sha := p.baseSha
+  , branch := p.branch, commit_sha := p.commitSha, pr_number := p.prNumber.map Int.ofNat
+  , pr_url := p.prUrl, pr_state := p.prState, merge_sha := p.mergeSha, pr_error := p.prError }
 
 private def fetchProposals (owner name : String) : Sqlite.M (Array Proposal) := do
   let rows ← HasModel.fetch <| query% do
@@ -131,6 +146,16 @@ def proposalsOf (owner name : String) : IO (Array Proposal) :=
 /-- Proposal `id` of `owner/name`. -/
 def findProposal (owner name id : String) : IO (Option Proposal) := do
   return (← proposalsOf owner name).find? (·.id == id)
+
+/-- Every pending proposal, of every repository. -/
+private def pendingProposals : IO (Array Proposal) := do
+  let rows ← Store.run <| HasModel.fetch <| query% do
+    let p ← from Store.ProposalRow
+    guard p.status = "pending"
+    select p
+  return rows.map Proposal.ofRow
+
+private def saveProposal (p : Proposal) : IO Unit := Store.run (HasModel.save p.toRow)
 
 /-- What proposal job `id`'s agent was first given, if it has read its context. -/
 def fetchContext (id : String) : Sqlite.M (Option Store.ContextRow) := do
@@ -165,8 +190,8 @@ def fetchJobs (owner name : String) : Sqlite.M (Array Job) := do
   return (rows.map Job.ofRow).filter (·.kind? == some .proposal)
 
 /-- A new `pending` proposal job of `repo`, unless one is live — a job still to write its
-    proposal, or a proposal still pending — or `cap` proposal jobs were made in the last 24 hours.
-    The checks and the write are one transaction. -/
+    proposal, or a proposal still pending, its pull request open or still to be opened — or `cap`
+    proposal jobs were made in the last 24 hours. The checks and the write are one transaction. -/
 def createJob (repo : Repo) (cap : Nat) : IO (Except CreateError Job) := do
   let now ← nowIso
   let since := isoOfEpoch ((← nowEpoch) - 86400)
@@ -176,8 +201,10 @@ def createJob (repo : Repo) (cap : Nat) : IO (Except CreateError Job) := do
     if let some j := jobs.find? (·.status?.any (liveStatuses.contains ·)) then
       return .error (.live s!"{repo.slug} has a proposal being written already, by job {j.id}")
     if let some p := (← fetchProposals repo.owner repo.name).find? (·.status == "pending") then
-      return .error (.live s!"{repo.slug} has a proposal waiting for a decision, {p.id}; accept \
-or reject it first")
+      let pr := match p.prUrl with
+        | some u => s!"; merge or close its pull request, {u}, first"
+        | none => "; its pull request is still to be opened"
+      return .error (.live s!"{repo.slug} has a proposal waiting for a decision, {p.id}{pr}")
     let made ← Platform.jobsSinceIn repo.owner repo.name since .proposal
     if made + 1 > cap then
       return .error (.capped s!"{repo.slug} has had {made} rubric proposal(s) in the last 24 \
@@ -190,24 +217,29 @@ hours, the most allowed ({cap}, --max-proposals-per-day)")
 
 /-- What an agent submits. -/
 structure Submission where
-  /-- The rubric version the proposal was written from: the one its context gave. -/
-  baseVersion : Nat
+  /-- The commit of the rubrics repository it says it was written from, if it says: its job's. -/
+  baseSha     : Option String := none
   rubric      : Rubric
   styleNotes  : Option String
   rationale   : String
 
-/-- The submission in `j`, checked: the document as a rubric `PUT` checks it, the style notes and
-    the rationale within their bounds. -/
+/-- The submission in `j`, checked: the document as a rubric directory is checked, with no field a
+    rubric does not have, the style notes and the rationale within their bounds. A `baseVersion`,
+    which a proposal named before rubrics lived in git, is not read. -/
 def Submission.ofJson (j : Json) : Except String Submission := do
-  let some baseVersion := (j.getObjValAs? Nat "baseVersion").toOption
-    | throw "the submission must name the 'baseVersion' of the rubric it was written from, as its \
-context gave it"
+  let baseSha ← match j.getObjVal? "baseSha" with
+    | .error _ | .ok .null => pure none
+    | .ok (.str s) => pure (some s.toLower)
+    | .ok _ => throw "'baseSha' must be the commit the rubric was read at, or left out"
   let doc ← match j.getObjVal? "rubric" with
-    | .ok d => (Rubric.ofJson d (ignore := RubricVersion.fields)).mapError (s!"'rubric': " ++ ·)
+    | .ok d => (Rubric.ofJson d (ignore := Rubrics.viewFields)).mapError (s!"'rubric': " ++ ·)
     | .error _ => throw "the submission must carry the proposed 'rubric' document, whole"
   doc.validate.mapError (s!"'rubric': " ++ ·)
-  -- A person's document keeps the fields this build does not know, for a newer front-end; an
-  -- agent's has no business with any, and is told which to drop.
+  for t in doc.prTypes do
+    if let some why := RubricFiles.typeNameProblem t.name then
+      throw s!"'rubric': pull request type '{t.name}': {why}"
+  -- A person's files keep the keys this build does not know, for a newer build; an agent's
+  -- document has no business with any, and is told which to drop.
   let unknown (what : String) (extra : List (String × Json)) : Except String Unit :=
     match extra with
     | [] => .ok ()
@@ -230,12 +262,15 @@ context gave it"
   if rationale.trimAscii.isEmpty then throw "the 'rationale' is empty"
   if rationale.utf8ByteSize > maxRationaleBytes then
     throw s!"the 'rationale' is longer than {maxRationaleBytes} bytes"
-  return { baseVersion, rubric := doc, styleNotes, rationale }
+  return { baseSha, rubric := doc, styleNotes, rationale }
+
+/-- The branch of proposal `id` of `owner/name` in the rubrics repository. -/
+def branchOf (owner name id : String) : String := s!"diff-reviewer/proposal/{owner}/{name}/{id}"
 
 /-- Store `sub` as the proposal of job `id`, which must be a running proposal job of `repo`, and
-    make the job a `draft`: its proposal written. The base must be a version the rubric has had (0
-    for none); one older than the current is kept as it is, and accepting it asks for a rebase.
-    One transaction. -/
+    make the job a `draft`: its proposal written. Its base is the commit its job was pinned to,
+    which `baseSha`, when given, must be. Its pull request is opened after (`openPull`). One
+    transaction. -/
 def submit (repo : Repo) (id : String) (sub : Submission) :
     IO (Except Platform.UpdateError Proposal) := do
   let now ← nowIso
@@ -247,220 +282,190 @@ def submit (repo : Repo) (id : String) (sub : Submission) :
     unless job.status? == some .running do
       return .error (.conflict s!"job {id} is {job.statusRaw}, not running; read its context \
 first, and a proposal is submitted once")
-    let current := ((← Platform.fetchCurrentRubric repo.owner repo.name).map (·.version)).getD 0
-    if sub.baseVersion > current then
-      return .error (.invalid s!"'baseVersion' is {sub.baseVersion}, but the rubric of \
-{repo.slug} is at version {current}")
+    let some base := job.rubricSha
+      | return .error (.conflict s!"job {id} is pinned to no commit of the rubrics repository, \
+which a proposal's pull request is made against")
+    if let some b := sub.baseSha then
+      unless b == base do
+        return .error (.invalid s!"'baseSha' is {b}, but the rubric was given at {base}; send \
+that, or leave it out")
     let some ctx ← fetchContext id
       | return .error (.conflict s!"job {id}'s context has not been read; read it first")
     let p : Proposal :=
-      { id := pid, owner := repo.owner, name := repo.name, jobId := id
-      , baseVersion := sub.baseVersion, documentRaw := sub.rubric.toJson.compress
+      { id := pid, owner := repo.owner, name := repo.name, jobId := id, baseSha := some base
+      , documentRaw := sub.rubric.toJson.compress
       , styleNotes := sub.styleNotes, baseStyleNotes := some ctx.style_notes
       , context := { samples := stringsOfRaw (some ctx.sample_ids)
                    , prs := stringsOfRaw (some ctx.prs) }
       , rationale := sub.rationale, status := "pending", createdAt := now, decidedAt := none
-      , acceptedVersion := none }
+      , branch := some (branchOf repo.owner repo.name pid) }
     HasModel.save p.toRow
     let next : Job := { job with statusRaw := JobStatus.draft.toString, error := none
-                                 rubricVersion := some sub.baseVersion
                                  version := job.version + 1, updatedAt := now }
     HasModel.save next.toRow
     return .ok p
 
-/-! ## Deciding -/
+/-! ## The pull request -/
 
-/-- Why a proposal was not accepted or rejected. -/
-inductive DecideError where
-  | notFound
-  | conflict (why : String)
-  /-- The rubric has moved since the proposal's base, or since the person read it: both versions,
-      for a rebase. -/
-  | moved (base current : Nat) (why : String)
+/-- What proposal `p`'s commit changes over its base, `base`: every file of its directory written,
+    each pull request type the base has and it has not removed, and `style.md` written when it
+    proposes notes — removed, when it proposes none at all (`""`). -/
+def changesOf (p : Proposal) (doc : Rubric) (base : RubricFiles.Parsed) :
+    Array GitHub.TreeChange :=
+  let dir := Rubrics.directory p.owner p.name
+  let files := RubricFiles.render doc ""
+  let written := files.map fun f => ({ path := s!"{dir}/{f.path}", content := some f.content }
+    : GitHub.TreeChange)
+  let removed := (base.rubric.prTypes.filter fun t => (doc.findType? t.name).isNone).map fun t =>
+    ({ path := s!"{dir}/types/{t.name}.md", content := none } : GitHub.TreeChange)
+  let notes : List GitHub.TreeChange := match p.styleNotes with
+    | none => []
+    | some n =>
+      if (RubricFiles.normalizeBody n).isEmpty then
+        if base.styleNotes.isEmpty then [] else [{ path := s!"{dir}/style.md", content := none }]
+      else [{ path := s!"{dir}/style.md", content := some (RubricFiles.normalizeBody n ++ "\n") }]
+  (written ++ removed ++ notes).toArray
 
-/-- Accept proposal `id` of `repo`, the person having read the rubric at `version`: its document
-    becomes the next rubric version, and — when the person asks, `applyStyleNotes` — its style
-    notes the repository's. Both record the calibration samples the proposal's context drew on.
-    Refused when the proposal is decided already, when the rubric is no longer at the proposal's
-    base or at `version` (`moved`), and, applying notes, when the repository's style notes are no
-    longer the ones the agent read. One transaction, the rubric written before the notes: a
-    failure after the first write throws, so that nothing of it is kept. -/
-def accept (repo : Repo) (id : String) (version : Nat) (applyStyleNotes : Bool) :
-    IO (Except DecideError (Proposal × RubricVersion)) := do
-  let now ← nowIso
-  let failed : IO.Ref (Option DecideError) ← IO.mkRef none
-  -- Leave the transaction by throwing, which rolls back whatever it wrote, with why kept aside.
-  let abort {α : Type} (e : DecideError) : Sqlite.M α := do
-    failed.set (some e)
-    throw (IO.userError "the proposal was not accepted")
-  try
-    Store.transact do
-      let some p := (← fetchProposals repo.owner repo.name).find? (·.id == id)
-        | abort .notFound
-      unless p.status == "pending" do
-        abort (.conflict s!"proposal {id} is {p.status} already")
-      let doc ← match p.rubric? with
-        | .ok d => pure d
-        | .error e => abort (.conflict s!"proposal {id} cannot be read by this build ({e})")
-      let current := ((← Platform.fetchCurrentRubric repo.owner repo.name).map (·.version)).getD 0
-      unless current == p.baseVersion do
-        abort (.moved p.baseVersion current s!"the rubric of {repo.slug} is at version \
-{current}, and proposal {id} was written from version {p.baseVersion}; rebase it on the current \
-rubric in the editor and save that with \"fromProposal\": \"{id}\"")
-      unless version == current do
-        abort (.moved p.baseVersion current s!"the rubric of {repo.slug} has changed since it \
-was read (version {version}, now {current}); reload it, or rebase the proposal in the editor and \
-save that with \"fromProposal\": \"{id}\"")
-      let written ← match ← Platform.putRubricIn repo.owner repo.name version doc now
-          (derived := p.context) with
-        | .ok v => pure v
-        | .error (.conflict why) | .error (.invalid why) => abort (.conflict why)
-        | .error .notFound => abort .notFound
-      if applyStyleNotes then
-        let some notes := p.styleNotes
-          | abort (.conflict s!"proposal {id} proposes no style notes; accept it without \
-'applyStyleNotes'")
-        let some fresh ← Platform.fetchRepo repo.owner repo.name | abort .notFound
-        unless p.baseStyleNotes == some fresh.styleNotes do
-          abort (.conflict s!"the style notes of {repo.slug} have changed since the agent of \
-proposal {id} read them; accept it without 'applyStyleNotes', and copy what you want of its notes \
-into the settings")
-        let _ ← Platform.saveStyleNotes fresh notes p.context
-      let p := { p with status := "accepted", decidedAt := some now
-                        acceptedVersion := some written.version }
-      HasModel.save p.toRow
-      return .ok (p, written)
-  catch e =>
-    match ← failed.get with
-    | some why => return .error why
-    | none => throw e
+/-- The body of proposal `p`'s pull request: its rationale, and where it came from. -/
+def pullBody (p : Proposal) : String :=
+  s!"{p.rationale}\n\n---\n\nProposed by diff-reviewer: proposal `{p.id}`, written by job \
+`{p.jobId}` from {(p.baseSha.getD "?")}. Merging this pull request accepts it, and closing it \
+unmerged rejects it; edit the branch first to change what is merged."
 
-/-- Inside the transaction of a person's write — a rubric `PUT` or a settings `PUT` naming
-    `fromProposal` — proposal `id` of `repo`: its provenance, for the write to record, and, for a
-    rubric written from it (`rubricVersion`, the version written), the proposal marked accepted.
-    A settings write adopts only the style notes (`rubricVersion` is `none`): it records the
-    provenance and decides nothing, so the proposal stays pending and its rubric can still be
-    accepted, or rejected. A proposal rejected is refused: what it said was turned down. One
-    accepted already gives its provenance again, keeping the rubric version it records. -/
-def adoptIn (repo : Repo) (id : String) (rubricVersion : Option Nat) (now : String) :
-    Sqlite.M (Except Platform.UpdateError Provenance) := do
-  let some p := (← fetchProposals repo.owner repo.name).find? (·.id == id)
-    | return .error (.invalid s!"'fromProposal': {id} is not a proposal of {repo.slug}")
-  if p.status == "rejected" then
-    return .error (.conflict s!"'fromProposal': proposal {id} was rejected")
-  let some rubricVersion := rubricVersion | return .ok p.context
-  let p := { p with status := "accepted", decidedAt := p.decidedAt <|> some now
-                    acceptedVersion := p.acceptedVersion <|> some rubricVersion }
-  HasModel.save p.toRow
-  return .ok p.context
+/-- Open proposal `p`'s pull request on the rubrics repository, as far as it has not been: its
+    commit over its base (the git data API: a tree over the base's, and a commit), its branch, and
+    the pull request — or find the one a lost answer opened. Each step is recorded as it is made,
+    so that a failure is taken up again where it stopped, by the next pass. -/
+def openPull (gh : GitHub.Client) (src : Rubrics.Source) (p : Proposal) :
+    IO (Except String Proposal) := do
+  if p.prNumber.isSome || p.status != "pending" then return .ok p
+  let fail (p : Proposal) (why : String) : IO (Except String Proposal) := do
+    unless p.prError == some why do saveProposal { p with prError := some why }
+    return .error why
+  let some base := p.baseSha | return ← fail p "the proposal names no commit to be made over"
+  let branch := p.branch.getD (branchOf p.owner p.name p.id)
+  let mut p := { p with branch := some branch }
+  if p.commitSha.isNone then
+    let doc ← match p.rubric? with
+      | .ok d => pure d
+      | .error e => return ← fail p s!"the proposal cannot be read by this build ({e})"
+    let snap ← match ← Rubrics.snapshot gh src base p.owner p.name with
+      | .ok s => pure s
+      | .error e => return ← fail p e
+    let baseParsed := snap.parsed.toOption.getD {}
+    let c ← match ← gh.getCommit src.owner src.name base with
+      | .ok c => pure c
+      | .error e => return ← fail p s!"reading {base}: {e.message}"
+    let tree ← match ← gh.createTree src.owner src.name c.tree (changesOf p doc baseParsed) with
+      | .ok t => pure t
+      | .error e => return ← fail p s!"writing the proposal's tree: {e.message}"
+    let msg := s!"{p.owner}/{p.name}: rubric proposal {p.id}\n\nWritten by diff-reviewer job \
+{p.jobId} from {base}."
+    let commit ← match ← gh.createCommit src.owner src.name msg tree #[base] with
+      | .ok sha => pure sha
+      | .error e => return ← fail p s!"writing the proposal's commit: {e.message}"
+    p := { p with commitSha := some commit }
+    saveProposal p
+  let some commit := p.commitSha | return ← fail p "the proposal has no commit"
+  let p0 := p
+  match ← gh.createBranch src.owner src.name branch commit with
+  | .ok () => pure ()
+  -- There already: made by an attempt whose answer was lost — or by someone else, whose branch is
+  -- never taken for the proposal's.
+  | .error (.definite why) =>
+    unless why.startsWith "GitHub answered 422" do
+      return ← fail p s!"making the branch {branch}: {why}"
+    match ← gh.branchHead src.owner src.name branch with
+    | .ok (some sha) =>
+      unless sha == commit do
+        return ← fail p s!"the branch {branch} exists already at {sha}, not at the proposal's \
+commit {commit}; it is not the proposal's, and nothing is opened from it — delete it, and the \
+workers open the proposal's"
+    | .ok none => return ← fail p s!"making the branch {branch}: {why}"
+    | .error e => return ← fail p s!"reading the branch {branch}: {e.message}"
+  | .error e => return ← fail p s!"making the branch {branch}: {e.message}"
+  let pull ← match ← gh.findPull src.owner src.name branch with
+    | .ok (some pr) =>
+      unless pr.headSha == commit && pr.headRepo == src.slug do
+        return ← fail p s!"a pull request of {branch} exists already, #{pr.number}, and is not \
+the proposal's (its head is {pr.headSha} of {pr.headRepo}, not {commit} of {src.slug}); close it, \
+and the workers open the proposal's"
+      pure pr
+    | .ok none =>
+      match ← gh.createPull src.owner src.name s!"{p.owner}/{p.name}: rubric proposal {p.id}"
+          branch src.branch (pullBody p) with
+      | .ok pr => pure pr
+      | .error e => return ← fail p s!"opening the pull request: {e.message}"
+    | .error e => return ← fail p s!"looking for the pull request of {branch}: {e.message}"
+  let opened := { p0 with prNumber := some pull.number, prUrl := some pull.htmlUrl
+                          prState := some "open", prError := none }
+  saveProposal opened
+  return .ok opened
 
-/-- A person's rubric `doc` of `repo`, over version `expected`, made from proposal `id` — what
-    the editor saves after rebasing a proposal the rubric had moved on from: written as the next
-    rubric version with the proposal's provenance (`Platform.putRubricIn`), and the proposal
-    marked accepted with it (`adoptIn`). One transaction. -/
-def saveRubricFrom (repo : Repo) (id : String) (expected : Nat) (doc : Rubric) :
-    IO (Except Platform.UpdateError RubricVersion) := do
-  let now ← nowIso
-  let failed : IO.Ref (Option Platform.UpdateError) ← IO.mkRef none
-  let abort {α : Type} (e : Platform.UpdateError) : Sqlite.M α := do
-    failed.set (some e)
-    throw (IO.userError "the rubric was not written")
-  try
-    Store.transact do
-      let some p := (← fetchProposals repo.owner repo.name).find? (·.id == id)
-        | abort (.invalid s!"'fromProposal': {id} is not a proposal of {repo.slug}")
-      let written ← match ← Platform.putRubricIn repo.owner repo.name expected doc now
-          (derived := p.context) with
-        | .ok v => pure v
-        | .error e => abort e
-      match ← adoptIn repo id (some written.version) now with
-      | .ok _ => return .ok written
-      | .error e => abort e
-  catch e =>
-    match ← failed.get with
-    | some why => return .error why
-    | none => throw e
-
-/-- Reject proposal `id` of `repo`: recorded, and nothing else written. -/
-def reject (repo : Repo) (id : String) : IO (Except DecideError Proposal) := do
-  let now ← nowIso
-  Store.transact do
-    let some p := (← fetchProposals repo.owner repo.name).find? (·.id == id)
-      | return .error .notFound
-    unless p.status == "pending" do
-      return .error (.conflict s!"proposal {id} is {p.status} already")
-    let p := { p with status := "rejected", decidedAt := some now }
-    HasModel.save p.toRow
-    return .ok p
+/-- Follow every pending proposal's pull request: open the ones not yet opened (`openPull`), and
+    of the open ones, one merged is `accepted` — its merge commit recording what the proposal drew
+    on (`Rubrics.recordProvenanceIn`), in the same transaction — and one closed unmerged is
+    `rejected`. A pull request merged or closed is followed no further: reopening one decides
+    nothing again. -/
+def followPulls (gh : GitHub.Client) (src : Rubrics.Source) (note : String → String → IO Unit) :
+    IO Unit := do
+  for p in ← pendingProposals do
+    let some n := p.prNumber
+      | if let .error why ← openPull gh src p then
+          note s!"proposal-{p.id}-{why}" s!"opening the pull request of rubric proposal {p.id} \
+of {p.owner}/{p.name}: {why}"
+    match ← gh.getPull src.owner src.name n with
+    | .error e =>
+      note s!"proposal-pr-{p.id}-{e.message}" s!"reading the pull request of rubric proposal \
+{p.id} ({src.slug}#{n}): {e.message}"
+    | .ok pr =>
+      if pr.state != "closed" then continue
+      let now ← nowIso
+      if pr.merged then
+        let some merge := pr.mergeCommitSha
+          | note s!"proposal-merge-{p.id}" s!"the pull request of rubric proposal {p.id} is \
+merged, and GitHub names no merge commit yet"
+        Store.transact do
+          HasModel.save { p with status := "accepted", decidedAt := some now, prState := "merged"
+                                 mergeSha := some merge }.toRow
+          -- On the merge, and on the proposal's own commit, which a merge commit brings in and
+          -- a directory's history names in its place.
+          Rubrics.recordProvenanceIn p.owner p.name merge s!"proposal:{p.id}" p.context
+          if let some c := p.commitSha then
+            Rubrics.recordProvenanceIn p.owner p.name c s!"proposal:{p.id}" p.context
+      else
+        saveProposal { p with status := "rejected", decidedAt := some now, prState := "closed" }
 
 /-! ## What a person reads -/
 
-private def change (before after : String) : Json :=
-  if before == after then .null else .mkObj [("before", before), ("after", after)]
-
-/-- `{"before", "after"}` of a flag, or `null` when it is the same. -/
-private def flagChange (before after : Bool) : Json :=
-  if before == after then .null else .mkObj [("before", before), ("after", after)]
-
-private def names {α : Type} (f : α → String) (xs : List α) : Json :=
-  .arr (xs.map fun x => Json.str (f x)).toArray
-
-/-- What `after` changes of `before`: the default rubric's text and the document's `fanout`; the
-    pull request types added, removed and changed — a type by its name, changed in its
-    description, its rubric, its `fanout` or its categories (added, removed, or with another
-    description) — and the style notes, when `notes` has both. Fan-out is shown on its own: turning
-    it on multiplies the runs a review is charged for, and turning it off drops what a person set,
-    so neither may pass unseen. -/
-def diffJson (before after : Rubric) (notes : Option (String × String) := none) : Json :=
-  let typeChange (b a : PrType) : Option Json :=
-    let added := a.categories.filter fun c => !b.categories.any (·.name == c.name)
-    let removed := b.categories.filter fun c => !a.categories.any (·.name == c.name)
-    let changed := a.categories.filterMap fun c => do
-      let old ← b.categories.find? (·.name == c.name)
-      if old.description == c.description then none
-      else some (Json.mkObj [("name", c.name), ("before", old.description),
-                             ("after", c.description)])
-    if b.description == a.description && b.rubric == a.rubric && b.fanout == a.fanout &&
-        added.isEmpty && removed.isEmpty && changed.isEmpty then none
-    else some (.mkObj [("name", a.name), ("description", change b.description a.description),
-                       ("rubric", change b.rubric a.rubric),
-                       ("fanout", flagChange b.fanout a.fanout),
-                       ("categoriesAdded", .arr (added.map Category.toJson).toArray),
-                       ("categoriesRemoved", names (·.name) removed),
-                       ("categoriesChanged", .arr changed.toArray)])
-  let added := after.prTypes.filter fun t => (before.findType? t.name).isNone
-  let removed := before.prTypes.filter fun t => (after.findType? t.name).isNone
-  let changed := after.prTypes.filterMap fun t => do typeChange (← before.findType? t.name) t
-  .mkObj [("defaultRubric", change before.defaultRubric after.defaultRubric),
-          ("fanout", flagChange before.fanout after.fanout),
-          ("typesAdded", .arr (added.map PrType.toJson).toArray),
-          ("typesRemoved", names (·.name) removed),
-          ("typesChanged", .arr changed.toArray),
-          ("styleNotes", (notes.map fun (b, a) => change b a).getD .null)]
-
-/-- A proposal as a person reads it. With `detail`, its document and style notes, and its diff
-    against its base and against the style notes its agent was given at its first read of its
-    context (which only `applyStyleNotes` writes); and whether the rubric has moved since its base
-    (`rebaseNeeded`), which accepting would refuse — rebase it and save with `fromProposal`. -/
-def Proposal.toJson (p : Proposal) (current : Nat) (detail : Bool) : IO Json := do
+/-- A proposal as a person reads it, `current` the commit whose rubric is in use. With `detail`,
+    its document and style notes, and its diff against the rubric and the style notes at its
+    base. -/
+def Proposal.toJson (p : Proposal) (current : Option String) (detail : Bool) : IO Json := do
+  let pull : Json := match p.prNumber with
+    | some n => .mkObj [("number", n), ("url", optStr p.prUrl),
+                        ("state", optStr p.prState)]
+    | none => .null
   let fields : List (String × Json) :=
     [("id", p.id), ("owner", p.owner), ("name", p.name), ("jobId", p.jobId),
-     ("status", p.status), ("baseVersion", p.baseVersion), ("currentVersion", current),
-     ("rebaseNeeded", p.status == "pending" && current != p.baseVersion),
+     ("status", p.status), ("baseSha", optStr p.baseSha), ("currentSha", optStr current),
      ("rationale", p.rationale), ("proposesStyleNotes", p.styleNotes.isSome),
      ("createdAt", p.createdAt), ("decidedAt", optStr p.decidedAt),
-     ("acceptedVersion", (p.acceptedVersion.map fun v => (v : Json)).getD .null)]
+     ("branch", optStr p.branch), ("pullRequest", pull), ("prError", optStr p.prError),
+     ("mergeSha", optStr p.mergeSha)]
   unless detail do return .mkObj fields
-  let base : Except String Rubric ← if p.baseVersion == 0 then pure (.ok {}) else
-    match ← Platform.rubricAt p.owner p.name p.baseVersion with
-    | some v => pure v.rubric?
-    | none => pure (.error s!"version {p.baseVersion} is not in the history")
+  let base : Except String (Rubric × String) ← match p.baseSha with
+    | none => pure (.ok ({}, ""))
+    | some sha => match ← Rubrics.cached sha p.owner p.name with
+      | some s => pure (match s.rubric? with
+        | .ok r => Except.ok (r.getD {}, s.styleNotes)
+        | .error es => Except.error (Rubrics.errorsLine es))
+      | none => pure (.error s!"{sha} has not been read")
   let (document, documentError) : Json × Json := match p.rubric? with
     | .ok d => (d.toJson, .null)
     | .error e => (.null, .str e)
-  let notes := p.styleNotes.map fun n => (p.baseStyleNotes.getD "", n)
   let (diff, diffError) : Json × Json := match base, p.rubric? with
-    | .ok b, .ok d => (diffJson b d notes, .null)
+    | .ok (b, notes), .ok d => (diffJson b d (p.styleNotes.map fun n => (notes, n)), .null)
     | .error e, _ => (.null, .str s!"the base rubric cannot be read: {e}")
     | _, .error e => (.null, .str s!"the proposal cannot be read: {e}")
   return .mkObj (fields ++
@@ -596,12 +601,14 @@ def instructions : String :=
 You are proposing a change to the review rubric of this repository on the diff-reviewer platform.
 Reviewing agents review the repository's pull requests by this rubric; calibration compares their
 reviews with what the repository's trusted reviewers wrote of the same commits. Your proposal is
-advisory: a person reads it beside the current rubric and accepts or rejects it. Nothing you
-submit changes anything until they do.
+advisory: the platform opens it as a pull request on the repository the rubrics are kept in, and a
+person reads it there and merges it or closes it. Nothing you submit changes anything until they
+merge it.
 
 ## What you are given
 
-- `rubric`: the current rubric document and its `version` — a `defaultRubric` and the `prTypes`,
+- `rubric`: the current rubric document and the commit it is read at, `sha` — a `defaultRubric`
+  and the `prTypes`,
   each with a `description` (how an agent recognises it), a `rubric` and the `categories` its
   comments are filed under. A type, or the document, may carry `fanout: true`: its reviews run
   as one sub-run per category plus one by the default rubric, each charged as a run of its own.
@@ -645,7 +652,7 @@ length, tone, what is left out) and the current notes do not say it.
 
 ```json
 {
-  \"baseVersion\": 3,
+  \"baseSha\": \"<rubric.sha>\",
   \"rubric\": {
     \"defaultRubric\": \"…\",
     \"prTypes\": [{\"name\": \"feature\", \"description\": \"…\", \"rubric\": \"…\",
@@ -656,21 +663,24 @@ length, tone, what is left out) and the current notes do not say it.
 }
 ```
 
-- `baseVersion` is the `version` of the `rubric` you were given.
+- `baseSha` is the `sha` of the `rubric` you were given; it may be left out.
 - `rubric` is the whole document you propose, not a patch: what you leave out is removed. Start
   from the one you were given.
 - `styleNotes` is the full new text, or `null` to propose no change to them.
 - `rationale` says, change by change, what you changed and which evidence led you to it. At most
   32 KiB.
 
-The platform checks the document as it checks a rubric a person writes; fix what it reports and
-submit again until it is accepted. A proposal is submitted once."
+The platform checks the document as it checks the rubric files a person writes; fix what it
+reports and submit again until it is accepted. A proposal is submitted once."
 
-/-- The context of proposal job `job` of `repo`: see the module's description. -/
-def contextJson (repo : Repo) (job : Job) : IO Json := do
-  let rubric := match ← Platform.currentRubric repo.owner repo.name with
-    | some v => v.toJson
-    | none => RubricVersion.none repo.owner repo.name
+/-- The context of proposal job `job` of `repo`: see the module's description. The rubric and the
+    style notes are those of the commit the job is pinned to, which its proposal is made over. -/
+def contextJson (src : Option Rubrics.Source) (repo : Repo) (job : Job) : IO Json := do
+  let snap ← match job.rubricSha with
+    | some sha => Rubrics.cached sha repo.owner repo.name
+    | none => pure none
+  let rubric := Rubrics.viewJson src repo.owner repo.name snap #[] none none none {}
+  let styleNotes := (snap.map (·.styleNotes)).getD ""
   let (human, agent, used) ← misses repo
   let (edits, editPrs) ← personEdits repo.owner repo.name
   let samples ← Calibration.listSamples repo.owner repo.name (deleted := true)
@@ -682,14 +692,14 @@ def contextJson (repo : Repo) (job : Job) : IO Json := do
   Store.transact do
     let prev ← fetchContext job.id
     HasModel.save ({ job_id := job.id
-                   , style_notes := (prev.map (·.style_notes)).getD repo.styleNotes
+                   , style_notes := (prev.map (·.style_notes)).getD styleNotes
                    , sample_ids := rawOfStrings
                        ((stringsOfRaw (prev.map (·.sample_ids)) ++ used).eraseDups)
                    , prs := rawOfStrings ((stringsOfRaw (prev.map (·.prs)) ++ prs).eraseDups)
                    , read_at := (prev.map (·.read_at)).getD now } : Store.ContextRow)
   return .mkObj [
     ("jobId", job.id), ("owner", repo.owner), ("name", repo.name), ("status", job.statusRaw),
-    ("instructions", instructions), ("rubric", rubric), ("styleNotes", repo.styleNotes),
+    ("instructions", instructions), ("rubric", rubric), ("styleNotes", styleNotes),
     ("calibration", ← Calibration.summaryJson repo.owner repo.name (split := "pool")),
     ("missedHuman", .arr human), ("unmatchedAgent", .arr agent),
     ("personEdits", .arr edits)]

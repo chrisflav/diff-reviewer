@@ -1,6 +1,13 @@
 import { useCallback, useState } from "react";
-import { Link, useNavigate, useParams } from "react-router-dom";
-import { api, ApiError, UnauthorizedError, type Job, type RubricProposal } from "../api";
+import { Link, useParams } from "react-router-dom";
+import {
+  api,
+  ApiError,
+  githubLink,
+  UnauthorizedError,
+  type Job,
+  type RubricProposal,
+} from "../api";
 import {
   ProposalDiffView,
   ProposedDocumentView,
@@ -8,17 +15,14 @@ import {
   StyleNotesDiff,
 } from "../components/Proposal";
 import {
-  acceptProposal,
-  acceptRefusal,
-  adoptNotesPath,
-  adoptRubricPath,
   diffCounts,
   LIVE_PROPOSAL_JOB,
   proposalPath,
   proposalsPath,
-  type AcceptRefusal,
+  pullState,
 } from "../proposals";
-import { rubricStashKey } from "../stash";
+import { rubricPath, shortSha } from "../rubric";
+import { repoKey } from "../stash";
 import { useLoad } from "../useLoad";
 import { Pager, repoPath, usePoll } from "./Calibration";
 
@@ -43,9 +47,77 @@ function Crumbs({ owner, name, here }: { owner: string; name: string; here?: str
   );
 }
 
-function rubricLink(owner: string, name: string, v: number) {
-  if (v === 0) return <span className="mute">none</span>;
-  return <Link to={`${repoPath(owner, name)}/rubric?version=${v}`}>version {v}</Link>;
+/** A rubric commit, short, linked to the rubric page at it; `none` for none. */
+export function rubricLink(owner: string, name: string, sha: string | null) {
+  if (sha === null) return <span className="mute">none</span>;
+  return (
+    <Link className="data" to={rubricPath(owner, name, sha)} title={sha}>
+      {shortSha(sha)}
+    </Link>
+  );
+}
+
+/** A proposal's pull request on the rubrics repository, linked, with its number and state. */
+export function PullLink({ p }: { p: Pick<RubricProposal, "pullRequest" | "prError"> }) {
+  const pr = p.pullRequest;
+  if (pr === null)
+    return (
+      <span className={p.prError === null ? "mute" : "warn"}>
+        {p.prError === null ? "not opened yet" : "could not be opened yet"}
+      </span>
+    );
+  const url = githubLink(pr.url);
+  const label = `#${pr.number}`;
+  return (
+    <>
+      {url === null ? (
+        <span className="data">{label}</span>
+      ) : (
+        <a className="data" href={url} rel="noreferrer noopener" target="_blank">
+          {label}
+        </a>
+      )}{" "}
+      <span className={`status pr-${pr.state}`}>{pr.state}</span>
+    </>
+  );
+}
+
+/**
+ * Where a proposal stands on GitHub: its pull request, its branch, and why the pull request could
+ * not be opened, when it could not. It is decided there, not here.
+ */
+export function ProposalPull({ p }: { p: RubricProposal }) {
+  return (
+    <section aria-labelledby="pull-h">
+      <h2 id="pull-h">Pull request</h2>
+      <p>{pullState(p)}</p>
+      <dl className="facts">
+        <dt>Pull request</dt>
+        <dd>
+          <PullLink p={p} />
+        </dd>
+        <dt>Branch</dt>
+        <dd className="data">{p.branch}</dd>
+        <dt>Written from</dt>
+        <dd>{rubricLink(p.owner, p.name, p.baseSha)}</dd>
+        {p.mergeSha !== null && (
+          <>
+            <dt>Merged as</dt>
+            <dd>{rubricLink(p.owner, p.name, p.mergeSha)}</dd>
+          </>
+        )}
+      </dl>
+      {p.prError !== null && (
+        <p className="notice warn-notice" role="status">
+          The pull request could not be opened yet: <span className="body">{p.prError}</span>
+        </p>
+      )}
+      <p className="mute small-text">
+        Review it on GitHub, where it can be changed before it is merged like any other pull
+        request. Merging it changes the rubric; closing it unmerged rejects it.
+      </p>
+    </section>
+  );
 }
 
 function StatusTag({ p }: { p: RubricProposal }) {
@@ -73,7 +145,7 @@ function ProposalsView({
   name: string;
   onUnauthorized: () => void;
 }) {
-  const key = rubricStashKey(owner, name);
+  const key = repoKey(owner, name);
   const [offset, setOffset] = useState(0);
   const fetchList = useCallback(
     () => api.proposals(owner, name, PAGE, offset),
@@ -82,7 +154,7 @@ function ProposalsView({
   const list = useLoad(fetchList, onUnauthorized);
   const fetchJobs = useCallback(
     () =>
-      api.jobs("proposal").then((js) => js.filter((j) => rubricStashKey(j.owner, j.name) === key)),
+      api.jobs("proposal").then((js) => js.filter((j) => repoKey(j.owner, j.name) === key)),
     [key],
   );
   const jobs = useLoad(fetchJobs, onUnauthorized);
@@ -113,7 +185,7 @@ function ProposalsView({
         if (err instanceof UnauthorizedError) return onUnauthorized();
         if (err instanceof ApiError && err.status === 409)
           setAskError(
-            `A repository has one live proposal at a time — a job being written, or a proposal waiting for a decision — so none was asked for: ${err.message}`,
+            `A repository has one live proposal at a time — a job being written, or a proposal whose pull request is open — so none was asked for: ${err.message}`,
           );
         else if (err instanceof ApiError && err.status === 429)
           setAskError(
@@ -160,14 +232,16 @@ function ProposalsView({
         An agent reads where calibration says the agent's reviews and the trusted reviewers' part,
         and what people changed in the agent's drafts before posting them, and writes the rubric —
         and style notes, if it has any — it thinks the repository should have, with why. It is
-        advisory: nothing changes until a person accepts it, as the next rubric version. It learns
-        from the <code>pool</code> only, never from what calibration measures by.
+        opened as a pull request on the rubrics repository and decided there: merging it accepts
+        it, closing it unmerged rejects it. It learns from the <code>pool</code> only, never from
+        what calibration measures by.
       </p>
 
       <section aria-labelledby="ask-h">
         <h2 id="ask-h">Ask for one</h2>
         <p className="mute small-text">
-          One live proposal at a time: a job being written, or a proposal waiting for a decision.
+          One live proposal at a time: a job being written, or a proposal whose pull request is
+          open.
           Proposals asked for count against the repository's daily cap.
         </p>
         <div className="actions">
@@ -193,7 +267,7 @@ function ProposalsView({
         {pending !== undefined && (
           <p className="notice warn-notice">
             <Link to={proposalPath(owner, name, pending.id)}>Proposal {pending.id}</Link> is waiting
-            for a decision: accept or reject it before asking for another.
+            for a decision: merge or close its pull request before asking for another.
           </p>
         )}
       </section>
@@ -281,6 +355,7 @@ function ProposalsView({
                   <tr>
                     <th scope="col">Proposal</th>
                     <th scope="col">Status</th>
+                    <th scope="col">Pull request</th>
                     <th scope="col">Written from</th>
                     <th scope="col">Made</th>
                     <th scope="col">Decided</th>
@@ -297,16 +372,11 @@ function ProposalsView({
                       </td>
                       <td>
                         <StatusTag p={p} />
-                        {p.rebaseNeeded && (
-                          <span
-                            className="tag flag-stale"
-                            title="The rubric has moved since it was written: rebase it in the editor."
-                          >
-                            rubric moved
-                          </span>
-                        )}
                       </td>
-                      <td>rubric {rubricLink(owner, name, p.baseVersion)}</td>
+                      <td>
+                        <PullLink p={p} />
+                      </td>
+                      <td>rubric {rubricLink(owner, name, p.baseSha)}</td>
                       <td className="data mute">{p.createdAt}</td>
                       <td className="small-text">
                         {p.decidedAt === null ? (
@@ -314,9 +384,7 @@ function ProposalsView({
                         ) : (
                           <>
                             <span className="data mute">{p.decidedAt}</span>
-                            {p.acceptedVersion !== null && (
-                              <> as {rubricLink(owner, name, p.acceptedVersion)}</>
-                            )}
+                            {p.mergeSha !== null && <> as {rubricLink(owner, name, p.mergeSha)}</>}
                           </>
                         )}
                       </td>
@@ -364,19 +432,7 @@ function ProposalView({
   onUnauthorized: () => void;
 }) {
   const fetch = useCallback(() => api.proposal(owner, name, id), [owner, name, id]);
-  const { data: p, error, reload, setData } = useLoad(fetch, onUnauthorized);
-  const navigate = useNavigate();
-  // Off unless ticked: accepting the rubric never writes the notes on its own.
-  const [applyNotes, setApplyNotes] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [refusal, setRefusal] = useState<(AcceptRefusal & { withNotes: boolean }) | null>(null);
-  const [actError, setActError] = useState<string | null>(null);
-  const [done, setDone] = useState<string | null>(null);
-
-  const fail = (err: unknown) => {
-    if (err instanceof UnauthorizedError) return onUnauthorized();
-    setActError(err instanceof Error ? err.message : String(err));
-  };
+  const { data: p, error } = useLoad(fetch, onUnauthorized);
 
   if (p === null)
     return (
@@ -385,57 +441,6 @@ function ProposalView({
         {error !== null ? <p className="error">{error}</p> : <p className="mute">Loading…</p>}
       </>
     );
-
-  const accept = () => {
-    const withNotes = p.proposesStyleNotes && applyNotes;
-    setBusy(true);
-    setActError(null);
-    setRefusal(null);
-    setDone(null);
-    acceptProposal(p, withNotes)
-      .then((r) => {
-        setData({ ...p, ...r.proposal });
-        setDone(
-          `Accepted as rubric version ${r.rubric.version}${withNotes ? ", with its style notes" : ""}.`,
-        );
-        reload();
-      })
-      .catch((err: unknown) => {
-        const why = acceptRefusal(err);
-        if (why === null) return fail(err);
-        setRefusal({ ...why, withNotes });
-        reload();
-      })
-      .finally(() => setBusy(false));
-  };
-
-  const reject = () => {
-    if (!window.confirm("Reject this proposal? Nothing of it is written, and it cannot be undone."))
-      return;
-    setBusy(true);
-    setActError(null);
-    setRefusal(null);
-    setDone(null);
-    api
-      .rejectProposal(owner, name, p.id)
-      .then((r) => {
-        setData({ ...p, ...r });
-        setDone("Rejected: nothing of it was written.");
-        reload();
-      })
-      .catch((err: unknown) => {
-        if (err instanceof ApiError && err.status === 409) {
-          setActError(`Refused: ${err.message}`);
-          reload();
-        } else fail(err);
-      })
-      .finally(() => setBusy(false));
-  };
-
-  const pendingNow = p.status === "pending";
-  const canAdopt = p.status !== "rejected" && p.document !== null && p.document !== undefined;
-  const openEditor = () => navigate(adoptRubricPath(p.owner, p.name, p.id));
-  const openNotes = () => navigate(adoptNotesPath(p.owner, p.name, p.id));
 
   return (
     <>
@@ -451,19 +456,13 @@ function ProposalView({
           </Link>
         </dd>
         <dt>Written from</dt>
-        <dd>rubric {rubricLink(owner, name, p.baseVersion)}</dd>
+        <dd>rubric {rubricLink(owner, name, p.baseSha)}</dd>
         <dt>The rubric now</dt>
-        <dd>{rubricLink(owner, name, p.currentVersion)}</dd>
+        <dd>{rubricLink(owner, name, p.currentSha)}</dd>
         <dt>Made</dt>
         <dd className="data">{p.createdAt}</dd>
         <dt>Decided</dt>
         <dd className="data">{p.decidedAt ?? "—"}</dd>
-        {p.acceptedVersion !== null && (
-          <>
-            <dt>Accepted as</dt>
-            <dd>{rubricLink(owner, name, p.acceptedVersion)}</dd>
-          </>
-        )}
         {p.diff !== undefined && p.diff !== null && (
           <>
             <dt>Changes</dt>
@@ -473,43 +472,8 @@ function ProposalView({
       </dl>
 
       {error !== null && <p className="error">{error}</p>}
-      {done !== null && (
-        <p className="notice" role="status">
-          {done}
-        </p>
-      )}
-      {actError !== null && (
-        <p className="error" role="alert">
-          {actError}
-        </p>
-      )}
-      {refusal !== null && (
-        <Refused
-          r={refusal}
-          proposesNotes={p.proposesStyleNotes}
-          canAdopt={canAdopt}
-          pending={pendingNow}
-          onEditor={openEditor}
-          onNotes={openNotes}
-        />
-      )}
-      {p.rebaseNeeded && refusal === null && (
-        <div className="notice warn-notice" role="status">
-          <p>
-            The rubric has moved since this proposal was written (from version {p.baseVersion}, now{" "}
-            {p.currentVersion}), so accepting it as it is would be refused: it would overwrite a
-            change it never saw. Open it in the editor to move it onto the current rubric, where you
-            choose wherever both changed the same thing, and save it there.
-          </p>
-          {canAdopt && (
-            <div className="actions">
-              <button type="button" onClick={openEditor}>
-                Open in the editor
-              </button>
-            </div>
-          )}
-        </div>
-      )}
+
+      <ProposalPull p={p} />
 
       <section aria-labelledby="why-h">
         <h2 id="why-h">Why</h2>
@@ -522,7 +486,8 @@ function ProposalView({
 
       <section aria-labelledby="diff-h">
         <h2 id="diff-h">
-          What it changes of rubric {p.baseVersion === 0 ? "(none)" : `version ${p.baseVersion}`}
+          What it changes of rubric{" "}
+          {p.baseSha === null ? "(none)" : <span className="data">{shortSha(p.baseSha)}</span>}
         </h2>
         {p.documentError !== null && p.documentError !== undefined && (
           <p className="error">
@@ -541,9 +506,7 @@ function ProposalView({
           p.document !== undefined &&
           p.document !== null && (
             <>
-              <p className="mute small-text">
-                The proposed document in full, as accepting writes it:
-              </p>
+              <p className="mute small-text">The proposed rubric in full:</p>
               <ProposedDocumentView doc={p.document} />
             </>
           )
@@ -554,199 +517,12 @@ function ProposalView({
         <section aria-labelledby="notes-h">
           <h2 id="notes-h">Style notes</h2>
           <p className="mute small-text">
-            Against the notes its agent was given when it first read its context. Accepting writes
-            them only when asked, and only while the repository's notes are still those.
+            Against the style notes at the commit it was written from: its pull request changes
+            the repository's <code>style.md</code> too.
           </p>
           <StyleNotesDiff change={p.diff?.styleNotes ?? null} />
-          {canAdopt && (
-            <>
-              {pendingNow && <NotesOnlyNote />}
-              <div className="actions">
-                <button type="button" className="ghost" onClick={openNotes}>
-                  Open the style notes in the settings…
-                </button>
-              </div>
-            </>
-          )}
         </section>
       )}
-
-      {pendingNow && (
-        <Decide
-          p={p}
-          applyNotes={applyNotes}
-          setApplyNotes={setApplyNotes}
-          busy={busy}
-          onAccept={accept}
-          onReject={reject}
-          onEdit={canAdopt ? openEditor : undefined}
-        />
-      )}
     </>
-  );
-}
-
-/**
- * What saving a pending proposal's style notes in the settings does: the save names the proposal,
- * which the new notes version records as what it came from, and decides nothing.
- */
-function NotesOnlyNote() {
-  return (
-    <p className="notice">
-      <strong>Saving the style notes in the settings does not decide this proposal:</strong> the
-      notes record it as what they came from, and it stays pending, so its rubric can still be
-      accepted or rejected here, or saved from the editor.
-    </p>
-  );
-}
-
-/** Whether the page can show what accepting `p` writes: its diff, or else its document. */
-function acceptShown(p: Pick<RubricProposal, "diff" | "document">): boolean {
-  return (
-    (p.diff !== undefined && p.diff !== null) || (p.document !== undefined && p.document !== null)
-  );
-}
-
-/**
- * Accept or reject a pending proposal, or, with `onEdit`, edit it before accepting: its document
- * opened in the rubric editor as unsaved edits, which saving there accepts. "Also apply the style
- * notes" is shown only when the proposal has some, and is off until the person ticks it.
- * Accepting is not offered when neither the diff nor the document can be shown: nothing is
- * accepted unseen.
- */
-export function Decide({
-  p,
-  applyNotes,
-  setApplyNotes,
-  busy,
-  onAccept,
-  onReject,
-  onEdit,
-}: {
-  p: RubricProposal;
-  applyNotes: boolean;
-  setApplyNotes: (on: boolean) => void;
-  busy: boolean;
-  onAccept: () => void;
-  onReject: () => void;
-  onEdit?: (() => void) | undefined;
-}) {
-  const shown = acceptShown(p);
-  return (
-    <section aria-labelledby="decide-h" className="decide">
-      <h2 id="decide-h">Decide</h2>
-      <p className="mute small-text">
-        Accepting makes the proposed document rubric version {p.currentVersion + 1}, recording the
-        calibration samples its agent drew on. It is checked against the rubric you read here,
-        version {p.currentVersion}: if it has moved since, nothing is written.
-      </p>
-      {!shown && (
-        <p className="error small-text">
-          Neither what it changes nor the document it proposes can be shown here, so it cannot be
-          accepted from this page; it can still be rejected.
-        </p>
-      )}
-      {p.proposesStyleNotes && (
-        <label className="check">
-          <input
-            type="checkbox"
-            name="apply-style-notes"
-            checked={applyNotes}
-            onChange={(e) => setApplyNotes(e.target.checked)}
-          />
-          Also apply the style notes it proposes, as the repository's
-        </label>
-      )}
-      <div className="actions">
-        <button type="button" onClick={onAccept} disabled={busy || !shown}>
-          Accept as rubric version {p.currentVersion + 1}
-          {p.proposesStyleNotes && applyNotes && ", with the style notes"}
-        </button>
-        {onEdit !== undefined && (
-          <button type="button" className="ghost" onClick={onEdit} disabled={busy}>
-            Edit before accepting…
-          </button>
-        )}
-        <button type="button" className="ghost danger" onClick={onReject} disabled={busy}>
-          Reject
-        </button>
-      </div>
-      {onEdit !== undefined && (
-        <p className="mute small-text">
-          Editing opens the proposed document in the rubric editor as unsaved changes on top of
-          the rubric as it is now; saving it there accepts the proposal, as the version you saved.
-        </p>
-      )}
-    </section>
-  );
-}
-
-/** A refused accept, and the way on: the editor for a moved rubric, the settings for notes. */
-function Refused({
-  r,
-  proposesNotes,
-  canAdopt,
-  pending,
-  onEditor,
-  onNotes,
-}: {
-  r: AcceptRefusal & { withNotes: boolean };
-  proposesNotes: boolean;
-  canAdopt: boolean;
-  pending: boolean;
-  onEditor: () => void;
-  onNotes: () => void;
-}) {
-  if (r.kind === "moved")
-    return (
-      <div className="notice warn-notice" role="alert">
-        <p>
-          Nothing was written: the rubric is at version {r.currentVersion}, and the proposal was
-          written from version {r.baseVersion}.{" "}
-          <span className="body mute small-text">{r.message}</span>
-        </p>
-        <p>
-          Open it in the editor: its document is put there as unsaved edits on top of version{" "}
-          {r.currentVersion}, what only it changed is taken, and where both changed the same thing
-          you choose. Saving there names the proposal and accepts it.
-          {r.withNotes &&
-            proposesNotes &&
-            " Its style notes were not applied either: open them in the settings once the rubric is saved."}
-        </p>
-        {canAdopt && pending && r.withNotes && proposesNotes && <NotesOnlyNote />}
-        {canAdopt && (
-          <div className="actions">
-            <button type="button" onClick={onEditor}>
-              Open in the editor
-            </button>
-            {r.withNotes && proposesNotes && (
-              <button type="button" className="ghost" onClick={onNotes}>
-                Open the style notes in the settings
-              </button>
-            )}
-          </div>
-        )}
-      </div>
-    );
-  return (
-    <div className="notice warn-notice" role="alert">
-      <p>
-        Refused, nothing was written: <span className="body">{r.message}</span>
-      </p>
-      {r.withNotes && proposesNotes && canAdopt && (
-        <>
-          <p>
-            If the style notes are what was refused, accept without them, and open them in the
-            settings, where they are put on top of the notes as they are now.
-          </p>
-          {pending && <NotesOnlyNote />}
-          <div className="actions">
-            <button type="button" className="ghost" onClick={onNotes}>
-              Open the style notes in the settings
-            </button>
-          </div>
-        </>
-      )}
-    </div>
   );
 }

@@ -4,6 +4,7 @@ import DiffReviewerTest.Server
 import DiffReviewerTest.Workers
 import DiffReviewerTest.Calibration
 import DiffReviewerTest.Style
+import DiffReviewerTest.FakeGit
 
 open Lean (Json)
 open DiffReviewer
@@ -12,12 +13,14 @@ open DiffReviewerTest.Server
 open DiffReviewerTest.Workers
 open DiffReviewerTest.Calibration
 open DiffReviewerTest.Style
+open DiffReviewerTest.FakeGit
 
 /-!
 # What keeps calibration a measurement
 
 The held-out split, fixed once made; the platform's own posts kept out of the samples; a proposal
 held to the rubric's own fields, cancelled when a person says so, and given its context bounded;
+what a merged proposal learned from kept out of what measures the rubric it made;
 and the platform's credentials on orchestra kept apart from its others.
 -/
 
@@ -86,7 +89,7 @@ def ownPostsAreNotSamples : Test := withTempDb do
 /-- A proposal's document may carry no field a rubric does not have, at any depth. -/
 def proposalsHaveNoUnknownFields : Test := do
   let parse (doc : String) := Proposal.Submission.ofJson
-    ((Json.parse (proposal 1 (rubric := doc))).toOption.getD .null)
+    ((Json.parse (proposal (rubric := doc))).toOption.getD .null)
   let top := parse "{\"defaultRubric\": \"x\", \"note\": 1}"
   let inType := parse "{\"prTypes\": [{\"name\": \"a\", \"weight\": 2}]}"
   let inCategory := parse "{\"prTypes\": [{\"name\": \"a\", \"categories\": \
@@ -106,9 +109,11 @@ def proposalsAreCancelled : Test := withTempDb do
   let f ← history
   let orch ← FakeOrchestra.new
   let prop ← FakeOrchestra.new
-  let svc ← withProposer f orch prop
+  let fg ← FakeGit.new
+  let svc ← withProposer f orch prop fg
   let st ← State.new cfg svc
   let _ ← putRepo st "{}"
+  let _ ← commitRubric fg svc rubricV1
   let made ← route st (req .post proposalsPath "{}")
   let jobId := (field made "id").getD ""
   Workers.queuePending svc
@@ -213,101 +218,18 @@ def heldOutPullsTeachNothing : Test := withTempDb do
     ++ checkEq edits.size 1 "one changed comment"
     ++ checkEq stampsAgain stamps "splits read again, nothing written"
 
-/-- A proposal's agent context records the pull requests it drew on; a person who rebases the
-    proposal and saves it with `fromProposal` keeps that provenance on the rubric version and the
-    style notes, accepts the proposal and frees its slot; and the notes' provenance survives a
-    delete and a registration again. -/
-def fromProposalKeepsProvenance : Test := withTempDb do
-  let f ← history
-  let orch ← FakeOrchestra.new
-  let prop ← FakeOrchestra.new
-  let svc ← withProposer f orch prop
-  let st ← State.new cfg svc
-  let _ ← putRepo st "{}"
-  let _ ← route st (req .put s!"{repoPath}/rubrics" rubricV1)
-  let _ ← postedReviewOf 7
-  let made ← route st (req .post proposalsPath "{}")
-  let jobId := (field made "id").getD ""
-  Workers.queuePending svc
-  let _ ← route st (agentProposalReq .get jobId)
-  let submitted ← route st (agentProposalReq .post jobId (proposal 1))
-  let pid := (field submitted "proposalId").getD ""
-  let _ ← route st (req .put s!"{repoPath}/rubrics" "{\"version\": 1, \"defaultRubric\": \"x\"}")
-  let moved ← route st (req .post s!"{proposalsPath}/{pid}/accept" "{\"version\": 2}")
-  let rebased ← route st (req .put s!"{repoPath}/rubrics"
-    s!"\{\"version\": 2, \"fromProposal\": \"{pid}\", \"defaultRubric\": \"rebased\"}")
-  let shown ← route st (req .get s!"{proposalsPath}/{pid}")
-  let anew ← route st (req .post proposalsPath "{}")
-  let notes ← putRepo st s!"\{\"styleNotes\": \"Brief.\", \"fromProposal\": \"{pid}\"}"
-  let notesNow ← Platform.notesHistory "acme" "widgets"
-  let unknown ← putRepo st "{\"styleNotes\": \"x\", \"fromProposal\": \"nope\"}"
-  let _ ← route st (req .delete repoPath)
-  let again ← putRepo st "{\"version\": 0}"
-  let notesAfter ← Platform.notesHistory "acme" "widgets"
-  let pulls (j : Json) := (listOf j ["derivedFromPulls"]).filterMap (·.getStr?.toOption)
-  let movedWhy := (field moved "error").getD ""
-  return check ((movedWhy.splitOn "fromProposal").length > 1)
-      "a moved rubric's 409 says to save with fromProposal"
-    ++ checkStatus rebased 200 "the rebased rubric, saved from the proposal"
-    ++ checkEq (pulls (bodyJson rebased)) ["acme/widgets#7"]
-      "records the pull request its context drew on"
-    ++ checkEq (str (bodyJson shown) ["status"]) (some "accepted") "the proposal is accepted"
-    ++ checkEq (num (bodyJson shown) ["acceptedVersion"]) (some 3) "as that version"
-    ++ checkStatus anew 201 "and its slot is free"
-    ++ checkStatus notes 200 "style notes, written from it"
-    ++ checkEq ((notesNow[0]?.map (·.derived.prs)).getD []) ["acme/widgets#7"]
-      "record its provenance"
-    ++ checkEq (num (bodyJson notes) ["styleNotesVersion"]) (some 1) "as notes version 1"
-    ++ checkStatus unknown 400 "from a proposal that is not one"
-    ++ checkEq (num (bodyJson again) ["styleNotesVersion"]) (some 2)
-      "registered again: the notes go on from the last version"
-    ++ checkEq ((notesAfter[0]?.map (·.derived.prs)).getD []) ["acme/widgets#7"]
-      "and keep what they were derived from"
-
-/-- Style notes saved in the settings from a proposal record its provenance and decide nothing:
-    the proposal stays pending, its slot taken, and its rubric can still be accepted, which the
-    notes do not get in the way of. -/
-def notesAloneDecideNothing : Test := withTempDb do
-  let f ← history
-  let orch ← FakeOrchestra.new
-  let prop ← FakeOrchestra.new
-  let svc ← withProposer f orch prop
-  let st ← State.new cfg svc
-  let _ ← putRepo st "{}"
-  let _ ← route st (req .put s!"{repoPath}/rubrics" rubricV1)
-  let _ ← postedReviewOf 7
-  let made ← route st (req .post proposalsPath "{}")
-  let jobId := (field made "id").getD ""
-  Workers.queuePending svc
-  let _ ← route st (agentProposalReq .get jobId)
-  let submitted ← route st (agentProposalReq .post jobId (proposal 1))
-  let pid := (field submitted "proposalId").getD ""
-  let notes ← putRepo st s!"\{\"styleNotes\": \"Brief.\", \"fromProposal\": \"{pid}\"}"
-  let notesNow ← Platform.notesHistory "acme" "widgets"
-  let shown ← route st (req .get s!"{proposalsPath}/{pid}")
-  let anew ← route st (req .post proposalsPath "{}")
-  let accepted ← route st (req .post s!"{proposalsPath}/{pid}/accept" "{\"version\": 1}")
-  let after ← route st (req .get s!"{proposalsPath}/{pid}")
-  return checkStatus notes 200 "style notes, written from the proposal"
-    ++ checkEq ((notesNow[0]?.map (·.derived.prs)).getD []) ["acme/widgets#7"]
-      "record its provenance"
-    ++ checkEq (str (bodyJson shown) ["status"]) (some "pending") "the proposal is still pending"
-    ++ check ((bodyJson shown).getObjVal? "acceptedVersion" matches .ok .null)
-      "with no rubric version"
-    ++ checkStatus anew 409 "and still the repository's live proposal"
-    ++ checkStatus accepted 200 "its rubric is accepted afterwards"
-    ++ checkEq (str (bodyJson after) ["status"]) (some "accepted") "and then it is accepted"
-    ++ checkEq (num (bodyJson after) ["acceptedVersion"]) (some 2) "as rubric version 2"
-
-/-- The notes version an agent was given is recorded on its job; a score of any sample of a pull
-    request those notes were derived from is derived, one imported after them too. -/
+/-- A proposal of style notes alone, merged, makes its merge commit derived from what it drew on,
+    as a rubric's would: a score of any sample of those pull requests under that commit is
+    derived, one imported after it too. -/
 def derivedByPullAndNotes : Test := withTempDb do
   let f ← history
   let orch ← FakeOrchestra.new
   let prop ← FakeOrchestra.new
-  let svc ← withProposer f orch prop
+  let fg ← FakeGit.new
+  let svc ← withProposer f orch prop fg
   let st ← State.new cfg svc
   let _ ← imported st svc f (evalShare := 0)
+  let _ ← commitRubric fg svc "{}"
   let _ ← poolRunOf st [← sampleId st 301]
   Workers.queuePending svc
   let _ ← routeAgent st (agentReq .get "" (pr := 13))
@@ -316,9 +238,10 @@ def derivedByPullAndNotes : Test := withTempDb do
   let jobId := (field made "id").getD ""
   Workers.queuePending svc
   let _ ← route st (agentProposalReq .get jobId)
-  let submitted ← route st (agentProposalReq .post jobId (proposal 0))
-  let pid := (field submitted "proposalId").getD ""
-  let _ ← putRepo st s!"\{\"styleNotes\": \"Brief.\", \"fromProposal\": \"{pid}\"}"
+  let _ ← route st (agentProposalReq .post jobId (proposal (rubric := "{}")
+    (notes := "\"Brief.\"")))
+  let merge ← fg.merge 1
+  Workers.tick svc
   -- Bob reviews #13 later; his sample takes #13's split, and the suite holds it out.
   f.reviews.modify (·.push (13, review 302 "bob" "COMMENTED" "Looks off." jobHead))
   let _ ← importId st
@@ -333,8 +256,9 @@ def derivedByPullAndNotes : Test := withTempDb do
   let some j ← Platform.findJob job | return #["the calibration job is gone"]
   let summary := bodyJson (← route st (req .get s!"{repoPath}/calibration/summary"))
   return checkStatus run 201 "a run of bob's sample"
-    ++ checkEq j.notesVersion (some 1) "the job records the notes version its agent was given"
-    ++ checkEq j.rubricVersion (some 0) "under no rubric"
+    ++ checkEq j.rubricSha (some merge) "the job is pinned to the merge"
+    ++ checkEq ((← Rubrics.cached merge "acme" "widgets").map (·.styleNotes)) (some "Brief.")
+      "whose notes are the proposal's"
     ++ checkEq (num summary ["overall", "derivedScores"]) (some 1)
       "its score is derived: the notes learned from #13"
     ++ checkEq (num summary ["overall", "scored"]) (some 0) "and left out"
@@ -345,9 +269,11 @@ def missesAreOfTheNewestScore : Test := withTempDb do
   let f ← history
   let orch ← FakeOrchestra.new
   let prop ← FakeOrchestra.new
-  let svc ← withProposer f orch prop
+  let fg ← FakeGit.new
+  let svc ← withProposer f orch prop fg
   let st ← State.new cfg svc
   let _ ← imported st svc f (evalShare := 0)
+  let _ ← commitRubric fg svc "{}"
   let s301 ← sampleId st 301
   let both := "{\"decision\": \"request_changes\", \"body\": \"Both.\", \"comments\": [\
 {\"file\": \"A.lean\", \"start_line\": 4, \"end_line\": 5, \"body\": \"a name\"}, \
@@ -374,8 +300,6 @@ def all : List (String × Test) :=
    ("theProposerTokenIsChecked", theProposerTokenIsChecked),
    ("theAgentTokensStandApart", theAgentTokensStandApart),
    ("heldOutPullsTeachNothing", heldOutPullsTeachNothing),
-   ("fromProposalKeepsProvenance", fromProposalKeepsProvenance),
-   ("notesAloneDecideNothing", notesAloneDecideNothing),
    ("derivedByPullAndNotes", derivedByPullAndNotes),
    ("missesAreOfTheNewestScore", missesAreOfTheNewestScore)]
 

@@ -2,8 +2,8 @@
   "openapi": "3.1.0",
   "info": {
     "title": "diff-reviewer platform API",
-    "version": "0.9.0",
-    "description": "The review platform: the repositories whose pull requests it reviews, and one review job per review. A job moves `pending → queued → running → draft → approved → posted`; `rejected` is a discarded draft, `stale` a draft whose pull request has moved on, and `failed` a run that ended without a review.\n\nThree credentials, none standing in for another. The password (`$DIFF_REVIEWER_PASSWORD`) is accepted only by `POST /api/login`, which sets the session cookie; failed password logins are rate-limited (an immediate `429` with `Retry-After`), and the API token signs in there too, unlimited. Every route under `/api/v1/` needs the session cookie or the API token (`$DIFF_REVIEWER_API_TOKEN_FILE`) as `Authorization: Bearer <token>`. Every route under `/api/agent/v1/` needs the agent token (`$DIFF_REVIEWER_AGENT_TOKEN_FILE`) as a bearer, and nothing else reaches it; an agent's requests go through kleis, which supplies it.\n\nEvery write must be `application/json` (`415` otherwise). Every write to a job under `/api/v1/` names the job's `version` as last read, and is a `409` if the job has changed since. A request the server fails on is a `500` whose reason goes to the server log; a method a route does not answer is a `405`. Collections answer `{\"items\": [...]}`. Instants are RFC 3339 in UTC; an absent value is `null`.\n\nEach repository has a rubric document — a default rubric and the pull request types its reviews tell apart, each with a rubric and the categories its comments are filed under — written whole and versioned (`/api/v1/repos/{owner}/{name}/rubrics`). Every write of a job's review, by the agent, a person or (once posted) GitHub, is kept as a revision (`/api/v1/jobs/{id}/revisions`).\n\nCalibration (`/api/v1/repos/{owner}/{name}/calibration/…`) compares the agent's reviews with the reviews the repository's `trustedReviewers` wrote on its closed pull requests: an import stores each such review as a sample, a run makes one `calibration` job per sample at the sample's commit, and each job's draft is scored against its sample. A `calibration` job is queued and run like any other, but is never approved, claimed or posted.\n\nLearned review style: the agent's `examples` are inline comments the repository's trusted reviewers wrote, picked from its calibration samples — never of the pull request under review — and its instructions end with the repository's `styleNotes`. A rubric proposal (`/api/v1/repos/{owner}/{name}/proposals`) is a `proposal` job of the repository, of no pull request: an agent reads the rubric, the style notes, calibration's results and people's edits of the agent's drafts (`/api/agent/v1/repos/{owner}/{name}/proposals/{jobId}`), and proposes a rubric document, which a person accepts as the next rubric version or rejects. A `proposal` job is never approved, claimed or posted.\n\nFan-out: a pull request type, or the rubric document for every review, may set `fanout`: a review under it is run as sub-runs side by side, one per category and one by the default rubric, each an orchestra task of its own that submits a partial review through the agent API naming itself `X-Diff-Reviewer-Job: <job>.<key>`; the platform merges them into the job's draft. The type must be known before anything is queued, so it is the repository's fixed `prType`. A job is `running` until merged, and shows its sub-runs (`subRuns`).\n\nIncremental re-review: a review job of a pull request whose review was posted, at a new head descending from the posted one, reviews the changes since. The job records what it follows (`previousJob`, `incrementalSince`, `incrementalCommits`); its agent is given the posted review and reads the diff since (`…/diff?since=<sha>`), every comment must be on that diff, and the draft ends with a line linking the earlier review, which a person reads and approves with it. A force-push falls back to a full review, with why in `fullReviewReason`. Per repository, `incremental` (on by default)."
+    "version": "1.0.0",
+    "description": "The review platform: the repositories whose pull requests it reviews, and one review job per review. A job moves `pending → queued → running → draft → approved → posted`; `rejected` is a discarded draft, `stale` a draft whose pull request has moved on, and `failed` a run that ended without a review.\n\nThree credentials, none standing in for another. The password (`$DIFF_REVIEWER_PASSWORD`) is accepted only by `POST /api/login`, which sets the session cookie; failed password logins are rate-limited (an immediate `429` with `Retry-After`), and the API token signs in there too, unlimited. Every route under `/api/v1/` needs the session cookie or the API token (`$DIFF_REVIEWER_API_TOKEN_FILE`) as `Authorization: Bearer <token>`. Every route under `/api/agent/v1/` needs the agent token (`$DIFF_REVIEWER_AGENT_TOKEN_FILE`) as a bearer, and nothing else reaches it; an agent's requests go through kleis, which supplies it.\n\nEvery write must be `application/json` (`415` otherwise). Every write to a job under `/api/v1/` names the job's `version` as last read, and is a `409` if the job has changed since. A request the server fails on is a `500` whose reason goes to the server log; a method a route does not answer is a `405`. Collections answer `{\"items\": [...]}`. Instants are RFC 3339 in UTC; an absent value is `null`.\n\nRubrics live in one GitHub repository, the rubrics repository (`$DIFF_REVIEWER_RUBRICS_REPO`, `owner/name`, on the branch `$DIFF_REVIEWER_RUBRICS_BRANCH`, `main` by default), one directory per reviewed repository: `<owner>/<name>/rubric.md` (YAML front matter `fanout` and, optionally, `types`, the order of the types; its body is the default rubric), `<owner>/<name>/types/<type>.md` (front matter `description`, `fanout` and `categories`, an ordered map of category name to description; its body is the type's rubric) and `<owner>/<name>/style.md` (the style notes). Git is the source of truth: the platform only reads it, and people change rubrics by commits and pull requests on GitHub. A head that does not parse leaves the last good commit in use, and says why (`error`). The rubric as read, its history and the diff between two commits are under `/api/v1/repos/{owner}/{name}/rubrics`; every job records the commit it was reviewed against (`rubricSha`). Every write of a job's review, by the agent, a person or (once posted) GitHub, is kept as a revision (`/api/v1/jobs/{id}/revisions`).\n\nCalibration (`/api/v1/repos/{owner}/{name}/calibration/…`) compares the agent's reviews with the reviews the repository's `trustedReviewers` wrote on its closed pull requests: an import stores each such review as a sample, a run makes one `calibration` job per sample at the sample's commit, and each job's draft is scored against its sample. A `calibration` job is queued and run like any other, but is never approved, claimed or posted.\n\nLearned review style: the agent's `examples` are inline comments the repository's trusted reviewers wrote, picked from its calibration samples — never of the pull request under review — and its instructions end with the repository's style notes, `<owner>/<name>/style.md` in the rubrics repository. A rubric proposal (`/api/v1/repos/{owner}/{name}/proposals`) is a `proposal` job of the repository, of no pull request: an agent reads the rubric and the style notes at the commit the job is pinned to, calibration's results and people's edits of the agent's drafts (`/api/agent/v1/repos/{owner}/{name}/proposals/{jobId}`), and proposes a rubric, which the platform opens as a pull request on the rubrics repository. Its status follows the pull request: merged is `accepted`, closed unmerged is `rejected`. A `proposal` job is never approved, claimed or posted.\n\nFan-out: a pull request type, or the rubric (`rubric.md`) for every review, may set `fanout`: a review under it is run as sub-runs side by side, one per category and one by the default rubric, each an orchestra task of its own that submits a partial review through the agent API naming itself `X-Diff-Reviewer-Job: <job>.<key>`; the platform merges them into the job's draft. The type must be known before anything is queued, so it is the repository's fixed `prType`. A job is `running` until merged, and shows its sub-runs (`subRuns`).\n\nIncremental re-review: a review job of a pull request whose review was posted, at a new head descending from the posted one, reviews the changes since. The job records what it follows (`previousJob`, `incrementalSince`, `incrementalCommits`); its agent is given the posted review and reads the diff since (`…/diff?since=<sha>`), every comment must be on that diff, and the draft ends with a line linking the earlier review, which a person reads and approves with it. A force-push falls back to a full review, with why in `fullReviewReason`. Per repository, `incremental` (on by default)."
   },
   "security": [
     {
@@ -220,10 +220,6 @@
                     "maxItems": 50,
                     "description": "GitHub logins; stored in lower case, once each. Left out, the current ones are kept."
                   },
-                  "styleNotes": {
-                    "type": "string",
-                    "description": "Markdown, at most 16 KiB (UTF-8). Left out (or null), the current notes are kept; an empty string clears them."
-                  },
                   "evalShare": {
                     "type": "integer",
                     "minimum": 0,
@@ -248,10 +244,6 @@
                     "type": "integer",
                     "minimum": 0,
                     "description": "The version of the settings last read, 0 for a repository not registered (now). Given, the write is a `409` if the settings have changed since; left out, it is not checked. A repository registered again after being deleted goes on from the version it had, so no version is given twice to one name."
-                  },
-                  "fromProposal": {
-                    "type": "string",
-                    "description": "The rubric proposal the style notes written were taken from: the new notes version records its provenance, and the proposal is not decided: it stays pending, its rubric still to be accepted or rejected. `400` for an id that is not a proposal of the repository, `409` for a rejected proposal."
                   }
                 }
               }
@@ -292,11 +284,11 @@
             "$ref": "#/components/responses/Error"
           }
         },
-        "description": "Names are stored in lower case, as GitHub compares them. `mode` and `autoReview` are replaced: a write that omits one sets its default. `trustedReviewers` and `styleNotes` are kept when omitted, so that a client that does not know it cannot wipe it. Every write increments `version`."
+        "description": "Names are stored in lower case, as GitHub compares them. `mode` and `autoReview` are replaced: a write that omits one sets its default. `trustedReviewers` is kept when omitted, so that a client that does not know it cannot wipe it. Every write increments `version`. `styleNotes` and `fromProposal` are refused (`400`): the style notes live in the rubrics repository, as `<owner>/<name>/style.md`."
       },
       "delete": {
         "summary": "Unregister a repository",
-        "description": "Its jobs are kept: they are the record of reviews that happened. So are its rubric versions, which those jobs name: registering the repository again picks its rubric up where it was. Versions of its settings never repeat: registering it again goes on from the version it had, so a page of the old registration is refused (`409`) by the new one.",
+        "description": "Its jobs are kept: they are the record of reviews that happened, and name the rubric commits they were reviewed against. Its rubric, in the rubrics repository, is not touched: registering the repository again reads it as it is. Versions of its settings never repeat: registering it again goes on from the version it had, so a page of the old registration is refused (`409`) by the new one.",
         "operationId": "deleteRepo",
         "responses": {
           "204": {
@@ -479,7 +471,7 @@
       ],
       "put": {
         "summary": "Replace a job's review",
-        "description": "The body is `{\"version\": n, \"review\": {...}}`. Allowed while the job is `pending`, `draft`, `approved` or `rejected` (`409` otherwise: the agent may still be writing it, or it is history), and makes it a `draft`: an approval was of the review as it was. Each comment must name a file and lines `1 ≤ start_line ≤ end_line`, and say something. `409` while a post of the job may have reached GitHub (`postStartedAt` is set). Each comment's `category` is checked against the rubric version the job was reviewed against (the current one if none). Comments without an `id` are given one, and the review is appended to the job's revisions as a person's. A `calibration` job's review is the agent's, scored as submitted, and is not edited: `409`.",
+        "description": "The body is `{\"version\": n, \"review\": {...}}`. Allowed while the job is `pending`, `draft`, `approved` or `rejected` (`409` otherwise: the agent may still be writing it, or it is history), and makes it a `draft`: an approval was of the review as it was. Each comment must name a file and lines `1 ≤ start_line ≤ end_line`, and say something. `409` while a post of the job may have reached GitHub (`postStartedAt` is set). Each comment's `category` is checked against the rubric at the commit the job was reviewed against (`rubricSha`; the rubric in use for a job without one). Comments without an `id` are given one, and the review is appended to the job's revisions as a person's. A `calibration` job's review is the agent's, scored as submitted, and is not edited: `409`.",
         "operationId": "putReview",
         "requestBody": {
           "required": true,
@@ -955,7 +947,7 @@
       ],
       "post": {
         "summary": "Submit the review",
-        "description": "The job must be `running` and `headSha` must be its head (`409` otherwise). The review must be one GitHub would take (`400`, saying what to fix): at most 200 inline comments, a summary unless it approves, and every comment's lines in one hunk of the diff's new side. `prType` must be one of the rubric's pull request types, or null when it names none, and each comment's `category` one of that type's categories (see `InlineComment`) (`400`). Comments without an `id` are given one. The job becomes a `draft`, recording `prType` and the rubric's version (0 for none), and the review is the first of its revisions. For a repository in `direct` mode the platform then posts it — always as a comment, whatever its decision, which the job keeps; if posting fails the job is left `approved` with the reason in `error`, and the submission still stands; when the post's outcome was unknown and it is found not to have reached GitHub, the workers post it again, if the pull request is still open at the job's head, up to 3 posts in all. When the repository fixes its type (`prType`), `prType` must name it. A sub-run of a fan-out review submits a partial review instead: checked the same way against the rubric version its job fanned out under, with `prType` the job's, and — for a category's sub-run — every comment of its category (`400`). It is kept on the sub-run; once every sub-run has submitted or failed, the platform merges them into the job's draft (the agent's one revision), which then goes on as above. An incremental re-review's comments must also lie in a hunk of the diff since its earlier review (`400`, saying so). An incremental re-review's draft ends with a line linking the earlier review (unless its body links it already), added when it is drafted — or when its sub-runs are merged.",
+        "description": "The job must be `running` and `headSha` must be its head (`409` otherwise). The review must be one GitHub would take (`400`, saying what to fix): at most 200 inline comments, a summary unless it approves, and every comment's lines in one hunk of the diff's new side. `prType` must be one of the rubric's pull request types, or null when it names none, and each comment's `category` one of that type's categories (see `InlineComment`) (`400`). Comments without an `id` are given one. The job becomes a `draft`, recording `prType`, and the review is the first of its revisions. For a repository in `direct` mode the platform then posts it — always as a comment, whatever its decision, which the job keeps; if posting fails the job is left `approved` with the reason in `error`, and the submission still stands; when the post's outcome was unknown and it is found not to have reached GitHub, the workers post it again, if the pull request is still open at the job's head, up to 3 posts in all. When the repository fixes its type (`prType`), `prType` must name it. A sub-run of a fan-out review submits a partial review instead: checked the same way against the rubric at the commit its job fanned out under (`rubricSha`), with `prType` the job's, and — for a category's sub-run — every comment of its category (`400`). It is kept on the sub-run; once every sub-run has submitted or failed, the platform merges them into the job's draft (the agent's one revision), which then goes on as above. An incremental re-review's comments must also lie in a hunk of the diff since its earlier review (`400`, saying so). An incremental re-review's draft ends with a line linking the earlier review (unless its body links it already), added when it is drafted — or when its sub-runs are merged.",
         "operationId": "agentSubmit",
         "security": [
           {
@@ -1079,7 +1071,7 @@
       "get": {
         "summary": "What a rubric proposal is written from",
         "operationId": "agentProposalShow",
-        "description": "The proposal job must be `queued` or `running` (`404` otherwise); reading a `queued` one moves it to `running`. Of the repository and the job, with no pull request: kleis's `reviewer` spec does not allow it, a `rubric-proposer` spec does. The first read records the style notes it gives (which applying the proposal's notes checks are still the repository's), and every read the samples and pull requests its context drew on: the provenance every rubric and notes version taken from the proposal records. Only the proposals' agent token reaches it.",
+        "description": "The proposal job must be `queued` or `running` (`404` otherwise); reading a `queued` one moves it to `running`. Of the repository and the job, with no pull request: kleis's `reviewer` spec does not allow it, a `rubric-proposer` spec does. The job was pinned to the rubric in use when it was queued (its `rubricSha`): `rubric` is the rubric at that commit, and `styleNotes` its style notes. Every read records the samples and pull requests its context drew on: the provenance the proposal records. Only the proposals' agent token reaches it.",
         "security": [
           {
             "proposerAgentBearer": []
@@ -1107,7 +1099,7 @@
       "post": {
         "summary": "Submit a rubric proposal",
         "operationId": "agentProposalSubmit",
-        "description": "The job must be `running` (`409` otherwise: a proposal is submitted once). `rubric` is checked as `PUT …/rubrics` checks a document, and may carry no field a rubric does not have, on the document, a type or a category (`400`, naming them) — only a person's document keeps unknown fields; `baseVersion` must be a version the rubric has had (`400`) — one older than the current is stored, and accepting it asks for a rebase. Stored as a `pending` proposal; the job becomes a `draft`.",
+        "description": "The job must be `running` (`409` otherwise: a proposal is submitted once). `rubric` is a whole rubric — `defaultRubric`, `prTypes` and `fanout` — checked as the platform checks a rubric it reads (`400`, saying what is wrong), and may carry no field a rubric does not have (`400`, naming them). `baseSha`, if given, must be the job's pinned `rubricSha` (`400`); `baseVersion` is ignored. Stored as a `pending` proposal written from the pinned commit, and the job becomes a `draft`; the platform then writes it as files on a branch of the rubrics repository and opens a pull request. When that cannot be done yet, the proposal says why (`prError`) and it is tried again.",
         "security": [
           {
             "proposerAgentBearer": []
@@ -1120,19 +1112,17 @@
               "schema": {
                 "type": "object",
                 "required": [
-                  "baseVersion",
                   "rubric",
                   "rationale"
                 ],
                 "properties": {
-                  "baseVersion": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "description": "The `rubric.version` of the context."
+                  "baseSha": {
+                    "type": "string",
+                    "description": "The `rubric.sha` of the context: the job's pinned commit. Optional; anything else is a `400`."
                   },
                   "rubric": {
                     "type": "object",
-                    "description": "A whole rubric document, as `PUT …/rubrics` takes it (without `version`).",
+                    "description": "A whole rubric.",
                     "properties": {
                       "defaultRubric": {
                         "type": "string"
@@ -1142,6 +1132,9 @@
                         "items": {
                           "$ref": "#/components/schemas/PrType"
                         }
+                      },
+                      "fanout": {
+                        "type": "boolean"
                       }
                     }
                   },
@@ -1173,7 +1166,9 @@
                   "required": [
                     "proposalId",
                     "jobId",
-                    "status"
+                    "status",
+                    "pullRequest",
+                    "prError"
                   ],
                   "properties": {
                     "proposalId": {
@@ -1187,6 +1182,20 @@
                       "enum": [
                         "pending"
                       ]
+                    },
+                    "pullRequest": {
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "description": "The page of the pull request opened on the rubrics repository; null when it could not be opened yet."
+                    },
+                    "prError": {
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "description": "Why the pull request is not open yet; the workers try again."
                     }
                   }
                 }
@@ -1400,16 +1409,16 @@
         }
       ],
       "get": {
-        "summary": "A repository's rubric document",
-        "description": "The current version; version 0 with an empty document when there is none yet. `404` for a repository that is not registered.",
+        "summary": "A repository's rubric",
+        "description": "The rubric in use, read from the rubrics repository at `sha`: the branch head, or the last commit that parses when the head does not (`error` says why, and `headSha` is the head). While the rubrics repository has never been read — or cannot be: not found, or not readable with the token — `sha` is null, `error` says why, and the repository's reviews wait rather than going without a rubric. With no rubric at all — no rubrics repository configured (`repository` null), an empty repository, a missing branch — `sha` is null and `error` says why. `exists` is false when the repository's directory is not there at `sha`: then the rubric is empty. `404` for a repository that is not registered.",
         "operationId": "getRubrics",
         "responses": {
           "200": {
-            "description": "The document.",
+            "description": "The rubric.",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/RubricDocument"
+                  "$ref": "#/components/schemas/RubricView"
                 }
               }
             }
@@ -1418,71 +1427,6 @@
             "$ref": "#/components/responses/Error"
           },
           "404": {
-            "$ref": "#/components/responses/Error"
-          }
-        }
-      },
-      "put": {
-        "summary": "Replace a repository's rubric document",
-        "description": "The body is the whole document with the version it replaces, as last read (`409` if that is no longer the current one). It becomes the next version, and the one it replaces stays in the history. A type's `description`, `rubric` and `categories` default to empty. `400` for a type or category without a name or with the name of another, past 50 types or 50 categories a type, or a rubric past 65536 bytes. The answer of a `GET` may be sent back as it is, edited: its `owner`, `name`, `createdAt` and `documentError` are not kept as the document's, and fields this build does not know, on the document, a type or a category, are kept. A field may be left out (it is then empty) but not `null` (`400`). `409` too while the current version cannot be read by this build (`documentError`): it is left for a build that can. With `fromProposal`, it records that proposal's provenance and accepts it, in the same transaction.",
-        "operationId": "putRubrics",
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "type": "object",
-                "required": [
-                  "version"
-                ],
-                "properties": {
-                  "version": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "description": "The version last read; 0 when the repository had none."
-                  },
-                  "defaultRubric": {
-                    "type": "string"
-                  },
-                  "prTypes": {
-                    "type": "array",
-                    "items": {
-                      "$ref": "#/components/schemas/PrType"
-                    }
-                  },
-                  "fromProposal": {
-                    "type": "string",
-                    "description": "The rubric proposal this document was made from — a proposal rebased in the editor after the rubric moved on from its base. The version records the proposal's provenance (`derivedFrom`, `derivedFromPulls`), and the proposal is marked accepted with it, freeing the repository's one live proposal. A rejected proposal, or one that is not the repository's, is refused."
-                  }
-                }
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "The new version.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RubricDocument"
-                }
-              }
-            }
-          },
-          "400": {
-            "$ref": "#/components/responses/Error"
-          },
-          "401": {
-            "$ref": "#/components/responses/Error"
-          },
-          "404": {
-            "$ref": "#/components/responses/Error"
-          },
-          "409": {
-            "$ref": "#/components/responses/Error"
-          },
-          "415": {
             "$ref": "#/components/responses/Error"
           }
         }
@@ -1508,12 +1452,12 @@
         }
       ],
       "get": {
-        "summary": "Every version of a repository's rubric document",
-        "description": "Newest first. A job's `rubricVersion` names one of them. Paged: `limit` (default 50, at most 200) and `offset`; `400` for a `limit` or `offset` that is not one.",
+        "summary": "The commits of a repository's rubric",
+        "description": "The commits of the rubrics repository's branch that touch the repository's directory, newest first. A job's `rubricSha` names one of them. Empty when no rubrics repository is configured. Paged: `limit` (default 50, at most 200) and `offset`; `400` for a `limit` or `offset` that is not one; `502` when GitHub cannot be read.",
         "operationId": "getRubricHistory",
         "responses": {
           "200": {
-            "description": "The versions.",
+            "description": "The commits.",
             "content": {
               "application/json": {
                 "schema": {
@@ -1526,7 +1470,7 @@
                     "items": {
                       "type": "array",
                       "items": {
-                        "$ref": "#/components/schemas/RubricDocument"
+                        "$ref": "#/components/schemas/RubricCommit"
                       }
                     },
                     "nextOffset": {
@@ -1548,6 +1492,9 @@
             "$ref": "#/components/responses/Error"
           },
           "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
             "$ref": "#/components/responses/Error"
           }
         },
@@ -1576,6 +1523,136 @@
             "description": "How many items to skip."
           }
         ]
+      }
+    },
+    "/api/v1/repos/{owner}/{name}/rubrics/commits/{sha}": {
+      "parameters": [
+        {
+          "name": "owner",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "name",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "sha",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{40}$"
+          },
+          "description": "A full commit sha of the rubrics repository."
+        }
+      ],
+      "get": {
+        "summary": "A repository's rubric at one commit",
+        "description": "The rubric as the repository's directory holds it at commit `sha`: what a job with that `rubricSha` was reviewed against. `headSha` is null. When the commit does not parse, `error` says why (file, line) and the rubric fields are empty; `exists` is false when the directory is not there. `400` for a `sha` that is not 40 hexadecimal digits; `404` for a repository that is not registered, no rubrics repository configured, or a commit the rubrics repository does not have; `502` when GitHub cannot be read.",
+        "operationId": "getRubricCommit",
+        "responses": {
+          "200": {
+            "description": "The rubric at that commit.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RubricView"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/v1/repos/{owner}/{name}/rubrics/compare": {
+      "parameters": [
+        {
+          "name": "owner",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "name",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "get": {
+        "summary": "What changed of a repository's rubric between two commits",
+        "description": "The rubric at `head` against the rubric at `base`, in the shape of a proposal's diff, and the GitHub page comparing them. `diff` is null, with `diffError`, when either commit does not parse. `400` when `base` or `head` is missing or not 40 hexadecimal digits; `404` for a repository that is not registered, no rubrics repository configured, or a commit the rubrics repository does not have; `502` when GitHub cannot be read.",
+        "operationId": "getRubricCompare",
+        "parameters": [
+          {
+            "name": "base",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{40}$"
+            },
+            "description": "The older commit."
+          },
+          {
+            "name": "head",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{40}$"
+            },
+            "description": "The newer commit."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The comparison.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RubricCompare"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
       }
     },
     "/api/v1/repos/{owner}/{name}/calibration/import": {
@@ -1742,7 +1819,7 @@
       "post": {
         "summary": "Ask for a rubric proposal",
         "operationId": "createProposal",
-        "description": "A `pending` `proposal` job of the repository (`prNumber` 0), queued on orchestra as a task of the repository with no `issue_number`, through the client for proposals (`DIFF_REVIEWER_ORCHESTRA_PROPOSER_TOKEN_FILE`), with the kleis narrowing `github: only discover, fetch`. Never posted. `409` while the repository has a live proposal — a job pending, queued or running, or a proposal waiting for a decision; `429` past `--max-proposals-per-day` (2 by default) for the repository.",
+        "description": "A `pending` `proposal` job of the repository (`prNumber` 0), queued on orchestra as a task of the repository with no `issue_number`, through the client for proposals (`DIFF_REVIEWER_ORCHESTRA_PROPOSER_TOKEN_FILE`), with the kleis narrowing `github: only discover, fetch`. Never posted. `409` while the repository has a live proposal — a job pending, queued or running, or a proposal waiting for a decision (its pull request on the rubrics repository not yet merged or closed) — and when there is no rubrics repository to open its pull request on (none configured, or one read that has no branch); while the rubrics repository has never been read, the job is made and waits, `pending`, with why in its `error`; `429` past `--max-proposals-per-day` (2 by default) for the repository.",
         "requestBody": {
           "required": true,
           "content": {
@@ -1885,7 +1962,7 @@
         "operationId": "getProposal",
         "responses": {
           "200": {
-            "description": "The proposal, with `document`, `styleNotes` and `diff`.",
+            "description": "The proposal, with `document`, `styleNotes` and `diff`. Its status follows its pull request, read again when asked.",
             "content": {
               "application/json": {
                 "schema": {
@@ -1898,193 +1975,6 @@
             "$ref": "#/components/responses/Error"
           },
           "404": {
-            "$ref": "#/components/responses/Error"
-          }
-        }
-      }
-    },
-    "/api/v1/repos/{owner}/{name}/proposals/{id}/accept": {
-      "parameters": [
-        {
-          "name": "owner",
-          "in": "path",
-          "required": true,
-          "schema": {
-            "type": "string"
-          }
-        },
-        {
-          "name": "name",
-          "in": "path",
-          "required": true,
-          "schema": {
-            "type": "string"
-          }
-        },
-        {
-          "name": "id",
-          "in": "path",
-          "required": true,
-          "schema": {
-            "type": "string"
-          }
-        }
-      ],
-      "post": {
-        "summary": "Accept a rubric proposal",
-        "operationId": "acceptProposal",
-        "description": "A versioned write of the rubric: `version` is the rubric version the person read. The proposal's document becomes the next rubric version, recording the calibration samples the proposal's context drew on (`derivedFrom`); with `applyStyleNotes`, its style notes become the repository's, recording them too. One transaction, the rubric written first: a refusal after it rolls everything back. `409` when the proposal is decided already, when applying notes it has none or the repository's notes are no longer the ones its agent was given at its first read of its context, and — with `baseVersion` and `currentVersion` beside `error` — when the rubric has moved since the proposal's base or since `version`: rebase it in the editor and save that as a rubric `PUT` with `fromProposal`, which keeps its provenance and accepts it.",
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "type": "object",
-                "required": [
-                  "version"
-                ],
-                "properties": {
-                  "version": {
-                    "type": "integer",
-                    "minimum": 0
-                  },
-                  "applyStyleNotes": {
-                    "type": "boolean",
-                    "default": false,
-                    "description": "Also write the proposal's style notes as the repository's. Without it the rubric is written and the notes are not. `409` when the proposal has none, or when the repository's notes are no longer the ones its agent read."
-                  }
-                }
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Accepted.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "required": [
-                    "proposal",
-                    "rubric"
-                  ],
-                  "properties": {
-                    "proposal": {
-                      "$ref": "#/components/schemas/RubricProposal"
-                    },
-                    "rubric": {
-                      "$ref": "#/components/schemas/RubricDocument"
-                    }
-                  }
-                }
-              }
-            }
-          },
-          "409": {
-            "description": "Refused; when the rubric has moved, with both versions.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "required": [
-                    "error"
-                  ],
-                  "properties": {
-                    "error": {
-                      "type": "string"
-                    },
-                    "baseVersion": {
-                      "type": "integer"
-                    },
-                    "currentVersion": {
-                      "type": "integer"
-                    }
-                  }
-                }
-              }
-            }
-          },
-          "400": {
-            "$ref": "#/components/responses/Error"
-          },
-          "401": {
-            "$ref": "#/components/responses/Error"
-          },
-          "404": {
-            "$ref": "#/components/responses/Error"
-          },
-          "415": {
-            "$ref": "#/components/responses/Error"
-          }
-        }
-      }
-    },
-    "/api/v1/repos/{owner}/{name}/proposals/{id}/reject": {
-      "parameters": [
-        {
-          "name": "owner",
-          "in": "path",
-          "required": true,
-          "schema": {
-            "type": "string"
-          }
-        },
-        {
-          "name": "name",
-          "in": "path",
-          "required": true,
-          "schema": {
-            "type": "string"
-          }
-        },
-        {
-          "name": "id",
-          "in": "path",
-          "required": true,
-          "schema": {
-            "type": "string"
-          }
-        }
-      ],
-      "post": {
-        "summary": "Reject a rubric proposal",
-        "operationId": "rejectProposal",
-        "description": "Records the decision and writes nothing else. `409` when it is decided already.",
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "type": "object"
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Rejected.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RubricProposal"
-                }
-              }
-            }
-          },
-          "400": {
-            "$ref": "#/components/responses/Error"
-          },
-          "401": {
-            "$ref": "#/components/responses/Error"
-          },
-          "404": {
-            "$ref": "#/components/responses/Error"
-          },
-          "409": {
-            "$ref": "#/components/responses/Error"
-          },
-          "415": {
             "$ref": "#/components/responses/Error"
           }
         }
@@ -2635,7 +2525,7 @@
       "get": {
         "summary": "The aggregate over every run",
         "operationId": "getCalibrationSummary",
-        "description": "Every scored calibration job of the repository by the current matcher, and the same broken down by the rubric version the jobs were reviewed against.",
+        "description": "Every scored calibration job of the repository by the current matcher, and the same broken down by the rubric the jobs were reviewed against (`byRubric`: by commit, or by legacy version).",
         "responses": {
           "200": {
             "description": "The summary.",
@@ -2808,9 +2698,7 @@
           "mode",
           "autoReview",
           "trustedReviewers",
-          "styleNotes",
           "evalShare",
-          "styleNotesVersion",
           "prType",
           "maxFanout",
           "incremental",
@@ -2842,21 +2730,11 @@
             },
             "description": "The GitHub logins, in lower case, whose reviews calibration imports and scores the agent against."
           },
-          "styleNotes": {
-            "type": "string",
-            "maxLength": 16384,
-            "description": "What the operator says of how the repository's reviews are written, in markdown, at most 16 KiB: the agent's instructions end with it. Empty for none."
-          },
           "evalShare": {
             "type": "integer",
             "minimum": 0,
             "maximum": 100,
             "description": "The share of pull requests, in percent, whose calibration samples are held out as `eval` (what runs measure by); the rest are the `pool` examples and proposals learn from. 50 by default. A pull request's split is fixed once made, and a later sample of it takes it."
-          },
-          "styleNotesVersion": {
-            "type": "integer",
-            "minimum": 0,
-            "description": "The version of the style notes, 0 before any. Each version records what it was derived from, kept by name across a delete and a registration again; a job records the version its agent was given (`notesVersion`)."
           },
           "prType": {
             "type": [
@@ -2926,6 +2804,7 @@
           "postNote",
           "postedReview",
           "rubricVersion",
+          "rubricSha",
           "directPosts",
           "postDirect",
           "kind",
@@ -3034,7 +2913,7 @@
               "string",
               "null"
             ],
-            "description": "The pull request type the agent said it reviewed: one of the rubric's types, at `rubricVersion`."
+            "description": "The pull request type the agent said it reviewed: one of the rubric's types, at `rubricSha`."
           },
           "attempts": {
             "type": "integer",
@@ -3091,7 +2970,14 @@
               "integer",
               "null"
             ],
-            "description": "The version of the repository's rubric document the review was checked against, recorded with the agent's submission: 0 when the repository had none; null for a job the agent has not reviewed, or one from before rubrics, whose edits are checked against the current rubric."
+            "description": "Legacy: the version of the rubric document, as the platform stored it before rubrics moved to git, that the review was checked against; 0 when the repository had none. Null for every job since, which records `rubricSha`."
+          },
+          "rubricSha": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The commit of the rubrics repository the review is checked against, pinned when the job is queued (a calibration job's when its run is made; a fan-out's sub-runs read their job's): its categories are those of the rubric there. Null for a job not yet queued, for one queued with no rubric (`rubricVersion` 0), and for one from before rubrics moved to git (see `rubricVersion`); a job without one is checked against the rubric in use."
           },
           "directPosts": {
             "type": "integer",
@@ -3126,7 +3012,7 @@
               "null"
             ],
             "minimum": 0,
-            "description": "The version of the style notes the agent was given when it read the job, as `rubricVersion` records the rubric: a score is `derived` when either was derived from its sample's pull request."
+            "description": "Legacy: the version of the style notes the agent was given, as the platform stored them before they moved to the rubrics repository. Null for every job since: the notes are those of `rubricSha`."
           },
           "isolated": {
             "type": [
@@ -3283,7 +3169,7 @@
           "instructions",
           "prTypes",
           "examples",
-          "rubricVersion"
+          "rubricSha"
         ],
         "properties": {
           "jobId": {
@@ -3324,7 +3210,7 @@
           },
           "instructions": {
             "type": "string",
-            "description": "How to review and how to write the review, in markdown, followed by the repository's default rubric when it has one, and then its `styleNotes` when it has them."
+            "description": "How to review and how to write the review, in markdown, followed by the repository's default rubric when it has one, and then its style notes when it has them, both at `rubricSha`."
           },
           "prTypes": {
             "type": "array",
@@ -3341,10 +3227,12 @@
               "$ref": "#/components/schemas/StyleExample"
             }
           },
-          "rubricVersion": {
-            "type": "integer",
-            "minimum": 0,
-            "description": "The version of the rubric document these come from; 0 when the repository has none."
+          "rubricSha": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The commit of the rubrics repository these come from, the one the job was pinned to when it was queued, never a newer head; null when no rubric is configured or there is none for the repository."
           },
           "prType": {
             "type": [
@@ -3503,18 +3391,31 @@
         },
         "description": "Fields this build does not know are kept as they are and written back, a `PUT` of the document included."
       },
-      "RubricDocument": {
+      "RubricView": {
         "type": "object",
         "required": [
           "owner",
           "name",
-          "version",
-          "createdAt",
+          "repository",
+          "branch",
+          "directory",
+          "sha",
+          "headSha",
+          "checkedAt",
+          "error",
+          "exists",
           "defaultRubric",
           "prTypes",
-          "documentError"
+          "fanout",
+          "styleNotes",
+          "files",
+          "treeUrl",
+          "legacyVersion",
+          "derivedFrom",
+          "derivedFromPulls"
         ],
-        "description": "One version of a repository's rubric document. Fields this build does not know are kept as they are and written back, a `PUT` of the document included.",
+        "description": "A repository's rubric as the rubrics repository holds it at one commit. Keys of `rubric.md`'s front matter this build does not know are spread into the object as they are.",
+        "additionalProperties": true,
         "properties": {
           "owner": {
             "type": "string"
@@ -3522,65 +3423,236 @@
           "name": {
             "type": "string"
           },
-          "version": {
-            "type": "integer",
-            "minimum": 0,
-            "description": "1 for the first document and one more for each change; 0 for a repository that has none yet."
+          "repository": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The rubrics repository, `owner/name`; null when none is configured."
           },
-          "createdAt": {
+          "branch": {
+            "type": "string",
+            "description": "The branch read."
+          },
+          "directory": {
+            "type": "string",
+            "description": "The repository's directory in it, `<owner>/<name>`."
+          },
+          "sha": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The commit the rubric is read at: the one in use (`GET …/rubrics`), or the one asked for. Null when there is no rubric at all, with `error` saying why."
+          },
+          "headSha": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`GET …/rubrics` only: the branch head last seen; it differs from `sha` when the head does not parse. Null on `…/commits/{sha}`."
+          },
+          "checkedAt": {
             "type": [
               "string",
               "null"
             ],
             "format": "date-time",
-            "description": "When this version was written; null for version 0."
+            "description": "When the head was last read."
+          },
+          "error": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "`GET …/rubrics`: why the head is not the commit in use (it does not parse), or why there is no rubric at all (an empty repository, a missing branch, none configured). `…/commits/{sha}`: why that commit does not parse.",
+            "required": [
+              "file",
+              "line",
+              "message"
+            ],
+            "properties": {
+              "file": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "The file at fault, a path in the rubrics repository."
+              },
+              "line": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "description": "Its line, 1-based."
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          },
+          "exists": {
+            "type": "boolean",
+            "description": "Whether the directory exists at `sha`; false: no rubric there, and the rubric is empty."
           },
           "defaultRubric": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "How to review any pull request of the repository, in markdown; given to the agent in its `instructions`. At most 65536 bytes. Null only with `documentError`."
+            "type": "string",
+            "description": "The body of `rubric.md`, in markdown: how to review any pull request of the repository."
           },
           "prTypes": {
-            "oneOf": [
-              {
-                "type": "array",
-                "maxItems": 50,
-                "items": {
-                  "$ref": "#/components/schemas/PrType"
-                }
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "description": "The kinds of pull request the repository's reviews tell apart. Null only with `documentError`."
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PrType"
+            },
+            "description": "The types, from `types/<type>.md`, in the order `rubric.md`'s `types` gives (the rest by name)."
           },
-          "documentError": {
+          "fanout": {
+            "type": "boolean",
+            "description": "`rubric.md`'s `fanout`: whether every review fans out, over the fixed type's categories (`prType`) — of every type, when it fixes none — and the default rubric. Absent is false."
+          },
+          "styleNotes": {
+            "type": "string",
+            "description": "`style.md`: how the repository's reviews are written, in markdown; the agent's instructions end with it. Empty for none."
+          },
+          "files": {
+            "type": "array",
+            "description": "The files of the directory at `sha`.",
+            "items": {
+              "type": "object",
+              "required": [
+                "path",
+                "url",
+                "editUrl"
+              ],
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "description": "In the rubrics repository, e.g. `acme/widgets/rubric.md`."
+                },
+                "url": {
+                  "type": "string",
+                  "description": "`https://github.com/<repository>/blob/<sha>/<path>`."
+                },
+                "editUrl": {
+                  "type": "string",
+                  "description": "`https://github.com/<repository>/edit/<branch>/<path>`: where to change it."
+                }
+              }
+            }
+          },
+          "treeUrl": {
             "type": [
               "string",
               "null"
             ],
-            "description": "Why this build cannot read the stored document, when it cannot. The agent API then refuses the repository's reviews (`409`) rather than review without the rubric."
+            "description": "`https://github.com/<repository>/tree/<branch>/<directory>`."
+          },
+          "legacyVersion": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "The rubric version, as the platform stored it before rubrics moved to git, that this commit was exported from, if any."
           },
           "derivedFrom": {
             "type": "array",
             "items": {
               "type": "string"
             },
-            "description": "The calibration samples the version was derived from: those of the rubric proposal it came from (by accepting it, or a `PUT` with `fromProposal`), and every earlier version's. Ignored when sent back with a `PUT`."
+            "description": "The calibration samples this rubric was derived from: those of the merged rubric proposals that reached it."
           },
           "derivedFromPulls": {
             "type": "array",
             "items": {
               "type": "string"
             },
-            "description": "The pull requests (`owner/name#pr`) it was derived from: those its proposal's context drew on — misses, unmatched comments, people's edits — and every earlier version's. A score of any sample of them, under this version, is `derived`. Ignored when sent back."
+            "description": "The pull requests (`owner/name#pr`) it was derived from. A score of any sample of them, under this rubric, is `derived`."
+          }
+        }
+      },
+      "RubricCommit": {
+        "type": "object",
+        "required": [
+          "sha",
+          "message",
+          "author",
+          "authorLogin",
+          "date",
+          "url",
+          "legacyVersion"
+        ],
+        "description": "A commit of the rubrics repository that touches a repository's directory.",
+        "properties": {
+          "sha": {
+            "type": "string"
           },
-          "fanout": {
-            "type": "boolean",
-            "description": "Whether every review of the repository fans out: one sub-run per category of the repository's fixed type (`prType`) — of every type, when it fixes none — and one by the default rubric. Absent is false."
+          "message": {
+            "type": "string"
+          },
+          "author": {
+            "type": "string",
+            "description": "The author's name, as git records it."
+          },
+          "authorLogin": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Their GitHub login, when GitHub knows it."
+          },
+          "date": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "url": {
+            "type": "string",
+            "description": "The commit on GitHub."
+          },
+          "legacyVersion": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "The legacy rubric version the commit was exported from, if any."
+          }
+        }
+      },
+      "RubricCompare": {
+        "type": "object",
+        "required": [
+          "base",
+          "head",
+          "url",
+          "diff",
+          "diffError"
+        ],
+        "properties": {
+          "base": {
+            "type": "string"
+          },
+          "head": {
+            "type": "string"
+          },
+          "url": {
+            "type": "string",
+            "description": "`https://github.com/<repository>/compare/<base>...<head>`."
+          },
+          "diff": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/RubricProposalDiff"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "What `head` changes of `base`, style notes included; null with `diffError` when either does not parse."
+          },
+          "diffError": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         }
       },
@@ -4372,7 +4444,7 @@
           },
           "derivedScores": {
             "type": "integer",
-            "description": "Scores whose sample's pull request the rubric version or the style notes version they were made under was derived from; left out unless `?derived=include`."
+            "description": "Scores whose sample's pull request the rubric they were made under (its commit, or a legacy rubric or style notes version) was derived from; left out unless `?derived=include`."
           },
           "derivedIncluded": {
             "type": "boolean"
@@ -4443,6 +4515,7 @@
                 "status",
                 "error",
                 "rubricVersion",
+                "rubricSha",
                 "prType",
                 "sample",
                 "score",
@@ -4465,7 +4538,15 @@
                   "type": [
                     "integer",
                     "null"
-                  ]
+                  ],
+                  "description": "The job's legacy `rubricVersion`."
+                },
+                "rubricSha": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "The job's `rubricSha`."
                 },
                 "prType": {
                   "type": [
@@ -4544,7 +4625,7 @@
           "runs",
           "samples",
           "overall",
-          "byRubricVersion"
+          "byRubric"
         ],
         "properties": {
           "owner": {
@@ -4563,22 +4644,30 @@
             "$ref": "#/components/schemas/CalibrationAggregate",
             "description": "Of every scored job whose sample is not deleted."
           },
-          "byRubricVersion": {
+          "byRubric": {
             "type": "array",
-            "description": "Newest rubric version first.",
+            "description": "By the rubric the jobs were reviewed against: one entry per rubric commit, newest first, then one per legacy rubric version, newest first, then the jobs that recorded neither.",
             "items": {
               "type": "object",
               "required": [
+                "rubricSha",
                 "rubricVersion",
                 "aggregate"
               ],
               "properties": {
+                "rubricSha": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "The rubric commit the jobs were reviewed against; null for a legacy entry."
+                },
                 "rubricVersion": {
                   "type": [
                     "integer",
                     "null"
                   ],
-                  "description": "The rubric version the jobs were reviewed against; 0 for none."
+                  "description": "Legacy: the rubric version the jobs were reviewed against, for jobs from before rubrics moved to git (0 for none); null with a `rubricSha`."
                 },
                 "aggregate": {
                   "$ref": "#/components/schemas/CalibrationAggregate"
@@ -4616,12 +4705,13 @@
         "type": "object",
         "required": [
           "defaultRubric",
+          "fanout",
           "typesAdded",
           "typesRemoved",
           "typesChanged",
           "styleNotes"
         ],
-        "description": "What a proposal changes of the rubric version it was written from, and of the style notes the repository had when it was submitted.",
+        "description": "What a rubric changes of another: a proposal of the commit it was written from, or one commit of another (`…/rubrics/compare`). Style notes included.",
         "properties": {
           "defaultRubric": {
             "type": [
@@ -4755,7 +4845,7 @@
               "object",
               "null"
             ],
-            "description": "Null when the proposal proposes no style notes, or the same.",
+            "description": "`{before, after}`, or null when unchanged (or, for a proposal, when it proposes none).",
             "properties": {
               "before": {
                 "type": "string"
@@ -4790,14 +4880,16 @@
           "name",
           "jobId",
           "status",
-          "baseVersion",
-          "currentVersion",
-          "rebaseNeeded",
+          "baseSha",
+          "currentSha",
           "rationale",
           "proposesStyleNotes",
           "createdAt",
           "decidedAt",
-          "acceptedVersion"
+          "branch",
+          "pullRequest",
+          "prError",
+          "mergeSha"
         ],
         "properties": {
           "id": {
@@ -4819,21 +4911,22 @@
               "pending",
               "accepted",
               "rejected"
-            ]
+            ],
+            "description": "Follows its pull request: `pending` while it is open or not opened yet, `accepted` once merged, `rejected` once closed unmerged."
           },
-          "baseVersion": {
-            "type": "integer",
-            "minimum": 0,
-            "description": "The rubric version it was written from; 0 for none."
+          "baseSha": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The rubric commit it was written from (its job's `rubricSha`); null when there was none."
           },
-          "currentVersion": {
-            "type": "integer",
-            "minimum": 0,
-            "description": "The rubric's version now."
-          },
-          "rebaseNeeded": {
-            "type": "boolean",
-            "description": "Pending, and the rubric has moved since its base: accepting it is a `409`; rebase it in the editor."
+          "currentSha": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The rubric commit in use now."
           },
           "rationale": {
             "type": "string",
@@ -4851,21 +4944,61 @@
               "string",
               "null"
             ],
-            "format": "date-time"
+            "format": "date-time",
+            "description": "When its pull request was merged or closed."
           },
-          "acceptedVersion": {
+          "branch": {
+            "type": "string",
+            "description": "The branch of the rubrics repository it is written on."
+          },
+          "pullRequest": {
             "type": [
-              "integer",
+              "object",
               "null"
             ],
-            "description": "The rubric version accepting it wrote."
+            "description": "Its pull request on the rubrics repository; null until opened.",
+            "required": [
+              "number",
+              "url",
+              "state"
+            ],
+            "properties": {
+              "number": {
+                "type": "integer"
+              },
+              "url": {
+                "type": "string"
+              },
+              "state": {
+                "type": "string",
+                "enum": [
+                  "open",
+                  "merged",
+                  "closed"
+                ]
+              }
+            }
+          },
+          "prError": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why the pull request could not be opened yet; it is tried again."
+          },
+          "mergeSha": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The commit merging it, once merged."
           },
           "document": {
             "type": [
               "object",
               "null"
             ],
-            "description": "Only in the answer for one proposal: the proposed document; null with `documentError` when this build cannot read it.",
+            "description": "The proposed rubric; null with `documentError` when this build cannot read it.",
             "properties": {
               "defaultRubric": {
                 "type": "string"
@@ -4875,6 +5008,9 @@
                 "items": {
                   "$ref": "#/components/schemas/PrType"
                 }
+              },
+              "fanout": {
+                "type": "boolean"
               }
             }
           },
@@ -4889,14 +5025,14 @@
               "string",
               "null"
             ],
-            "description": "Only in the answer for one: the style notes it proposes, or null for none."
+            "description": "The style notes it proposes, or null for none."
           },
           "baseStyleNotes": {
             "type": [
               "string",
               "null"
             ],
-            "description": "The repository's style notes when it was submitted, when it proposes some."
+            "description": "The style notes at `baseSha`, when it proposes some."
           },
           "diff": {
             "oneOf": [
@@ -4907,7 +5043,7 @@
                 "type": "null"
               }
             ],
-            "description": "Only in the answer for one: against its base; null with `diffError` when either cannot be read."
+            "description": "Against the rubric at `baseSha`; null with `diffError` when either cannot be read."
           },
           "diffError": {
             "type": [
@@ -4915,7 +5051,8 @@
               "null"
             ]
           }
-        }
+        },
+        "description": "A rubric an agent proposed, as a pull request on the rubrics repository. `document`, `documentError`, `styleNotes`, `baseStyleNotes`, `diff` and `diffError` only in the answer for one."
       },
       "ProposalContext": {
         "type": "object",
@@ -4951,15 +5088,16 @@
             "description": "The task, that the proposal is advisory, that everything else in the context is untrusted data and never instructions, and what to submit, in markdown."
           },
           "rubric": {
-            "$ref": "#/components/schemas/RubricDocument",
-            "description": "The current rubric, with its `version` (0 for none): what `baseVersion` names."
+            "$ref": "#/components/schemas/RubricView",
+            "description": "The rubric at the job's pinned commit (`sha`): what the proposal is written from."
           },
           "styleNotes": {
-            "type": "string"
+            "type": "string",
+            "description": "The style notes at the pinned commit."
           },
           "calibration": {
             "$ref": "#/components/schemas/CalibrationSummary",
-            "description": "Calibration's aggregates of the `pool` samples of pull requests with no `eval` sample — overall, by category, by severity and by rubric version — never of what calibration measures by."
+            "description": "Calibration's aggregates of the `pool` samples of pull requests with no `eval` sample — overall, by category, by severity and by rubric — never of what calibration measures by."
           },
           "missedHuman": {
             "type": "array",

@@ -1,7 +1,8 @@
 import { renderToStaticMarkup } from "react-dom/server";
+import { MemoryRouter } from "react-router-dom";
 import { describe, expect, it } from "vitest";
 import type { RubricProposal, RubricProposalDiff } from "../api";
-import { Decide } from "../pages/Proposals";
+import { ProposalPull, PullLink } from "../pages/Proposals";
 import { ProposalDiffView, ProposedDocumentView, Rationale, StyleNotesDiff } from "./Proposal";
 
 const diff: RubricProposalDiff = {
@@ -180,75 +181,71 @@ describe("Rationale", () => {
   });
 });
 
-describe("Decide", () => {
+describe("ProposalPull", () => {
   const p: RubricProposal = {
     id: "p1",
     owner: "o",
     name: "n",
     jobId: "j1",
     status: "pending",
-    baseVersion: 2,
-    currentVersion: 2,
-    rebaseNeeded: false,
+    baseSha: "1111111111111111111111111111111111111111",
+    currentSha: "1111111111111111111111111111111111111111",
     rationale: "",
     proposesStyleNotes: true,
     createdAt: "t",
     decidedAt: null,
-    acceptedVersion: null,
-    document: { defaultRubric: "No sorry.", prTypes: [] },
+    branch: "proposals/o/n/p1",
+    pullRequest: {
+      number: 12,
+      url: "https://github.com/chrisflav/review-rubrics/pull/12",
+      state: "open",
+    },
+    prError: null,
+    mergeSha: null,
   };
-  const render = (q: RubricProposal, applyNotes = false) =>
+  // The links are the router's: rendered inside one.
+  const render = (q: RubricProposal) =>
     renderToStaticMarkup(
-      <Decide
-        p={q}
-        applyNotes={applyNotes}
-        setApplyNotes={() => {}}
-        busy={false}
-        onAccept={() => {}}
-        onReject={() => {}}
-      />,
+      <MemoryRouter>
+        <ProposalPull p={q} />
+      </MemoryRouter>,
     );
 
-  it("offers the style notes unticked, when the proposal has some", () => {
+  it("links its pull request, and names its branch and base", () => {
     const html = render(p);
-    expect(html).toContain("Also apply the style notes");
-    expect(html).toMatch(/<input type="checkbox" name="apply-style-notes"\/>/);
-    expect(html).toContain("Accept as rubric version 3");
-    expect(html).not.toContain("with the style notes");
+    expect(html).toContain('href="https://github.com/chrisflav/review-rubrics/pull/12"');
+    expect(html).toContain("#12");
+    expect(html).toContain("open");
+    expect(html).toContain("proposals/o/n/p1");
+    expect(html).toContain('href="/repos/o/n/rubric?sha=1111111111111111111111111111111111111111"');
+    expect(html).toContain(">1111111<");
+    // It is decided on GitHub: nothing here accepts or rejects it.
+    expect(html).not.toMatch(/<button/);
   });
 
-  it("says so on the button once ticked", () => {
-    const html = render(p, true);
-    expect(html).toMatch(/name="apply-style-notes" checked=""/);
-    expect(html).toContain("with the style notes");
+  it("says why the pull request could not be opened yet", () => {
+    const html = render({ ...p, pullRequest: null, prError: "GitHub answered 403" });
+    expect(html).toContain("could not be opened yet");
+    expect(html).toContain("GitHub answered 403");
   });
 
-  it("does not offer notes a proposal does not have", () => {
-    expect(render({ ...p, proposesStyleNotes: false })).not.toContain("style notes");
+  it("shows the commit a merged one made", () => {
+    const merged = {
+      ...p,
+      status: "accepted",
+      pullRequest: { ...p.pullRequest!, state: "merged" },
+      mergeSha: "2222222222222222222222222222222222222222",
+    };
+    const html = render(merged);
+    expect(html).toContain("Merged as");
+    expect(html).toContain(">2222222<");
+    expect(html).toContain("the proposal is accepted");
   });
 
-  it("offers to edit before accepting, in the rubric editor, when it can be adopted", () => {
-    const html = renderToStaticMarkup(
-      <Decide
-        p={p}
-        applyNotes={false}
-        setApplyNotes={() => {}}
-        busy={false}
-        onAccept={() => {}}
-        onReject={() => {}}
-        onEdit={() => {}}
-      />,
-    );
-    expect(html).toContain("Edit before accepting");
-    expect(html).toContain("rubric editor");
-    expect(render(p)).not.toContain("Edit before accepting");
-  });
-
-  it("does not offer to accept what cannot be shown", () => {
-    const unseen = render({ ...p, document: null, diff: null, diffError: "unreadable" });
-    expect(unseen).toMatch(/<button type="button" disabled="">Accept/);
-    expect(unseen).toContain("cannot be accepted from this page");
-    // The document alone is enough: the page shows it in full.
-    expect(render({ ...p, diff: null, diffError: "unreadable" })).not.toContain("disabled");
+  it("never links a pull request address that is not GitHub's", () => {
+    const pullRequest = { number: 3, url: "javascript:alert(1)", state: "open" };
+    const html = renderToStaticMarkup(<PullLink p={{ pullRequest, prError: null }} />);
+    expect(html).not.toContain("href");
+    expect(html).toContain("#3");
   });
 });

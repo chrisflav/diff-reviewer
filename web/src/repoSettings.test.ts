@@ -5,8 +5,6 @@ import {
   evalShareProblem,
   formOf,
   formProblem,
-  MAX_STYLE_NOTES_BYTES,
-  notesProblem,
   loginProblem,
   mergeRepoSettings,
   onlyAutoReviewChanged,
@@ -21,7 +19,6 @@ const form = (over: Partial<RepoForm> = {}): RepoForm => ({
   mode: "staged",
   autoReview: false,
   trustedReviewers: ["alice", "bob"],
-  styleNotes: "",
   evalShare: 50,
   ...over,
 });
@@ -170,77 +167,42 @@ describe("openConflicts", () => {
   });
 });
 
-describe("style notes and the share held out", () => {
+describe("the share held out", () => {
   const repo: Repo = {
     owner: "o",
     name: "n",
     mode: "staged",
     autoReview: false,
     trustedReviewers: ["alice"],
-    styleNotes: "Be brief.",
     evalShare: 30,
-    styleNotesVersion: 2,
     version: 7,
     createdAt: "2026-01-01T00:00:00Z",
   };
 
-  it("reads them into the form, and defaults them from an older server", () => {
-    expect(formOf(repo)).toMatchObject({ styleNotes: "Be brief.", evalShare: 30 });
+  it("is read into the form, and defaulted from an older server", () => {
+    expect(formOf(repo)).toMatchObject({ evalShare: 30 });
     const old: Repo = { ...repo };
-    delete old.styleNotes;
     delete old.evalShare;
-    expect(formOf(old)).toMatchObject({ styleNotes: "", evalShare: 50 });
+    expect(formOf(old)).toMatchObject({ evalShare: 50 });
   });
 
-  it("sends them with the version read, and never the notes' version", () => {
-    const b = putBody(repo, { ...formOf(repo), styleNotes: "", evalShare: 0 });
-    expect(b).toEqual({
+  it("is sent with the version read, and not to a server that does not know it", () => {
+    expect(putBody(repo, { ...formOf(repo), evalShare: 0 })).toEqual({
       mode: "staged",
       autoReview: false,
       trustedReviewers: ["alice"],
-      styleNotes: "",
       evalShare: 0,
       version: 7,
     });
-  });
-
-  it("names the proposal the notes were taken from, when they were", () => {
-    const taken = { ...formOf(repo), styleNotes: "Be briefer." };
-    expect(putBody(repo, taken, "p1")).toMatchObject({ fromProposal: "p1" });
-    expect(putBody(repo, taken)).not.toHaveProperty("fromProposal");
-  });
-
-  it("does not name the proposal when the notes saved are those read", () => {
-    // Nothing of the proposal is kept, and naming it would accept it, its rubric unwritten.
-    expect(putBody(repo, { ...formOf(repo), evalShare: 40 }, "p1")).not.toHaveProperty(
-      "fromProposal",
-    );
+    const old: Repo = { ...repo };
+    delete old.evalShare;
+    expect(putBody(old, formOf(old))).not.toHaveProperty("evalShare");
   });
 
   it("tells a 409 for something else from one for a newer version", () => {
-    const why = "'fromProposal': proposal p1 was rejected";
+    const why = "the repository is being deleted";
     expect(saveRefusal(7, repo, why)).toBe(why);
     expect(saveRefusal(6, repo, why)).toBeNull();
-  });
-
-  it("sends neither to a server that does not know them", () => {
-    const old: Repo = { ...repo };
-    delete old.styleNotes;
-    delete old.evalShare;
-    delete old.styleNotesVersion;
-    const b = putBody(old, formOf(old));
-    expect(b).not.toHaveProperty("styleNotes");
-    expect(b).not.toHaveProperty("evalShare");
-  });
-
-  it("checks the notes' size in bytes of UTF-8, as the server does", () => {
-    expect(notesProblem("x".repeat(MAX_STYLE_NOTES_BYTES))).toBeNull();
-    expect(notesProblem("x".repeat(MAX_STYLE_NOTES_BYTES + 1))).not.toBeNull();
-    // Two bytes each: half as many characters fit.
-    expect(notesProblem("é".repeat(MAX_STYLE_NOTES_BYTES / 2 + 1))).not.toBeNull();
-    expect(formProblem(form({ styleNotes: "x".repeat(MAX_STYLE_NOTES_BYTES + 1) }))).toContain(
-      "bytes",
-    );
   });
 
   it("takes a whole percent from 0 to 100", () => {
@@ -253,28 +215,35 @@ describe("style notes and the share held out", () => {
     expect(formProblem(form({ evalShare: 101 }))).not.toBeNull();
   });
 
-  it("merges the notes as one text: one side's change is taken", () => {
-    const base = form({ styleNotes: "a" });
-    const m = mergeRepoSettings(
-      base,
-      form({ styleNotes: "b" }),
-      form({ styleNotes: "a", evalShare: 20 }),
-    );
-    expect(m.conflicts).toEqual([]);
-    expect(m.form).toMatchObject({ styleNotes: "b", evalShare: 20 });
+  it("merges: one side's change is taken; both sides' different changes are asked", () => {
+    const one = mergeRepoSettings(form(), form({ autoReview: true }), form({ evalShare: 20 }));
+    expect(one.conflicts).toEqual([]);
+    expect(one.form).toMatchObject({ autoReview: true, evalShare: 20 });
+    const m = mergeRepoSettings(form(), form({ evalShare: 40 }), form({ evalShare: 60 }));
+    expect(m.conflicts).toEqual([{ field: "evalShare", mine: 40, theirs: 60 }]);
+    expect(m.form.evalShare).toBe(60);
+    expect(resolveRepoConflict(m.form, m.conflicts[0]!, "mine").evalShare).toBe(40);
   });
+});
 
-  it("asks when both sides changed the notes or the share differently", () => {
-    const base = form({ styleNotes: "a", evalShare: 50 });
-    const mine = form({ styleNotes: "b", evalShare: 40 });
-    const theirs = form({ styleNotes: "c", evalShare: 60 });
-    const m = mergeRepoSettings(base, mine, theirs);
-    expect(m.conflicts).toEqual([
-      { field: "styleNotes", mine: "b", theirs: "c" },
-      { field: "evalShare", mine: 40, theirs: 60 },
-    ]);
-    expect(m.form).toMatchObject({ styleNotes: "c", evalShare: 60 });
-    const picked = resolveRepoConflict(m.form, m.conflicts[0]!, "mine");
-    expect(picked.styleNotes).toBe("b");
+describe("style notes, which live in the rubrics repository", () => {
+  it("are never sent back, nor the proposal they were taken from: the server refuses them", () => {
+    // As a server older than API 1.0.0 sent them.
+    const old: Repo = {
+      owner: "o",
+      name: "n",
+      mode: "staged",
+      autoReview: false,
+      trustedReviewers: ["alice"],
+      styleNotes: "Be brief.",
+      styleNotesVersion: 2,
+      version: 7,
+      createdAt: "2026-01-01T00:00:00Z",
+    };
+    const b = putBody(old, formOf(old));
+    expect(b).not.toHaveProperty("styleNotes");
+    expect(b).not.toHaveProperty("styleNotesVersion");
+    expect(b).not.toHaveProperty("fromProposal");
+    expect(formOf(old)).not.toHaveProperty("styleNotes");
   });
 });

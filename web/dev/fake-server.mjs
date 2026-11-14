@@ -16,11 +16,15 @@
  *
  * A claim (a post that may have reached GitHub) is settled by "Check GitHub" as found, posted.
  *
- * Rubrics are versioned per repository as the real server keeps them (`chrisflav/diff-reviewer`
- * has two versions; `chrisflav/unreadable` has one this build "cannot read"), and every write of
- * a job's review is kept in its history. To try a 409 on the rubric page, save from another tab:
+ * Rubrics live in a fake rubrics repository (`chrisflav/review-rubrics`), as the real server reads
+ * them from GitHub: `chrisflav/diff-reviewer` has three commits (the first exported from the old
+ * version 1), and the head of `chrisflav/unreadable` does not parse, so its last good commit is in
+ * use. Every write of a job's review is kept in its history. To change the rubrics:
  *
- *     curl -X POST 127.0.0.1:8091/__fake/rubric-bump    # someone else saves a new version
+ *     curl -X POST 127.0.0.1:8091/__fake/rubric-bump    # someone else commits a change
+ *     curl -X POST 127.0.0.1:8091/__fake/rubric-break   # a commit that does not parse
+ *     curl -X POST 127.0.0.1:8091/__fake/notes-bump     # someone else changes style.md
+ *     curl -X POST '127.0.0.1:8091/__fake/rubrics-repo?configured=0' # no rubrics repository
  *
  * The repository settings are versioned too, and `chrisflav/diff-reviewer` has calibration data:
  * samples (one deleted, one whose score is stale), an import that went through, and runs over a
@@ -30,23 +34,24 @@
  *     curl -X POST 127.0.0.1:8091/__fake/repo-bump       # someone else changes the settings
  *     curl -X POST '127.0.0.1:8091/__fake/calibration-cap?charged=20' # the daily cap is reached
  *
- * API 0.6.0: the settings carry style notes (versioned) and the share held out; every sample is
- * `eval` or `pool`; rubric version 2 was made from an accepted proposal, so the scores of its pull
- * requests under it are derived. Rubric proposals: one accepted, one rejected and one pending,
- * written from version 1 (so accepting it is a 409, and it is rebased in the editor). Asking for
- * another is a 409 while it is pending; past two a day, a 429. A job asked for is written by:
+ * Every sample is `eval` or `pool`; commit c2 was merged from a proposal, so the scores of its
+ * pull requests under it are derived. Rubric proposals are pull requests on the rubrics
+ * repository: one merged, one closed and one open. Asking for another is a 409 while one is
+ * pending; past two a day, a 429. A job asked for is written, and its pull request moved, by:
  *
- *     curl -X POST 127.0.0.1:8091/__fake/proposal-write  # the live job submits, at the current version
- *     curl -X POST 127.0.0.1:8091/__fake/notes-bump      # someone else changes the style notes
+ *     curl -X POST 127.0.0.1:8091/__fake/proposal-write  # the job submits; its PR fails to open
+ *     curl -X POST '127.0.0.1:8091/__fake/proposal-pr?state=open'   # or merged, or closed
  */
 
 import { createServer } from "node:http";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 
 const port = Number(process.env.PORT ?? 8091);
 let signedIn = true;
 let delay = 0;
 const now = () => new Date().toISOString();
+/** A commit id of the fake rubrics repository: 40 hex digits, fixed by `seed`. */
+const fakeSha = (seed) => createHash("sha1").update(String(seed)).digest("hex");
 
 const big = Array.from({ length: 450 }, (_, i) => `+export const n${i} = ${i};`).join("\n");
 
@@ -201,8 +206,13 @@ for (const [id, status, prNumber, r] of [
     prBody: "Adds `dismiss`.\n\n<script>alert('a PR body is text')</script>",
     error: status === "failed" ? "the run ended without a submission" : null,
     prType: status === "failed" ? null : "feature",
-    rubricVersion: status === "failed" ? null : status === "posted" ? 1 : 2,
-    notesVersion: status === "failed" ? null : 1,
+    // The posted job is from before the rubrics repository: a legacy version, no commit.
+    rubricSha:
+      status === "failed" || status === "posted"
+        ? null
+        : fakeSha(status === "draft" ? "c3" : "c2"),
+    rubricVersion: status === "posted" ? 1 : null,
+    notesVersion: status === "posted" ? 1 : null,
     directPosts: 0,
     postDirect: false,
     attempts: status === "failed" ? 2 : 1,
@@ -243,7 +253,9 @@ function revision(job, version, author, r) {
   };
 }
 
-// The rubric versions of each repository, oldest first.
+// The rubrics repository: one GitHub repository, a directory `<owner>/<name>` per repository
+// (`rubric.md`, `types/<type>.md`, `style.md`). Its commits, oldest first, each touching one
+// directory: a document, or `doc: null` with the `error` it does not parse with.
 const featureType = {
   name: "feature",
   description: "Adds new definitions or theorems.",
@@ -254,144 +266,240 @@ const featureType = {
     { name: "naming", description: "Against the naming convention." },
     { name: "style", description: "Formatting and layout." },
   ],
-  // A field a newer front-end wrote: kept through every save.
+  // Front matter a newer build reads: shown as it is.
   colour: "green",
 };
-const rubrics = new Map([
-  [
-    "chrisflav/diff-reviewer",
-    [
+const union = (a, b) => [...new Set([...a, ...b])];
+const day = 86400000;
+const rubricsRepo = "chrisflav/review-rubrics";
+// `/__fake/rubrics-repo?configured=0` turns the rubrics repository off.
+let rubricsConfigured = true;
+let rubricsCheckedAt = now();
+const rubricCommits = [];
+const emptyDoc = { defaultRubric: "", prTypes: [], fanout: false, styleNotes: "" };
+
+/** The commit of `dir` that is newest at global index `i` (inclusive), or undefined. */
+function dirAt(dir, i) {
+  for (let k = Math.min(i, rubricCommits.length - 1); k >= 0; k--)
+    if (rubricCommits[k].dir === dir) return rubricCommits[k];
+  return undefined;
+}
+
+/** Add a commit touching `dir`; its provenance is the last one's and `more`. */
+function commitRubric(dir, doc, meta, more = { samples: [], prs: [] }, error = null) {
+  const last = dirAt(dir, rubricCommits.length - 1);
+  const c = {
+    sha: fakeSha(meta.id ?? `${dir}:${rubricCommits.length}:${Date.now()}`),
+    dir,
+    message: meta.message,
+    author: meta.author ?? "Kim",
+    authorLogin: meta.authorLogin === undefined ? "kim" : meta.authorLogin,
+    date: meta.date ?? now(),
+    legacyVersion: meta.legacyVersion ?? null,
+    doc,
+    error,
+    derivedFrom: union(last?.derivedFrom ?? [], more.samples),
+    derivedFromPulls: union(last?.derivedFromPulls ?? [], more.prs),
+  };
+  rubricCommits.push(c);
+  rubricsCheckedAt = now();
+  return c;
+}
+
+const ago = (days) => new Date(Date.now() - days * day).toISOString();
+const v1Doc = {
+  defaultRubric: "Proofs must not use `sorry`.",
+  prTypes: [featureType],
+  fanout: false,
+  styleNotes: "One sentence a comment.\nNo praise.",
+};
+commitRubric(
+  "chrisflav/unreadable",
+  { ...emptyDoc, defaultRubric: "Nothing special." },
+  { id: "u1", message: "Add a rubric for chrisflav/unreadable", date: ago(8) },
+);
+commitRubric("chrisflav/diff-reviewer", v1Doc, {
+  id: "c1",
+  message: "Export rubric version 1 of chrisflav/diff-reviewer\n\nFrom the platform's database.",
+  author: "diff-reviewer",
+  authorLogin: null,
+  date: ago(7),
+  legacyVersion: 1,
+});
+commitRubric(
+  "chrisflav/diff-reviewer",
+  {
+    ...v1Doc,
+    defaultRubric: "Proofs must not use `sorry`.\nPrefer `simp only` in the middle of a proof.",
+    prTypes: [
       {
-        createdAt: now(),
-        doc: { defaultRubric: "Proofs must not use `sorry`.", prTypes: [featureType] },
+        ...featureType,
+        categories: [
+          ...featureType.categories,
+          { name: "docs", description: "Missing documentation." },
+        ],
       },
       {
-        createdAt: now(),
-        doc: {
-          defaultRubric:
-            "Proofs must not use `sorry`.\nPrefer `simp only` in the middle of a proof.",
-          prTypes: [
-            {
-              ...featureType,
-              categories: [
-                ...featureType.categories,
-                { name: "docs", description: "Missing documentation." },
-              ],
-            },
-            {
-              name: "refactor",
-              description: "Moves or renames without changing what is proved.",
-              rubric: "Check that nothing is lost and that deprecations are added.",
-              categories: [],
-            },
-          ],
-          reviewers: ["kim"],
-        },
-        // Made from proposal p-accepted: what its context drew on.
-        derivedFrom: ["s-04", "s-05"],
-        derivedFromPulls: ["chrisflav/diff-reviewer#104", "chrisflav/diff-reviewer#105"],
+        name: "refactor",
+        description: "Moves or renames without changing what is proved.",
+        rubric: "Check that nothing is lost and that deprecations are added.",
+        categories: [],
       },
     ],
-  ],
-  [
-    "chrisflav/unreadable",
-    [{ createdAt: now(), doc: null, documentError: "unknown field type 'weights'" }],
-  ],
-]);
+    reviewers: ["kim"],
+  },
+  { id: "c2", message: "Add a docs category (#3)\n\nProposal p-accepted.", date: ago(4) },
+  {
+    samples: ["s-04", "s-05"],
+    prs: ["chrisflav/diff-reviewer#104", "chrisflav/diff-reviewer#105"],
+  },
+);
+commitRubric(
+  "chrisflav/unreadable",
+  null,
+  { id: "u2", message: "Weigh the categories", date: ago(2) },
+  undefined,
+  {
+    file: "chrisflav/unreadable/types/feature.md",
+    line: 4,
+    message: "'categories' must map each name to a description, not to a number",
+  },
+);
+{
+  const c2 = rubricCommits.find((c) => c.sha === fakeSha("c2"));
+  const doc = structuredClone(c2.doc);
+  doc.styleNotes += "\nSuggest a fix, do not ask a question.";
+  doc.prTypes[1].fanout = true;
+  commitRubric("chrisflav/diff-reviewer", doc, {
+    id: "c3",
+    message: "Suggest, don't ask; fan refactors out",
+    author: "Alice",
+    authorLogin: "alice",
+    date: ago(1),
+  });
+}
 
-function rubricVersion(owner, name, i) {
-  const vs = rubrics.get(`${owner}/${name}`) ?? [];
-  const v = vs[i];
-  if (v === undefined)
-    return {
-      owner,
-      name,
-      version: 0,
-      createdAt: null,
-      defaultRubric: "",
-      prTypes: [],
-      documentError: null,
-    };
-  if (v.doc === null)
-    return {
-      owner,
-      name,
-      version: i + 1,
-      createdAt: v.createdAt,
-      defaultRubric: null,
-      prTypes: null,
-      documentError: v.documentError,
-    };
-  return {
-    ...v.doc,
+const commitIndex = (sha) => rubricCommits.findIndex((c) => c.sha === sha);
+
+/**
+ * The commit a repository's rubric is in use at: the newest at which its directory parses, and
+ * why the head is not that commit (its directory does not parse there).
+ */
+function rubricInUse(dir) {
+  const head = rubricCommits.length - 1;
+  const last = dirAt(dir, head);
+  if (last === undefined || last.doc !== null) return { index: head, error: null };
+  // The head's directory does not parse: the commit before the one that broke it.
+  let k = commitIndex(last.sha) - 1;
+  while (k >= 0 && dirAt(dir, k) !== undefined && dirAt(dir, k).doc === null)
+    k = commitIndex(dirAt(dir, k).sha) - 1;
+  return { index: k, error: last.error };
+}
+
+/** `RubricView`: the rubric of `owner/name` at global commit `i`, read as the server reads it. */
+function rubricView(owner, name, i, extra = {}) {
+  const dir = `${owner}/${name}`;
+  const out = {
     owner,
     name,
-    version: i + 1,
-    createdAt: v.createdAt,
-    documentError: null,
-    derivedFrom: v.derivedFrom ?? [],
-    derivedFromPulls: v.derivedFromPulls ?? [],
+    repository: rubricsConfigured ? rubricsRepo : null,
+    branch: "main",
+    directory: dir,
+    sha: null,
+    headSha: null,
+    checkedAt: rubricsConfigured ? rubricsCheckedAt : null,
+    error: null,
+    exists: false,
+    ...emptyDoc,
+    files: [],
+    treeUrl: null,
+    legacyVersion: null,
+    derivedFrom: [],
+    derivedFromPulls: [],
+    ...extra,
+  };
+  if (!rubricsConfigured)
+    return {
+      ...out,
+      error: { file: null, line: null, message: "no rubrics repository is configured" },
+    };
+  if (i < 0) return out;
+  const at = rubricCommits[i];
+  const c = dirAt(dir, i);
+  const gh = `https://github.com/${rubricsRepo}`;
+  const atHead = dirAt(dir, rubricCommits.length - 1);
+  out.sha = at.sha;
+  out.treeUrl = atHead === undefined ? null : `${gh}/tree/main/${dir}`;
+  if (c === undefined) return out;
+  out.exists = true;
+  out.legacyVersion = c.legacyVersion;
+  out.derivedFrom = c.derivedFrom;
+  out.derivedFromPulls = c.derivedFromPulls;
+  if (c.doc === null) return { ...out, error: out.error ?? c.error };
+  const paths = [
+    "rubric.md",
+    ...c.doc.prTypes.map((t) => `types/${t.name}.md`),
+    ...(c.doc.styleNotes === "" ? [] : ["style.md"]),
+  ];
+  return {
+    ...out,
+    ...structuredClone(c.doc),
+    files: paths.map((p) => ({
+      path: `${dir}/${p}`,
+      url: `${gh}/blob/${at.sha}/${dir}/${p}`,
+      editUrl: `${gh}/edit/main/${dir}/${p}`,
+    })),
   };
 }
 
-/** What version `n` (1-based) of a repository's rubric was derived from; nothing for 0. */
-function derivedOf(owner, name, n) {
-  const v = (rubrics.get(`${owner}/${name}`) ?? [])[n - 1];
-  return { samples: v?.derivedFrom ?? [], prs: v?.derivedFromPulls ?? [] };
-}
-
-const union = (a, b) => [...new Set([...a, ...b])];
-
-/** Push a rubric version over the last, keeping every earlier version's provenance and `more`. */
-function pushRubric(owner, name, doc, more = { samples: [], prs: [] }) {
-  const vs = rubrics.get(`${owner}/${name}`) ?? [];
-  const last = derivedOf(owner, name, vs.length);
-  vs.push({
-    createdAt: now(),
-    doc,
-    derivedFrom: union(last.samples, more.samples),
-    derivedFromPulls: union(last.prs, more.prs),
-  });
-  rubrics.set(`${owner}/${name}`, vs);
-  return currentRubric(owner, name);
-}
-
+/** `GET …/rubrics`: the rubric in use, and why the head is not it. */
 function currentRubric(owner, name) {
-  const vs = rubrics.get(`${owner}/${name}`) ?? [];
-  return rubricVersion(owner, name, vs.length - 1);
+  if (!rubricsConfigured) return rubricView(owner, name, -1);
+  if (rubricCommits.length === 0)
+    return rubricView(owner, name, -1, {
+      error: { file: null, line: null, message: `${rubricsRepo} has no branch main` },
+    });
+  const { index, error } = rubricInUse(`${owner}/${name}`);
+  return rubricView(owner, name, index, {
+    headSha: rubricCommits[rubricCommits.length - 1].sha,
+    error,
+  });
 }
 
-/** Why the document is refused, as `Rubric.validate` says it, or null. */
-function rubricProblem(d) {
-  if (typeof d.defaultRubric !== "string" || !Array.isArray(d.prTypes)) return "not a document";
-  if (d.prTypes.length > 50)
-    return `the document names ${d.prTypes.length} pull request types; at most 50`;
-  for (const [i, t] of d.prTypes.entries()) {
-    if (typeof t.name !== "string" || t.name.trim() === "")
-      return `pull request type ${i + 1} has an empty name`;
-    if (d.prTypes.filter((u) => u.name === t.name).length > 1)
-      return `two pull request types are called '${t.name}'`;
-    for (const [j, c] of (t.categories ?? []).entries()) {
-      if (typeof c.name !== "string" || c.name.trim() === "")
-        return `category ${j + 1} of '${t.name}' has an empty name`;
-      if (t.categories.filter((x) => x.name === c.name).length > 1)
-        return `'${t.name}' has two categories called '${c.name}'`;
-    }
-  }
-  return null;
+/** The document of `dir` at `sha` (empty where there is none); null when it does not parse. */
+function docAt(dir, sha) {
+  const i = commitIndex(sha);
+  const c = i < 0 ? undefined : dirAt(dir, i);
+  if (c === undefined) return emptyDoc;
+  return c.doc;
+}
+
+/** The commit a job was reviewed against: its own, or for one from before, the one in use. */
+function jobRubricDoc(job) {
+  const dir = `${job.owner}/${job.name}`;
+  if (typeof job.rubricSha === "string") return docAt(dir, job.rubricSha);
+  if (job.rubricVersion === 0) return null;
+  const { index } = rubricInUse(dir);
+  return index < 0 ? null : (dirAt(dir, index)?.doc ?? null);
 }
 
 /** `categoriesFor` of the rubric the job was reviewed against: empty is free text. */
 function allowedCategories(job) {
-  if (job.rubricVersion === 0) return [];
-  const vs = rubrics.get(`${job.owner}/${job.name}`) ?? [];
-  const v = job.rubricVersion === null ? vs[vs.length - 1] : vs[job.rubricVersion - 1];
-  const d = v?.doc;
-  if (d === undefined || d === null) return [];
+  const d = jobRubricDoc(job);
+  if (d === null) return [];
   const t = d.prTypes.find((x) => x.name === job.prType);
   if (t !== undefined) return (t.categories ?? []).map((c) => c.name);
   return [...new Set(d.prTypes.flatMap((x) => (x.categories ?? []).map((c) => c.name)))];
 }
+
+/** What the rubric at `sha` of a repository was derived from. */
+function derivedOf(owner, name, sha) {
+  const i = sha === null ? -1 : commitIndex(sha);
+  const c = i < 0 ? undefined : dirAt(`${owner}/${name}`, i);
+  return { samples: c?.derivedFrom ?? [], prs: c?.derivedFromPulls ?? [] };
+}
+
+
 
 function page(items, url) {
   const limit = Number(url.searchParams.get("limit") ?? 50);
@@ -409,9 +517,7 @@ const repos = new Map([
       mode: "staged",
       autoReview: false,
       trustedReviewers: ["alice", "bob"],
-      styleNotes: "One sentence a comment.\nNo praise.",
       evalShare: 50,
-      styleNotesVersion: 1,
       version: 3,
       createdAt: now(),
     },
@@ -424,17 +530,12 @@ const repos = new Map([
       mode: "staged",
       autoReview: false,
       trustedReviewers: [],
-      styleNotes: "",
       evalShare: 50,
-      styleNotesVersion: 0,
       version: 1,
       createdAt: now(),
     },
   ],
 ]);
-
-/** The provenance of each repository's latest style notes version, as `NotesRow` keeps it. */
-const notesDerived = new Map([["chrisflav/diff-reviewer", { samples: [], prs: [] }]]);
 
 /** `validLogin` in Lean. */
 const validLogin = (s) =>
@@ -450,6 +551,14 @@ function putRepo(owner, name, body) {
   const key = `${owner}/${name}`.toLowerCase();
   const old = repos.get(key);
   const current = old?.version ?? 0;
+  for (const f of ["styleNotes", "fromProposal"])
+    if (body[f] !== undefined)
+      return [
+        400,
+        {
+          error: `'${f}' is not a setting: the style notes live in the rubrics repository, as ${key}/style.md`,
+        },
+      ];
   if (body.mode !== undefined && body.mode !== null && !["staged", "direct"].includes(body.mode))
     return [400, { error: `'mode' must be 'staged' or 'direct', not '${body.mode}'` }];
   let trusted = old?.trustedReviewers ?? [];
@@ -462,14 +571,6 @@ function putRepo(owner, name, body) {
     if (t.length > 50)
       return [400, { error: `'trustedReviewers' names ${t.length} logins; at most 50` }];
     trusted = [...new Set(t.map((l) => l.toLowerCase()))];
-  }
-  let styleNotes = old?.styleNotes ?? "";
-  if (body.styleNotes !== undefined && body.styleNotes !== null) {
-    if (typeof body.styleNotes !== "string")
-      return [400, { error: "'styleNotes' must be a string" }];
-    if (Buffer.byteLength(body.styleNotes, "utf8") > 16384)
-      return [400, { error: "'styleNotes' is longer than 16384 bytes" }];
-    styleNotes = body.styleNotes;
   }
   let evalShare = old?.evalShare ?? 50;
   if (body.evalShare !== undefined && body.evalShare !== null) {
@@ -486,42 +587,18 @@ function putRepo(owner, name, body) {
         error: `the settings of ${key} have changed since they were read (version ${body.version}, now ${current}); reload them`,
       },
     ];
-  let provenance = { samples: [], prs: [] };
-  if (body.fromProposal !== undefined && body.fromProposal !== null) {
-    const r = adoptProposal(key, body.fromProposal, null);
-    if (r.error !== undefined) return [r.status, { error: r.error }];
-    provenance = r.context;
-  }
   const repo = {
     owner: owner.toLowerCase(),
     name: name.toLowerCase(),
     mode: body.mode ?? "staged",
     autoReview: body.autoReview ?? false,
     trustedReviewers: trusted,
-    styleNotes,
     evalShare,
-    styleNotesVersion: old?.styleNotesVersion ?? 0,
     version: current + 1,
     createdAt: old?.createdAt ?? now(),
   };
-  writeNotes(repo, old?.styleNotes ?? "", provenance);
   repos.set(key, repo);
   return [old === undefined ? 201 : 200, repo];
-}
-
-/** `writeNotesIn`: a new notes version when the notes, or what they are derived from, change. */
-function writeNotes(repo, before, more) {
-  const key = `${repo.owner}/${repo.name}`;
-  const last = notesDerived.get(key) ?? { samples: [], prs: [] };
-  const prov = { samples: union(last.samples, more.samples), prs: union(last.prs, more.prs) };
-  const same =
-    repo.styleNotes === before &&
-    prov.samples.length === last.samples.length &&
-    prov.prs.length === last.prs.length;
-  if (same || (repo.styleNotesVersion === 0 && repo.styleNotes === "" && more.prs.length === 0))
-    return;
-  repo.styleNotesVersion += 1;
-  notesDerived.set(key, prov);
 }
 
 // Calibration: samples, imports, runs and their calibration jobs, of chrisflav/diff-reviewer.
@@ -534,7 +611,6 @@ const calib = {
   cap: 20,
 };
 const files = ["DiffReviewer/Types.lean", "DiffReviewer/Platform.lean", "README.md"];
-const day = 86400000;
 for (let i = 0; i < 32; i++) {
   const reviewer = i % 3 === 0 ? "bob" : "alice";
   const scope = i % 7 === 3 ? "partial" : i % 5 === 4 ? "decision" : "full";
@@ -764,13 +840,13 @@ function aggregate(results, includeStale, includeDerived = false) {
   };
 }
 
-/** Whether a result's sample's pull request is one its job's rubric version learned from. */
+/** Whether a result's sample's pull request is one its job's rubric learned from. */
 function isDerived(r) {
   const job = jobs.get(r.jobId);
   const s = sampleById(r.sampleId);
-  if (job === undefined || s === undefined || job.rubricVersion === null) return false;
+  if (job === undefined || s === undefined || typeof job.rubricSha !== "string") return false;
   const key = `${s.owner}/${s.name}#${s.prNumber}`;
-  return derivedOf(s.owner, s.name, job.rubricVersion).prs.includes(key);
+  return derivedOf(s.owner, s.name, job.rubricSha).prs.includes(key);
 }
 
 const sampleById = (id) => calib.samples.find((s) => s.id === id);
@@ -805,8 +881,9 @@ function calibrationJob(run, s, status, createdAt) {
     prBody: null,
     error: status === "failed" ? "the run ended without a submission" : null,
     prType: draft === null ? null : "feature",
+    rubricSha: draft === null ? null : run.rubricSha,
     rubricVersion: draft === null ? null : run.rubricVersion,
-    notesVersion: draft === null ? null : 1,
+    notesVersion: draft === null || run.rubricVersion === null ? null : 1,
     directPosts: 0,
     postDirect: false,
     attempts: 1,
@@ -823,15 +900,19 @@ function calibrationJob(run, s, status, createdAt) {
   return job;
 }
 
-/** A run of `ids`, its jobs `status` (scored when `draft`); `ago` days back. */
-function makeRun(id, ids, ago, rubricVersion, status = "draft", hits = null) {
-  const createdAt = new Date(Date.now() - ago * day).toISOString();
+/**
+ * A run of `ids`, its jobs `status` (scored when `draft`); `daysAgo` days back, under the rubric
+ * at commit `rubric`, or (a number) the legacy version of a run from before the rubrics repository.
+ */
+function makeRun(id, ids, daysAgo, rubric, status = "draft", hits = null) {
+  const createdAt = new Date(Date.now() - daysAgo * day).toISOString();
   const run = {
     id,
     owner: "chrisflav",
     name: "diff-reviewer",
     createdAt,
-    rubricVersion,
+    rubricSha: typeof rubric === "string" ? rubric : null,
+    rubricVersion: typeof rubric === "number" ? rubric : null,
     results: [],
   };
   ids.forEach((sid, k) => {
@@ -860,9 +941,11 @@ function makeRun(id, ids, ago, rubricVersion, status = "draft", hits = null) {
 }
 const ids = (from, n) => calib.samples.slice(from, from + n).map((s) => s.id);
 makeRun("run-1", ids(0, 6), 30, 1, "draft", 0);
-makeRun("run-2", ids(0, 8), 20, 1);
-makeRun("run-3", ids(2, 10), 10, 2, "draft", 3);
-makeRun("run-4", ids(4, 4), 1, 2, (k) => (k === 0 ? "running" : k === 1 ? "failed" : "draft"));
+makeRun("run-2", ids(0, 8), 20, fakeSha("c1"));
+makeRun("run-3", ids(2, 10), 10, fakeSha("c2"), "draft", 3);
+makeRun("run-4", ids(4, 4), 1, fakeSha("c3"), (k) =>
+  k === 0 ? "running" : k === 1 ? "failed" : "draft",
+);
 // A deleted sample: still shown, marked, in its runs, and left out of the aggregates.
 calib.samples[5].deletedAt = now();
 
@@ -890,6 +973,7 @@ function runJson(run, detail, includeStale, includeDerived = false) {
         jobId: r.jobId,
         status: job?.status ?? "pending",
         error: job?.error ?? null,
+        rubricSha: job?.rubricSha ?? null,
         rubricVersion: job?.rubricVersion ?? null,
         prType: job?.prType ?? null,
         sample:
@@ -1067,7 +1151,7 @@ function calibrationRoute(req, res, url, parts, body) {
         `run-${calib.runs.length + 1}`,
         chosen,
         0,
-        (rubrics.get(`${owner}/${name}`) ?? []).length,
+        currentRubric(owner, name).sha,
         "pending",
       );
       run.split = split;
@@ -1076,7 +1160,18 @@ function calibrationRoute(req, res, url, parts, body) {
   }
   if (what === "summary" && req.method === "GET") {
     const all = calib.runs.filter(mine).flatMap((r) => r.results.map((x) => ({ ...x, run: r })));
-    const versions = [...new Set(all.map((x) => x.run.rubricVersion))].sort((a, b) => b - a);
+    // By rubric: commits newest first, then legacy versions newest first, then unrecorded.
+    const keyOf = (run) => run.rubricSha ?? `v${run.rubricVersion}`;
+    const rank = (run) =>
+      run.rubricSha !== null
+        ? [0, -commitIndex(run.rubricSha)]
+        : run.rubricVersion !== null
+          ? [1, -run.rubricVersion]
+          : [2, 0];
+    const groups = [...new Map(all.map((x) => [keyOf(x.run), x.run])).values()].sort((a, b) => {
+      const [ra, rb] = [rank(a), rank(b)];
+      return ra[0] - rb[0] || ra[1] - rb[1];
+    });
     return send(res, 200, {
       owner,
       name,
@@ -1084,10 +1179,11 @@ function calibrationRoute(req, res, url, parts, body) {
       runs: calib.runs.filter(mine).length,
       samples: calib.samples.filter((s) => mine(s) && s.deletedAt === null).length,
       overall: aggregate(all, includeStale, includeDerived),
-      byRubricVersion: versions.map((v) => ({
-        rubricVersion: v,
+      byRubric: groups.map((g) => ({
+        rubricSha: g.rubricSha,
+        rubricVersion: g.rubricVersion,
         aggregate: aggregate(
-          all.filter((x) => x.run.rubricVersion === v),
+          all.filter((x) => keyOf(x.run) === keyOf(g)),
           includeStale,
           includeDerived,
         ),
@@ -1096,8 +1192,8 @@ function calibrationRoute(req, res, url, parts, body) {
   }
   return send(res, 404, { error: "no such route" });
 }
-// Rubric proposals, of chrisflav/diff-reviewer: one accepted (rubric version 2), one rejected,
-// and one pending, written from version 1, which the rubric has moved on from.
+// Rubric proposals, of chrisflav/diff-reviewer, each a pull request on the rubrics repository: one
+// merged (commit c2), one closed unmerged, and one open, written from c1.
 const proposals = [];
 /** `--max-proposals-per-day`. */
 const proposalCap = 2;
@@ -1121,8 +1217,9 @@ function proposalJob(id, status, createdAt, error = null) {
     prBody: null,
     error,
     prType: null,
-    rubricVersion: status === "draft" ? 1 : null,
-    notesVersion: status === "draft" ? 1 : null,
+    rubricSha: status === "draft" ? fakeSha("c1") : null,
+    rubricVersion: null,
+    notesVersion: null,
     directPosts: 0,
     postDirect: false,
     attempts: 1,
@@ -1157,12 +1254,17 @@ shown as text.
 <b>code is text too</b>
 \`\`\``;
 
+let nextPull = 9;
+
 function addProposal(p) {
   proposals.unshift({
     owner: "chrisflav",
     name: "diff-reviewer",
     decidedAt: null,
-    acceptedVersion: null,
+    branch: `proposals/chrisflav/diff-reviewer/${p.id}`,
+    pullRequest: null,
+    prError: null,
+    mergeSha: null,
     context: {
       samples: ["s-04", "s-05"],
       prs: ["chrisflav/diff-reviewer#104", "chrisflav/diff-reviewer#105"],
@@ -1170,39 +1272,47 @@ function addProposal(p) {
     ...p,
   });
 }
+const pull = (number, state) => ({
+  number,
+  url: `https://github.com/${rubricsRepo}/pull/${number}`,
+  state,
+});
 {
-  const v1 = rubrics.get("chrisflav/diff-reviewer")[0].doc;
-  const v2 = rubrics.get("chrisflav/diff-reviewer")[1].doc;
+  const dir = "chrisflav/diff-reviewer";
+  const v1 = docAt(dir, fakeSha("c1"));
+  const v2 = docAt(dir, fakeSha("c2"));
+  const document = (d) => {
+    const out = structuredClone(d);
+    delete out.styleNotes;
+    delete out.reviewers;
+    return out;
+  };
   proposalJob("pj-1", "draft", new Date(Date.now() - 5 * day).toISOString());
   addProposal({
     id: "p-accepted",
     jobId: "pj-1",
-    baseVersion: 1,
-    document: (() => {
-      const d = structuredClone(v2);
-      delete d.reviewers;
-      return d;
-    })(),
+    baseSha: fakeSha("c1"),
+    document: document(v2),
     styleNotes: null,
-    baseStyleNotes: "One sentence a comment.\nNo praise.",
     rationale: "Docs keep being asked for: add a `docs` category.",
     status: "accepted",
     createdAt: new Date(Date.now() - 5 * day).toISOString(),
     decidedAt: new Date(Date.now() - 4 * day).toISOString(),
-    acceptedVersion: 2,
+    pullRequest: pull(3, "merged"),
+    mergeSha: fakeSha("c2"),
   });
   proposalJob("pj-2", "draft", new Date(Date.now() - 3 * day).toISOString());
   addProposal({
     id: "p-rejected",
     jobId: "pj-2",
-    baseVersion: 2,
-    document: { ...structuredClone(v2), prTypes: [] },
+    baseSha: fakeSha("c2"),
+    document: { ...document(v2), prTypes: [] },
     styleNotes: null,
-    baseStyleNotes: "One sentence a comment.\nNo praise.",
     rationale: "Drop every type; one rubric is enough.",
     status: "rejected",
     createdAt: new Date(Date.now() - 3 * day).toISOString(),
     decidedAt: new Date(Date.now() - 3 * day).toISOString(),
+    pullRequest: pull(5, "closed"),
   });
   proposalJob(
     "pj-3",
@@ -1214,9 +1324,10 @@ function addProposal(p) {
   addProposal({
     id: "p-pending",
     jobId: "pj-4",
-    baseVersion: 1,
+    baseSha: fakeSha("c1"),
     document: {
       defaultRubric: "Proofs must not use `sorry`.\nNor `admit`.",
+      fanout: false,
       prTypes: [
         {
           ...structuredClone(v1.prTypes[0]),
@@ -1240,16 +1351,17 @@ function addProposal(p) {
       ],
     },
     styleNotes: "One sentence a comment.\nNo praise.\nSuggest a fix, do not ask a question.",
-    baseStyleNotes: "One sentence a comment.\nNo praise.",
     rationale: hostileRationale,
     status: "pending",
     createdAt: new Date(Date.now() - 2 * 3600000).toISOString(),
+    pullRequest: pull(8, "open"),
   });
 }
 
 const textChange = (b, a) => (b === a ? null : { before: b, after: a });
+const flagChange = (b, a) => (Boolean(b) === Boolean(a) ? null : { before: !!b, after: !!a });
 
-/** `Proposal.diffJson` in Lean. */
+/** `Proposal.diffJson` in Lean: of a proposal against its base, or of a commit against another. */
 function proposalDiff(before, after, notes) {
   const find = (d, n) => d.prTypes.find((t) => t.name === n);
   const typesChanged = after.prTypes.flatMap((a) => {
@@ -1265,9 +1377,11 @@ function proposalDiff(before, after, notes) {
         ? []
         : [{ name: c.name, before: o.description, after: c.description }];
     });
+    const fanout = flagChange(b.fanout, a.fanout);
     if (
       b.description === a.description &&
       b.rubric === a.rubric &&
+      fanout === null &&
       added.length + removed.length + changed.length === 0
     )
       return [];
@@ -1276,6 +1390,7 @@ function proposalDiff(before, after, notes) {
         name: a.name,
         description: textChange(b.description, a.description),
         rubric: textChange(b.rubric, a.rubric),
+        fanout,
         categoriesAdded: added,
         categoriesRemoved: removed.map((c) => c.name),
         categoriesChanged: changed,
@@ -1284,6 +1399,7 @@ function proposalDiff(before, after, notes) {
   });
   return {
     defaultRubric: textChange(before.defaultRubric, after.defaultRubric),
+    fanout: flagChange(before.fanout, after.fanout),
     typesAdded: after.prTypes.filter((t) => find(before, t.name) === undefined),
     typesRemoved: before.prTypes
       .filter((t) => find(after, t.name) === undefined)
@@ -1294,60 +1410,78 @@ function proposalDiff(before, after, notes) {
 }
 
 function proposalJson(p, detail) {
-  const current = (rubrics.get(`${p.owner}/${p.name}`) ?? []).length;
   const out = {
     id: p.id,
     owner: p.owner,
     name: p.name,
     jobId: p.jobId,
     status: p.status,
-    baseVersion: p.baseVersion,
-    currentVersion: current,
-    rebaseNeeded: p.status === "pending" && current !== p.baseVersion,
+    baseSha: p.baseSha,
+    currentSha: currentRubric(p.owner, p.name).sha,
     rationale: p.rationale,
     proposesStyleNotes: p.styleNotes !== null,
     createdAt: p.createdAt,
     decidedAt: p.decidedAt,
-    acceptedVersion: p.acceptedVersion,
+    branch: p.branch,
+    pullRequest: p.pullRequest,
+    prError: p.prError,
+    mergeSha: p.mergeSha,
   };
   if (!detail) return out;
-  const base =
-    p.baseVersion === 0
-      ? { defaultRubric: "", prTypes: [] }
-      : rubrics.get(`${p.owner}/${p.name}`)[p.baseVersion - 1].doc;
+  const base = p.baseSha === null ? emptyDoc : docAt(`${p.owner}/${p.name}`, p.baseSha);
+  if (base === null)
+    return {
+      ...out,
+      document: p.document,
+      documentError: null,
+      styleNotes: p.styleNotes,
+      baseStyleNotes: null,
+      diff: null,
+      diffError: `the rubric at ${p.baseSha} does not parse`,
+    };
   return {
     ...out,
     document: p.document,
     documentError: null,
     styleNotes: p.styleNotes,
-    baseStyleNotes: p.baseStyleNotes,
+    baseStyleNotes: p.styleNotes === null ? null : base.styleNotes,
     diff: proposalDiff(
       base,
       p.document,
-      p.styleNotes === null ? null : [p.baseStyleNotes ?? "", p.styleNotes],
+      p.styleNotes === null ? null : [base.styleNotes, p.styleNotes],
     ),
     diffError: null,
   };
 }
 
-/**
- * `Proposal.adoptIn`: a rubric or settings write naming proposal `id`. A rubric written from it
- * (`rubricVersion`) marks it accepted; style notes alone (`null`) record it and decide nothing.
- */
-function adoptProposal(key, id, rubricVersion) {
-  const p = proposals.find((x) => `${x.owner}/${x.name}` === key && x.id === id);
-  if (p === undefined)
-    return { status: 400, error: `'fromProposal': ${id} is not a proposal of ${key}` };
-  if (p.status === "rejected")
-    return { status: 409, error: `'fromProposal': proposal ${id} was rejected` };
-  if (rubricVersion === null) return { context: p.context };
+/** What GitHub says of a proposal's pull request: merged, its rubric is committed. */
+function settlePull(p, state) {
+  if (state === "open") {
+    p.pullRequest ??= pull(nextPull++, "open");
+    p.prError = null;
+    return;
+  }
+  if (p.pullRequest === null) p.pullRequest = pull(nextPull++, "open");
+  p.pullRequest = { ...p.pullRequest, state };
+  p.prError = null;
+  p.decidedAt = now();
+  if (state === "closed") {
+    p.status = "rejected";
+    return;
+  }
+  const dir = `${p.owner}/${p.name}`;
+  const notes = p.styleNotes ?? docAt(dir, currentRubric(p.owner, p.name).sha)?.styleNotes ?? "";
+  const c = commitRubric(
+    dir,
+    { ...structuredClone(p.document), styleNotes: notes },
+    { message: `Merge pull request #${p.pullRequest.number} from ${p.branch}` },
+    p.context,
+  );
   p.status = "accepted";
-  p.decidedAt ??= now();
-  p.acceptedVersion ??= rubricVersion;
-  return { context: p.context };
+  p.mergeSha = c.sha;
 }
 
-function proposalsRoute(req, res, url, parts, body) {
+function proposalsRoute(req, res, url, parts) {
   const [owner, name] = [parts[3].toLowerCase(), parts[4].toLowerCase()];
   const key = `${owner}/${name}`;
   const repo = repos.get(key);
@@ -1374,7 +1508,7 @@ function proposalsRoute(req, res, url, parts, body) {
     const waiting = mine.find((p) => p.status === "pending");
     if (waiting !== undefined)
       return send(res, 409, {
-        error: `${key} has a proposal waiting for a decision, ${waiting.id}; accept or reject it first`,
+        error: `${key} has a proposal waiting for a decision, ${waiting.id}; merge or close its pull request first`,
       });
     const made = pjobs.filter((j) => Date.now() - Date.parse(j.createdAt) < day).length;
     if (made + 1 > proposalCap)
@@ -1393,48 +1527,59 @@ function proposalsRoute(req, res, url, parts, body) {
   const p = mine.find((x) => x.id === parts[6]);
   if (p === undefined) return send(res, 404, { error: "not found" });
   if (parts.length === 7 && req.method === "GET") return send(res, 200, proposalJson(p, true));
-  if (parts[7] === "reject" && req.method === "POST") {
-    if (p.status !== "pending")
-      return send(res, 409, { error: `proposal ${p.id} is ${p.status} already` });
-    Object.assign(p, { status: "rejected", decidedAt: now() });
-    return send(res, 200, proposalJson(p, false));
+  return send(res, 404, { error: "no such route" });
+}
+
+/** `GET …/rubrics`, `…/history`, `…/commits/{sha}` and `…/compare`. */
+function rubricsRoute(req, res, url, parts) {
+  const [owner, name] = [parts[3].toLowerCase(), parts[4].toLowerCase()];
+  const dir = `${owner}/${name}`;
+  if (!repos.has(dir)) return send(res, 404, { error: `${dir} is not registered` });
+  if (req.method !== "GET") return send(res, 405, { error: "method not allowed" });
+  if (parts.length === 6) return send(res, 200, currentRubric(owner, name));
+  const touching = rubricsConfigured ? rubricCommits.filter((c) => c.dir === dir).reverse() : [];
+  const gh = `https://github.com/${rubricsRepo}`;
+  if (parts[6] === "history" && parts.length === 7)
+    return send(
+      res,
+      200,
+      page(
+        touching.map((c) => ({
+          sha: c.sha,
+          message: c.message,
+          author: c.author,
+          authorLogin: c.authorLogin,
+          date: c.date,
+          url: `${gh}/commit/${c.sha}`,
+          legacyVersion: c.legacyVersion,
+        })),
+        url,
+      ),
+    );
+  const isSha = (s) => typeof s === "string" && /^[0-9a-f]{40}$/.test(s);
+  if (!rubricsConfigured) return send(res, 404, { error: "no rubrics repository is configured" });
+  if (parts[6] === "commits" && parts.length === 8) {
+    if (!isSha(parts[7])) return send(res, 400, { error: `'${parts[7]}' is not a commit id` });
+    const i = commitIndex(parts[7]);
+    if (i < 0) return send(res, 404, { error: `${rubricsRepo} has no commit ${parts[7]}` });
+    return send(res, 200, rubricView(owner, name, i));
   }
-  if (parts[7] === "accept" && req.method === "POST") {
-    if (!Number.isInteger(body.version) || body.version < 0)
-      return send(res, 400, { error: "the body must name the rubric 'version' read" });
-    if (p.status !== "pending")
-      return send(res, 409, { error: `proposal ${p.id} is ${p.status} already` });
-    const current = (rubrics.get(key) ?? []).length;
-    if (current !== p.baseVersion)
-      return send(res, 409, {
-        error: `the rubric of ${key} is at version ${current}, and proposal ${p.id} was written from version ${p.baseVersion}; rebase it on the current rubric in the editor and save that with "fromProposal": "${p.id}"`,
-        baseVersion: p.baseVersion,
-        currentVersion: current,
-      });
-    if (body.version !== current)
-      return send(res, 409, {
-        error: `the rubric of ${key} has changed since it was read (version ${body.version}, now ${current}); reload it, or rebase the proposal in the editor and save that with "fromProposal": "${p.id}"`,
-        baseVersion: p.baseVersion,
-        currentVersion: current,
-      });
-    if (body.applyStyleNotes === true) {
-      if (p.styleNotes === null)
-        return send(res, 409, {
-          error: `proposal ${p.id} proposes no style notes; accept it without 'applyStyleNotes'`,
-        });
-      if (p.baseStyleNotes !== repo.styleNotes)
-        return send(res, 409, {
-          error: `the style notes of ${key} have changed since the agent of proposal ${p.id} read them; accept it without 'applyStyleNotes', and copy what you want of its notes into the settings`,
-        });
-    }
-    const written = pushRubric(owner, name, structuredClone(p.document), p.context);
-    if (body.applyStyleNotes === true) {
-      const before = repo.styleNotes;
-      repo.styleNotes = p.styleNotes;
-      writeNotes(repo, before, p.context);
-    }
-    Object.assign(p, { status: "accepted", decidedAt: now(), acceptedVersion: written.version });
-    return send(res, 200, { proposal: proposalJson(p, false), rubric: written });
+  if (parts[6] === "compare" && parts.length === 7) {
+    const [base, head] = [url.searchParams.get("base"), url.searchParams.get("head")];
+    if (!isSha(base) || !isSha(head))
+      return send(res, 400, { error: "name the commits to compare, 'base' and 'head'" });
+    for (const s of [base, head])
+      if (commitIndex(s) < 0) return send(res, 404, { error: `${rubricsRepo} has no commit ${s}` });
+    const [b, h] = [docAt(dir, base), docAt(dir, head)];
+    const broken = b === null ? base : h === null ? head : null;
+    return send(res, 200, {
+      base,
+      head,
+      url: `${gh}/compare/${base}...${head}`,
+      diff: broken === null ? proposalDiff(b, h, [b.styleNotes, h.styleNotes]) : null,
+      diffError:
+        broken === null ? null : `the rubric at ${broken.slice(0, 7)} does not parse`,
+    });
   }
   return send(res, 404, { error: "no such route" });
 }
@@ -1509,13 +1654,38 @@ createServer(async (req, res) => {
   }
   if (url.pathname === "/api/session") return send(res, 200, { authenticated: signedIn });
   if (url.pathname === "/__fake/rubric-bump") {
-    const vs = rubrics.get("chrisflav/diff-reviewer");
-    const last = structuredClone(vs[vs.length - 1].doc);
+    // Someone else commits to the rubric of chrisflav/diff-reviewer.
+    const dir = "chrisflav/diff-reviewer";
+    const last = structuredClone(docAt(dir, currentRubric("chrisflav", "diff-reviewer").sha));
     last.defaultRubric += "\nSomeone else's line.";
     const feature = last.prTypes.find((t) => t.name === "feature");
     if (feature !== undefined) feature.description += " (Someone else's words.)";
-    pushRubric("chrisflav", "diff-reviewer", last);
-    return send(res, 200, {});
+    const c = commitRubric(dir, last, {
+      message: "Someone else's change",
+      author: "Bob",
+      authorLogin: "bob",
+    });
+    return send(res, 200, { sha: c.sha });
+  }
+  if (url.pathname === "/__fake/rubric-break") {
+    // Someone commits a rubric of chrisflav/diff-reviewer that does not parse: the last good one
+    // stays in use, and the page says why.
+    const c = commitRubric(
+      "chrisflav/diff-reviewer",
+      null,
+      { message: "Tweak the front matter", author: "Bob", authorLogin: "bob" },
+      undefined,
+      {
+        file: "chrisflav/diff-reviewer/rubric.md",
+        line: 2,
+        message: "'fanout' must be true or false, not 'sometimes'",
+      },
+    );
+    return send(res, 200, { sha: c.sha });
+  }
+  if (url.pathname === "/__fake/rubrics-repo") {
+    rubricsConfigured = url.searchParams.get("configured") !== "0";
+    return send(res, 200, { configured: rubricsConfigured });
   }
   if (url.pathname === "/__fake/repo-bump") {
     // Someone else changes the settings: a trusted reviewer more, and the mode.
@@ -1528,39 +1698,55 @@ createServer(async (req, res) => {
     return send(res, 200, r);
   }
   if (url.pathname === "/__fake/notes-bump") {
-    // Someone else changes the style notes: the pending proposal's notes no longer apply.
-    const r = repos.get("chrisflav/diff-reviewer");
-    const before = r.styleNotes;
-    r.styleNotes += "\nSomeone else's line.";
-    r.version += 1;
-    writeNotes(r, before, { samples: [], prs: [] });
-    return send(res, 200, r);
+    // Someone else changes the style notes of chrisflav/diff-reviewer, in its style.md.
+    const dir = "chrisflav/diff-reviewer";
+    const doc = structuredClone(docAt(dir, currentRubric("chrisflav", "diff-reviewer").sha));
+    doc.styleNotes += "\nSomeone else's line.";
+    const c = commitRubric(dir, doc, {
+      message: "Update style.md",
+      author: "Bob",
+      authorLogin: "bob",
+    });
+    return send(res, 200, { sha: c.sha });
   }
   if (url.pathname === "/__fake/proposal-write") {
-    // The live proposal job of chrisflav/diff-reviewer submits, at the current rubric version.
+    // The live proposal job of chrisflav/diff-reviewer submits, at the rubric it was pinned to;
+    // opening its pull request fails at first (`proposal-pr?state=open` opens it).
     const job = [...jobs.values()].find(
       (j) => j.kind === "proposal" && ["pending", "queued", "running"].includes(j.status),
     );
     if (job === undefined) return send(res, 409, { error: "no proposal job is live" });
-    const vs = rubrics.get("chrisflav/diff-reviewer");
-    const doc = structuredClone(vs[vs.length - 1].doc);
+    const dir = "chrisflav/diff-reviewer";
+    const sha = currentRubric("chrisflav", "diff-reviewer").sha;
+    const doc = structuredClone(docAt(dir, sha));
+    const notes = doc.styleNotes;
+    delete doc.styleNotes;
     delete doc.reviewers;
     doc.defaultRubric += "\nNo `admit` either.";
-    const repo = repos.get("chrisflav/diff-reviewer");
     addProposal({
       id: `p-${randomBytes(3).toString("hex")}`,
       jobId: job.id,
-      baseVersion: vs.length,
+      baseSha: sha,
       document: doc,
-      styleNotes: `${repo.styleNotes}\nSuggest, don't ask.`,
-      baseStyleNotes: repo.styleNotes,
+      styleNotes: `${notes}\nSuggest, don't ask.`,
       rationale: "People asked for `admit` to go too, in #106 and #107.",
       status: "pending",
       createdAt: now(),
+      prError: "GitHub answered 502 Bad Gateway while the pull request was opened",
       context: { samples: ["s-06"], prs: ["chrisflav/diff-reviewer#106"] },
     });
-    bump(job, { status: "draft", rubricVersion: vs.length, notesVersion: repo.styleNotesVersion });
+    bump(job, { status: "draft", rubricSha: sha });
     return send(res, 200, proposalJson(proposals[0], false));
+  }
+  if (url.pathname === "/__fake/proposal-pr") {
+    // GitHub moves the newest pending proposal's pull request: open, merged or closed.
+    const p = proposals.find((x) => x.status === "pending");
+    if (p === undefined) return send(res, 409, { error: "no proposal is pending" });
+    const state = url.searchParams.get("state") ?? "merged";
+    if (!["open", "merged", "closed"].includes(state))
+      return send(res, 400, { error: "'state' is open, merged or closed" });
+    settlePull(p, state);
+    return send(res, 200, proposalJson(p, false));
   }
   if (url.pathname === "/__fake/calibration-cap") {
     calib.charged = Number(url.searchParams.get("charged") ?? calib.cap);
@@ -1588,48 +1774,8 @@ createServer(async (req, res) => {
     return r === undefined ? send(res, 404, { error: "not found" }) : send(res, 200, r);
   }
   if (parts[2] === "repos" && parts[5] === "proposals")
-    return proposalsRoute(req, res, url, parts, body);
-  if (parts[2] === "repos" && parts[5] === "rubrics") {
-    const [owner, name] = [parts[3].toLowerCase(), parts[4].toLowerCase()];
-    if (!repos.has(`${owner}/${name}`))
-      return send(res, 404, { error: `${owner}/${name} is not registered` });
-    const vs = rubrics.get(`${owner}/${name}`) ?? [];
-    if (parts[6] === "history" && req.method === "GET")
-      return send(res, 200, page(vs.map((_, i) => rubricVersion(owner, name, i)).reverse(), url));
-    if (parts.length === 6 && req.method === "GET")
-      return send(res, 200, currentRubric(owner, name));
-    if (parts.length === 6 && req.method === "PUT") {
-      if (body.version !== vs.length)
-        return send(res, 409, {
-          error: `the rubric of ${owner}/${name} is at version ${vs.length}, not ${body.version}`,
-        });
-      if (vs.length > 0 && vs[vs.length - 1].doc === null)
-        return send(res, 409, {
-          error: "the current version cannot be read by this build; it is left as it is",
-        });
-      const doc = { ...body };
-      for (const f of ["version", "owner", "name", "createdAt", "documentError"]) delete doc[f];
-      doc.defaultRubric ??= "";
-      doc.prTypes = (doc.prTypes ?? []).map((t) => ({
-        description: "",
-        rubric: "",
-        categories: [],
-        ...t,
-      }));
-      delete doc.fromProposal;
-      delete doc.derivedFrom;
-      delete doc.derivedFromPulls;
-      const why = rubricProblem(doc);
-      if (why !== null) return send(res, 400, { error: why });
-      let more = { samples: [], prs: [] };
-      if (typeof body.fromProposal === "string") {
-        const r = adoptProposal(`${owner}/${name}`, body.fromProposal, vs.length + 1);
-        if (r.error !== undefined) return send(res, r.status, { error: r.error });
-        more = r.context;
-      }
-      return send(res, 200, pushRubric(owner, name, doc, more));
-    }
-  }
+    return proposalsRoute(req, res, url, parts);
+  if (parts[2] === "repos" && parts[5] === "rubrics") return rubricsRoute(req, res, url, parts);
   if (parts[2] === "repos" && parts.length === 5 && req.method === "PUT") {
     const [status, out] = putRepo(parts[3], parts[4], body);
     return send(res, status, out);

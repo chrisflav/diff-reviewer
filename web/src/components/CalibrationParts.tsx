@@ -353,9 +353,9 @@ export function Limits({ open = false }: { open?: boolean }) {
           scores out unless asked to include them. A fresh score needs a fresh run.
         </li>
         <li>
-          <strong>Derived scores.</strong> A rubric or style notes version made from a rubric
-          proposal records the pull requests the proposal drew on. A score of one of them, made
-          under that version, is derived: what measures the rubric would be what it learned from.
+          <strong>Derived scores.</strong> A rubric made from a rubric proposal records the pull
+          requests the proposal drew on. A score of one of them, made under that rubric, is
+          derived: what measures the rubric would be what it learned from.
           Aggregates leave derived scores out unless asked to include them.
         </li>
         <li>

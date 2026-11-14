@@ -2,6 +2,7 @@ import DiffReviewerTest.Basic
 import DiffReviewerTest.Platform
 import DiffReviewerTest.Server
 import DiffReviewerTest.Workers
+import DiffReviewerTest.FakeGit
 import DiffReviewerTest.Safety
 import DiffReviewerTest.Rubrics
 import DiffReviewerTest.Calibration
@@ -9,3 +10,4 @@ import DiffReviewerTest.Style
 import DiffReviewerTest.Validity
 import DiffReviewerTest.Fanout
 import DiffReviewerTest.Incremental
+import DiffReviewerTest.GitRubrics

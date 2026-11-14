@@ -10,28 +10,14 @@ import {
   toReview,
 } from "./review";
 import {
-  freshRubricKeys,
-  RKEY,
-  rebaseRubric,
-  resolveRubric,
-  rubricConflictId,
-  sameRubric,
-  toLocalRubric,
-  toRubricDoc,
-  type RubricDoc,
-} from "./rubric";
-import {
   dropStash,
   reopen,
   reopenRepo,
-  stashRepo,
-  unstashRepo,
-  reopenRubric,
-  rubricStashKey,
+  repoKey,
   stash,
-  stashRubric,
+  stashRepo,
   unstash,
-  unstashRubric,
+  unstashRepo,
 } from "./stash";
 
 // Node has no session storage; a map stands in for it, one that can be made to refuse writes.
@@ -156,107 +142,21 @@ describe("stash failing", () => {
   });
 });
 
-describe("rubric stash", () => {
-  beforeEach(() => {
-    store.clear();
-    full = false;
-  });
-
-  const doc: RubricDoc = {
-    defaultRubric: "base",
-    prTypes: [
-      { name: "a", description: "", rubric: "ra", categories: [] },
-      { name: "b", description: "", rubric: "rb", categories: [] },
-    ],
-  };
-
-  it("is keyed by the repository as the server keys it", () => {
-    expect(rubricStashKey("ChrisFlav", "Diff-Reviewer")).toBe("chrisflav/diff-reviewer");
-  });
-
-  it("brings back open conflicts, the sides picked and the edits made since, after a 401", () => {
-    // Version 1 edited here; version 2 saved elsewhere meanwhile; a 409, and the edits are moved.
-    const base = toLocalRubric(doc);
-    const mine = {
-      ...base,
-      defaultRubric: "mine",
-      prTypes: base.prTypes.map((t) => ({ ...t, rubric: `${t.rubric}-mine` })),
-    };
-    const theirs: RubricDoc = {
-      defaultRubric: "theirs",
-      prTypes: doc.prTypes.map((t) => ({ ...t, rubric: `${t.rubric}-theirs` })),
-    };
-    const r = rebaseRubric(base, mine, theirs);
-    expect(r.conflicts).toHaveLength(3);
-    const source = { repo: "o/n", version: 1, base, doc: mine };
-    // One side picked, and an edit made since; the other two conflicts still open.
-    const first = r.conflicts[0]!;
-    const picks = { [rubricConflictId(first)]: "mine" as const };
-    const picked = resolveRubric(r.review, first, "mine");
-    const added = { name: "new", description: "", rubric: "", categories: [] };
-    const now = {
-      ...picked,
-      prTypes: [...picked.prTypes, { ...added, [RKEY]: freshRubricKeys(picked, r.base)() }],
-    };
-    const edits = { repo: "o/n", version: 2, base: r.base, doc: now };
-    expect(stashRubric(edits, { from: 1, source, picks })).toBe(true);
-
-    // The page is gone: everything comes back from storage alone.
-    const back = unstashRubric("o/n");
-    expect(back?.pending?.picks).toEqual(picks);
-    const reopened = reopenRubric(back!);
-    expect(reopened).not.toBeNull();
-    expect(sameRubric(reopened!.edits.doc, now)).toBe(true);
-    expect(toRubricDoc(reopened!.edits.doc).prTypes.map((t) => t.name)).toEqual(["a", "b", "new"]);
-    expect(reopened!.rebased?.conflicts.map(rubricConflictId)).toEqual(
-      r.conflicts.map(rubricConflictId),
-    );
-    expect(reopened!.rebased?.picks).toEqual(picks);
-    // An open conflict settles as it would have before.
-    const open = reopened!.rebased!.conflicts[1]!;
-    expect(toRubricDoc(resolveRubric(reopened!.edits.doc, open, "mine")).prTypes[0]!.rubric).toBe(
-      "ra-mine",
-    );
-  });
-
-  it("reopens edits without conflicts as they were", () => {
-    const base = toLocalRubric(doc);
-    stashRubric({ repo: "o/n", version: 1, base, doc: { ...base, defaultRubric: "x" } });
-    const back = unstashRubric("o/n");
-    expect(back?.pending).toBeNull();
-    expect(reopenRubric(back!)?.rebased).toBeNull();
-  });
-
-  it("keeps across a 401 the proposal the edits adopt, so that the save still names it", () => {
-    const base = toLocalRubric(doc);
-    stashRubric({ repo: "o/n", version: 1, base, doc: base, fromProposal: "p1" });
-    const back = unstashRubric("o/n");
-    expect(back?.fromProposal).toBe("p1");
-    expect(reopenRubric(back!)?.edits.fromProposal).toBe("p1");
-  });
-
-  it("keeps the proposal the edits from before a move adopt, with conflicts open", () => {
-    const base = toLocalRubric(doc);
-    const source = { repo: "o/n", version: 1, base, doc: base, fromProposal: "p1" };
-    const edits = { repo: "o/n", version: 2, base, doc: base, fromProposal: "p1" };
-    stashRubric(edits, { from: 1, source, picks: {} });
-    expect(unstashRubric("o/n")?.pending?.source.fromProposal).toBe("p1");
-
-    // Kept by a build that stored it with the edits alone: taken from there.
-    const j = JSON.parse(store.get("diff-reviewer:rubric:o/n")!) as { pending: object };
-    delete (j.pending as { fromProposal?: string }).fromProposal;
-    store.set("diff-reviewer:rubric:o/n", JSON.stringify(j));
-    expect(unstashRubric("o/n")?.pending?.source.fromProposal).toBe("p1");
+describe("repoKey", () => {
+  it("keys a repository as the server keys it", () => {
+    expect(repoKey("ChrisFlav", "Diff-Reviewer")).toBe("chrisflav/diff-reviewer");
   });
 });
 
 describe("repo settings stash", () => {
-  beforeEach(() => store.clear());
+  beforeEach(() => {
+    store.clear();
+    full = false;
+  });
   const base = {
     mode: "staged" as const,
     autoReview: false,
     trustedReviewers: ["alice"],
-    styleNotes: "",
     evalShare: 50,
   };
   const edits = {
@@ -294,20 +194,23 @@ describe("repo settings stash", () => {
     expect(unstashRepo("o/n")).toBeNull();
   });
 
-  it("keeps the proposal whose style notes the edits adopt", () => {
-    stashRepo({ ...edits, fromProposal: "p1" });
-    expect(unstashRepo("o/n")?.fromProposal).toBe("p1");
-  });
-
-  it("keeps it for the edits from before a move too, with conflicts open", () => {
-    const source = { repo: "o/n", version: 3, base, form: base, fromProposal: "p1" };
-    stashRepo({ ...edits, fromProposal: "p1" }, { from: 3, source, picks: {} });
-    expect(unstashRepo("o/n")?.pending?.source).toEqual(source);
-
-    const j = JSON.parse(store.get("diff-reviewer:repo:o/n")!) as { pending: object };
-    delete (j.pending as { fromProposal?: string }).fromProposal;
-    store.set("diff-reviewer:repo:o/n", JSON.stringify(j));
-    expect(unstashRepo("o/n")?.pending?.source).toEqual(source);
+  it("drops the style notes and the proposal an older build kept, which are not settings", () => {
+    const old = (f: object) => ({ ...f, styleNotes: "Be brief." });
+    store.set(
+      "diff-reviewer:repo:o/n",
+      JSON.stringify({
+        ...edits,
+        base: old(edits.base),
+        form: old(edits.form),
+        fromProposal: "p1",
+        savedAt: "t",
+        pending: null,
+      }),
+    );
+    const s = unstashRepo("o/n");
+    expect(s?.form).toEqual(edits.form);
+    expect(s?.base).toEqual(edits.base);
+    expect(s === null ? null : reopenRepo(s)).toEqual({ edits, pending: null, conflicts: [] });
   });
 
   it("keeps a share held out left empty, which JSON stores as null", () => {
@@ -319,10 +222,9 @@ describe("repo settings stash", () => {
     expect(s?.base).toEqual(edits.base);
   });
 
-  it("reads a stash from before the style notes, filled in alike on both sides", () => {
+  it("reads a stash from before the share held out, filled in alike on both sides", () => {
     const strip = (f: object) => {
       const o: Record<string, unknown> = { ...f };
-      delete o.styleNotes;
       delete o.evalShare;
       return o;
     };
@@ -338,7 +240,7 @@ describe("repo settings stash", () => {
     );
     const s = unstashRepo("o/n");
     expect(s?.legacy).toBe(true);
-    expect(s?.base.styleNotes).toBe(s?.form.styleNotes);
+    expect(s?.base.evalShare).toBe(s?.form.evalShare);
     expect(s?.form.trustedReviewers).toEqual(["alice", "bob"]);
   });
 });

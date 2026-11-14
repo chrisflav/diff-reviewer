@@ -9,14 +9,11 @@
 
 import type { PostingMode, Repo, RepoSettings } from "./api";
 import { same } from "./review";
-import { utf8Bytes } from "./text";
 
 /** The most trusted reviewers a repository names (`maxTrustedReviewers`). */
 export const MAX_TRUSTED_REVIEWERS = 50;
 /** The longest GitHub login. */
 export const MAX_LOGIN_LENGTH = 39;
-/** The longest style notes, in bytes of UTF-8 (`maxStyleNotesBytes`). */
-export const MAX_STYLE_NOTES_BYTES = 16384;
 /** The share of pull requests held out when a repository has not said (`Repo.evalShare`). */
 export const DEFAULT_EVAL_SHARE = 50;
 
@@ -26,8 +23,6 @@ export interface RepoForm {
   autoReview: boolean;
   /** In lower case, once each, as the server stores them. */
   trustedReviewers: string[];
-  /** Markdown, at most `MAX_STYLE_NOTES_BYTES`; empty for none. */
-  styleNotes: string;
   /** Percent of new pull requests held out as `eval`, 0 to 100. */
   evalShare: number;
 }
@@ -40,45 +35,40 @@ export function formOf(r: Repo): RepoForm {
     mode: r.mode,
     autoReview: r.autoReview,
     trustedReviewers: normalLogins(r.trustedReviewers ?? []),
-    styleNotes: typeof r.styleNotes === "string" ? r.styleNotes : "",
     evalShare: typeof r.evalShare === "number" ? r.evalShare : DEFAULT_EVAL_SHARE,
   };
 }
 
-/** Fields of the record the server derives, never sent back. */
-const derivedFields = ["styleNotesVersion"];
+/**
+ * Fields a server older than API 1.0.0 sent that are not settings any more: the style notes live
+ * in the rubrics repository, and a write naming them is a 400. Never sent back.
+ */
+const retiredFields = ["styleNotes", "styleNotesVersion", "fromProposal"];
 
 /**
  * The body of a write of `form` over `read`, the settings at the version last read: every field
  * read that is not about the record, a newer build's settings among them, so that a write from
  * this page leaves them as they were; the form on top; and the version, so that a write over a
- * newer one is a 409. The style notes and the share held out are sent only when the server has
- * them (API 0.6.0), so that an older one is not sent fields it does not know. `fromProposal`
- * names the rubric proposal the notes were taken from, and is left out when the notes saved are
- * the notes read: nothing of the proposal is kept, and naming it would decide it.
+ * newer one is a 409. The share held out is sent only when the server has it (API 0.6.0), so that
+ * an older one is not sent a field it does not know.
  */
-export function putBody(read: Repo, form: RepoForm, fromProposal?: string): RepoSettings {
+export function putBody(read: Repo, form: RepoForm): RepoSettings {
   const out: Record<string, unknown> = { ...read };
-  for (const f of [...metaFields, ...derivedFields]) delete out[f];
+  for (const f of [...metaFields, ...retiredFields]) delete out[f];
   return {
     ...out,
     mode: form.mode,
     autoReview: form.autoReview,
     trustedReviewers: form.trustedReviewers,
-    ...("styleNotes" in read ? { styleNotes: form.styleNotes } : {}),
     ...("evalShare" in read ? { evalShare: form.evalShare } : {}),
-    ...(fromProposal === undefined || form.styleNotes === formOf(read).styleNotes
-      ? {}
-      : { fromProposal }),
     version: read.version,
   };
 }
 
 /**
- * What a 409 refusing a write over version `sent` said, when `theirs`, the settings (or the
- * rubric) read after it, are still at that version: not that they moved, which a merge mends, but
- * something else — the proposal named was rejected meanwhile, say — to be shown as the server put
- * it. Null when they moved.
+ * What a 409 refusing a write over version `sent` said, when `theirs`, the settings read after it,
+ * are still at that version: not that they moved, which a merge mends, but something else, to be
+ * shown as the server put it. Null when they moved.
  */
 export function saveRefusal(
   sent: number,
@@ -150,17 +140,7 @@ export function formProblem(f: RepoForm): string | null {
     const why = loginProblem(l);
     if (why !== null) return `'${l}': ${why}`;
   }
-  const why = notesProblem(f.styleNotes) ?? evalShareProblem(f.evalShare);
-  if (why !== null) return why;
-  return null;
-}
-
-/** Why the server would refuse style notes `s`, or null. */
-export function notesProblem(s: string): string | null {
-  const n = utf8Bytes(s);
-  return n > MAX_STYLE_NOTES_BYTES
-    ? `The style notes are ${n} bytes; at most ${MAX_STYLE_NOTES_BYTES}.`
-    : null;
+  return evalShareProblem(f.evalShare);
 }
 
 /** Why the server would refuse `evalShare` `n`, or null. */
@@ -174,7 +154,6 @@ export function sameForm(a: RepoForm, b: RepoForm): boolean {
   return (
     a.mode === b.mode &&
     a.autoReview === b.autoReview &&
-    a.styleNotes === b.styleNotes &&
     a.evalShare === b.evalShare &&
     a.trustedReviewers.length === b.trustedReviewers.length &&
     a.trustedReviewers.every((l, i) => b.trustedReviewers[i] === l)
@@ -185,7 +164,6 @@ export function sameForm(a: RepoForm, b: RepoForm): boolean {
 export type RepoConflict =
   | { field: "mode"; mine: PostingMode; theirs: PostingMode }
   | { field: "autoReview"; mine: boolean; theirs: boolean }
-  | { field: "styleNotes"; mine: string; theirs: string }
   | { field: "evalShare"; mine: number; theirs: number };
 
 export interface RepoMerged {
@@ -203,8 +181,7 @@ export interface RepoMerged {
  * overwritten unasked. With today's two-valued settings no conflict arises (two sides that both
  * changed a setting from its base changed it to the same value); the page still asks, and keeps
  * the sides picked across a reload, so that a setting of more values cannot be overwritten. The
- * style notes are one text: both sides changing them differently is a conflict, as is the share
- * held out.
+ * share held out both sides changed differently is a conflict.
  */
 export function mergeRepoSettings(base: RepoForm, mine: RepoForm, theirs: RepoForm): RepoMerged {
   const conflicts: RepoConflict[] = [];
@@ -216,7 +193,6 @@ export function mergeRepoSettings(base: RepoForm, mine: RepoForm, theirs: RepoFo
   };
   const mode = scalar("mode");
   const autoReview = scalar("autoReview");
-  const styleNotes = scalar("styleNotes");
   const evalShare = scalar("evalShare");
   const b = new Set(normalLogins(base.trustedReviewers));
   const m = normalLogins(mine.trustedReviewers);
@@ -227,7 +203,7 @@ export function mergeRepoSettings(base: RepoForm, mine: RepoForm, theirs: RepoFo
     ...normalLogins(theirs.trustedReviewers).filter((l) => !removed.has(l)),
     ...added,
   ]);
-  return { form: { mode, autoReview, trustedReviewers, styleNotes, evalShare }, conflicts };
+  return { form: { mode, autoReview, trustedReviewers, evalShare }, conflicts };
 }
 
 /** `form` with conflict `c` settled for `pick`. */

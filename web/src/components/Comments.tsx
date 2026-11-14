@@ -19,8 +19,8 @@ import { CategoryTag, SeverityBadge, severityHelp } from "./Severity";
 export const FormsContext = createContext<(id: string, dirty: boolean) => void>(() => {});
 
 /**
- * The categories a comment of the job's review may be filed under, from the rubric version the
- * job was reviewed against (`categoriesFor`): empty is free text.
+ * The categories a comment of the job's review may be filed under, from the rubric the job was
+ * reviewed against (`categoriesFor`): empty is free text.
  */
 export interface CategoryRules {
   allowed: string[];

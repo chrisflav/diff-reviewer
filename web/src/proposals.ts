@@ -1,68 +1,15 @@
 /**
- * Rubric proposals as the pages use them: what a refused accept means, the body of an accept,
- * where a proposal is rebased, and what adopting one puts into the rubric editor or the settings
- * — the proposal as edits made to the version it was written from, which the editors' three-way
- * merges then move onto the current one.
+ * Rubric proposals as the pages use them: where they are, what their pull request on the rubrics
+ * repository says of them, what one changes, and the rationale an agent wrote, read as text.
+ * A proposal is decided on GitHub (API 1.0.0): merged, it is accepted; closed unmerged, rejected.
  *
- * Pure functions and thin calls of `api`, so that the flow can be checked without a browser.
+ * Pure functions only, so that what the pages do can be checked without a browser.
  */
 
-import {
-  api,
-  ApiError,
-  type Repo,
-  type RubricDocument,
-  type RubricProposal,
-  type RubricProposalDiff,
-} from "./api";
-import { formOf } from "./repoSettings";
-import { alignRubric, documentOf, freshRubricKeys, toLocalRubric, toRubricDoc } from "./rubric";
-import { rubricStashKey, type RepoEdits, type RubricEdits } from "./stash";
+import type { RubricProposal, RubricProposalDiff } from "./api";
 
 /** The statuses of a proposal job still to write its proposal; mirrors `liveStatuses` in Lean. */
 export const LIVE_PROPOSAL_JOB = ["pending", "queued", "running"];
-
-/** Why an accept was refused, as the page explains it. */
-export type AcceptRefusal =
-  /** The rubric has moved since the proposal's base, or since it was read: rebase in the editor. */
-  | { kind: "moved"; baseVersion: number; currentVersion: number; message: string }
-  /** Anything else the server refused with a 409: decided already, notes changed or absent. */
-  | { kind: "refused"; message: string };
-
-/** What a failed accept was, or null when it was not a refusal (a 401, a network error, …). */
-export function acceptRefusal(err: unknown): AcceptRefusal | null {
-  if (!(err instanceof ApiError) || err.status !== 409) return null;
-  const b = err.body;
-  if (typeof b === "object" && b !== null) {
-    const { baseVersion, currentVersion } = b as Record<string, unknown>;
-    if (Number.isInteger(baseVersion) && Number.isInteger(currentVersion))
-      return {
-        kind: "moved",
-        baseVersion: baseVersion as number,
-        currentVersion: currentVersion as number,
-        message: err.message,
-      };
-  }
-  return { kind: "refused", message: err.message };
-}
-
-/**
- * The body of an accept: the rubric version the person read (the proposal's `currentVersion` as
- * the page loaded it), and the style notes only when asked and the proposal has some. Off unless
- * the person ticks it: accepting the rubric never writes the notes on its own.
- */
-export function acceptRequest(
-  p: Pick<RubricProposal, "currentVersion" | "proposesStyleNotes">,
-  applyStyleNotes = false,
-): { version: number; applyStyleNotes: boolean } {
-  return { version: p.currentVersion, applyStyleNotes: p.proposesStyleNotes && applyStyleNotes };
-}
-
-/** Accept `p` as read: `acceptRequest`'s body, sent. */
-export function acceptProposal(p: RubricProposal, applyStyleNotes = false) {
-  const r = acceptRequest(p, applyStyleNotes);
-  return api.acceptProposal(p.owner, p.name, p.id, r.version, r.applyStyleNotes);
-}
 
 /** Where a repository's proposals are. */
 export function proposalsPath(owner: string, name: string): string {
@@ -73,87 +20,23 @@ export function proposalPath(owner: string, name: string, id: string): string {
   return `${proposalsPath(owner, name)}/${encodeURIComponent(id)}`;
 }
 
-/** The rubric editor with proposal `id` opened in it, to be rebased and saved. */
-export function adoptRubricPath(owner: string, name: string, id: string): string {
-  return `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/rubric?proposal=${encodeURIComponent(id)}`;
-}
-
-/** The settings with proposal `id`'s style notes opened in them. */
-export function adoptNotesPath(owner: string, name: string, id: string): string {
-  return `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}?proposal=${encodeURIComponent(id)}`;
-}
-
-/** Why proposal `p` cannot be adopted into the rubric editor, or null. */
-export function adoptProblem(p: RubricProposal): string | null {
-  if (p.status === "rejected") return `Proposal ${p.id} was rejected; it cannot be adopted.`;
-  if (p.document === null || p.document === undefined)
-    return `Proposal ${p.id}'s document cannot be read by this version${p.documentError ? `: ${p.documentError}` : "."}`;
-  return null;
-}
-
-/**
- * Proposal `p` as rubric edits: its document, made to `base`, the version it was written from
- * (null for version 0, no rubric), named by `fromProposal`. Moved onto the current version by the
- * editor's three-way merge, what the proposal changed and the rubric did not since is taken, and
- * where both changed one thing the person picks.
- */
-export function adoptionEdits(
-  owner: string,
-  name: string,
-  p: RubricProposal,
-  base: RubricDocument | null,
-): RubricEdits | string {
-  const why = adoptProblem(p);
-  if (why !== null) return why;
-  const baseDoc = base === null ? { defaultRubric: "", prTypes: [] } : documentOf(base);
-  if (baseDoc === null)
-    return `Version ${p.baseVersion} of the rubric, which proposal ${p.id} was written from, cannot be read by this version.`;
-  const b = toLocalRubric(baseDoc);
-  const doc = p.document as NonNullable<RubricProposal["document"]>;
-  return {
-    repo: rubricStashKey(owner, name),
-    version: p.baseVersion,
-    base: b,
-    doc: alignRubric(b, doc, freshRubricKeys(b)),
-    fromProposal: p.id,
-  };
-}
-
-/** Load proposal `id` and the version it was written from, as `adoptionEdits`. */
-export async function loadAdoption(
-  owner: string,
-  name: string,
-  id: string,
-): Promise<RubricEdits | string> {
-  const p = await api.proposal(owner, name, id);
-  const why = adoptProblem(p);
-  if (why !== null) return why;
-  const base = p.baseVersion === 0 ? null : await api.rubricAt(owner, name, p.baseVersion);
-  return adoptionEdits(owner, name, p, base);
-}
-
-/** Save rubric edits, naming the proposal they were made from when they were. */
-export function saveRubricEdits(owner: string, name: string, e: RubricEdits) {
-  return api.putRubrics(owner, name, e.version, toRubricDoc(e.doc), e.fromProposal);
-}
-
-/**
- * Proposal `p`'s style notes as settings edits: made to the notes its agent was given (the rest of
- * the settings as `repo` holds them), named by `fromProposal`. Moved onto `repo` by the settings'
- * three-way merge: when the notes have changed since the agent read them, and the proposal changed
- * them too, the person picks.
- */
-export function notesAdoptionEdits(repo: Repo, p: RubricProposal): RepoEdits | string {
-  if (p.status === "rejected") return `Proposal ${p.id} was rejected; it cannot be adopted.`;
-  if (typeof p.styleNotes !== "string") return `Proposal ${p.id} proposes no style notes.`;
-  const now = formOf(repo);
-  return {
-    repo: rubricStashKey(repo.owner, repo.name),
-    version: repo.version,
-    base: { ...now, styleNotes: p.baseStyleNotes ?? "" },
-    form: { ...now, styleNotes: p.styleNotes },
-    fromProposal: p.id,
-  };
+/** Where a proposal stands on GitHub, in words: what its pull request says, or why none. */
+export function pullState(p: Pick<RubricProposal, "status" | "pullRequest" | "prError">): string {
+  const pr = p.pullRequest;
+  if (pr === null)
+    return p.prError === null
+      ? "Its pull request is not opened yet."
+      : "Its pull request could not be opened yet; it is tried again.";
+  switch (pr.state) {
+    case "open":
+      return "Its pull request is open: merged, the proposal is accepted; closed, rejected.";
+    case "merged":
+      return "Its pull request was merged: the proposal is accepted.";
+    case "closed":
+      return "Its pull request was closed unmerged: the proposal is rejected.";
+    default:
+      return `Its pull request is ${pr.state}.`;
+  }
 }
 
 /** Whether a proposal's diff changes nothing of the rubric (its style notes aside). */

@@ -17,6 +17,7 @@ It is built in milestones. The first six are here:
   `stale` a draft whose pull request has moved on, `failed` a run that ended without a review.
   `docs/openapi.json` describes the API and is served at `/api/openapi.json`.
 - **Background workers** inside `serve` (`DiffReviewer/Workers.lean`), every `--interval` seconds:
+  *following the rubrics* reads the head of the [rubrics repository](#rubrics)'s branch;
   *discovery* makes a job for every new head of an open pull request of a repository with
   `autoReview` (GitHub draft pull requests wait until they are ready; at most
   `--max-jobs-per-day` a repository), and makes every job of an older head `stale`, cancelling its
@@ -24,7 +25,7 @@ It is built in milestones. The first six are here:
   request's, fetches its diff (past `--max-diff-bytes` the job `failed`s) and puts it on
   [orchestra](https://github.com/chrisflav/orchestra) as an API client; *following* reads the
   queue entry and moves the job to `running`, or to `failed` when the run ends without a review;
-  *settling* settles every claim to post that is past its window, as
+  *rubric proposals* open their pull requests and follow them; *settling* settles every claim to post that is past its window, as
   `POST /api/v1/jobs/{id}/reconcile` would, and logs what it found. Kept diffs no live job needs,
   and any older than 30 days, are dropped.
 - **The agent API** (`/api/agent/v1/repos/{owner}/{name}/pulls/{pr}…`) and **the agent CLI**
@@ -51,22 +52,25 @@ It is built in milestones. The first six are here:
   job's head (otherwise the job is `stale`), and at most 3 posts by the platform in all; after that
   it is left `approved`, with why in its `error`, for a person to post. A post a person starts is
   never posted again by the platform, and does not count.
-- **Rubrics** (`/api/v1/repos/{owner}/{name}/rubrics`): per repository, a default rubric and the
-  kinds of pull request its reviews tell apart, each with its own rubric and categories, which the
-  agent reviews by. See [Rubrics](#rubrics).
+- **Rubrics**, in a git repository of their own (`DIFF_REVIEWER_RUBRICS_REPO`): per repository, a
+  default rubric and the kinds of pull request its reviews tell apart, each with its own rubric and
+  categories, and the style notes, which the agent reviews by at the commit its job is pinned to.
+  The platform only reads them (`/api/v1/repos/{owner}/{name}/rubrics`). See [Rubrics](#rubrics).
 - **A review's history** (`GET /api/v1/jobs/{id}/revisions`): every write of a job's review — the
   agent's submission, each edit, and what GitHub holds once it is posted — kept with who wrote it.
   The agent's draft beside what was posted is what calibration will learn from. It is bounded: the
-  agent's first draft, every revision GitHub holds, and the last 100 are kept. It and the rubric
+  agent's first draft, every revision GitHub holds, and the last 100 are kept. It and the rubric's
   history are paged (`?limit=…&offset=…`, 50 by default).
 - **Calibration** (`/api/v1/repos/{owner}/{name}/calibration/…`): the agent's reviews of past
   commits, scored against the reviews the repository's trusted reviewers wrote of the same commits.
   See [Calibration](#calibration).
 - **Learned review style**: the agent is shown inline comments the trusted reviewers wrote, to
-  write in their style, and the operator's `styleNotes`. See [Review style](#review-style).
+  write in their style, and the style notes, `style.md` beside the rubric. See
+  [Review style](#review-style).
 - **Rubric proposals** (`/api/v1/repos/{owner}/{name}/proposals`): an agent reads the calibration
-  data and the people's edits of the agent's drafts and proposes a rubric, which a person accepts
-  as the next rubric version or rejects. See [Rubric proposals](#rubric-proposals).
+  data and the people's edits of the agent's drafts and proposes a rubric, which the platform opens
+  as a pull request on the rubrics repository, for a person to merge or close. See
+  [Rubric proposals](#rubric-proposals).
 - **Fan-out**: a pull request type — or the rubric, for every review — may ask for its reviews to
   be run as one sub-run per category plus one by the default rubric, side by side, and merged into
   one draft. See [Fan-out](#fan-out).
@@ -92,6 +96,7 @@ DIFF_REVIEWER_AGENT_TOKEN_FILE=/etc/diff-reviewer/agent-token \
 DIFF_REVIEWER_GITHUB_TOKEN_FILE=/etc/diff-reviewer/github-token \
 DIFF_REVIEWER_ORCHESTRA_URL=https://orchestra.example \
 DIFF_REVIEWER_ORCHESTRA_TOKEN_FILE=/etc/diff-reviewer/orchestra-token \
+DIFF_REVIEWER_RUBRICS_REPO=chrisflav/review-rubrics \
   .lake/build/bin/diff-reviewer serve --db reviews.db --site web/dist
 ```
 
@@ -128,6 +133,9 @@ ignored.
 | `DIFF_REVIEWER_GITHUB_TOKEN_FILE` | The token for api.github.com: listing pull requests, reading one and its diff, posting reviews. Unset, there is no discovery, no diff and no posting. In production this is the placeholder `kleis` (see below). Also used by `diff-reviewer github`, which otherwise falls back to `gh auth token`. |
 | `DIFF_REVIEWER_GITHUB_LOGIN` | The GitHub login reviews are posted as. **Set it in production.** When a post's outcome is unknown, only reviews by this login count as the platform's: without it, anyone who writes a job's marker into a review of their own could make the platform record that job as posted (it logs this once). And on a pull request this login wrote, GitHub refuses an approval or a request for changes, so such a review is posted as a comment and the job's `postNote` says so. |
 | `DIFF_REVIEWER_GITHUB_API` | GitHub's API root, `https://api.github.com` by default. |
+| `DIFF_REVIEWER_RUBRICS_REPO` | The rubrics repository, `owner/name` (`chrisflav/review-rubrics`), read through the GitHub token: see [Rubrics](#rubrics). Unset, reviews have no rubric and there are no rubric proposals (it logs this once). |
+| `DIFF_REVIEWER_RUBRICS_BRANCH` | The branch whose head is the rubrics in use, and that rubric proposals' pull requests are opened into; `main` by default. |
+| `DIFF_REVIEWER_RUBRICS_MAPPING` | An export's mapping of old rubric versions to commits, loaded on start-up (see [Moving the rubrics out of the database](#moving-the-rubrics-out-of-the-database)). |
 | `DIFF_REVIEWER_ORCHESTRA_PROPOSER_TOKEN_FILE` | The platform's second API client token on orchestra, which rubric proposals are queued with (see [On orchestra](#on-orchestra)). Unset, proposal jobs stay `pending`, with why in their `error`. |
 | `DIFF_REVIEWER_ORCHESTRA_URL`, `DIFF_REVIEWER_ORCHESTRA_TOKEN_FILE` | Orchestra, and the platform's API client token on it. Without both, jobs stay `pending` (and the log says so once). Orchestra is always reached directly, never through `HTTPS_PROXY` (its host is curl's `noproxy`): the proxy is kleis, there for GitHub, and the orchestra token is not one kleis should see. Add the host to `NO_PROXY` too, for anything else in the environment. |
 | `HTTPS_PROXY`, `NO_PROXY`, `CURL_CA_BUNDLE`, `SSL_CERT_FILE` | Every outgoing request is made with `curl`, which reads these as usual (and no `~/.curlrc`: it runs with `-q`). Only `https` is used, or `http` to loopback. |
@@ -327,63 +335,231 @@ The platform holds no real credential of GitHub, and agents hold none of the pla
   reviews on the repositories it lists, so approved reviews appear under your own name.
   Calibration's imports read only under `/repos/{owner}/{name}/` too — the closed pull requests,
   their reviews and review comments, and a compare of two commits — which the same grant allows.
+- **The rubrics repository.** The same token reads it, and opens rubric proposals' pull requests
+  on it. A private one (`chrisflav/review-rubrics` is) needs the fine-grained PAT behind kleis to
+  include it, with **Contents: read** — and, for proposals only, **Contents: write** and **Pull
+  requests: write**. These are every request the platform makes of it (`{o}/{n}` the rubrics
+  repository, `{branch}` its branch):
+
+  | Method | Path | What for |
+  | --- | --- | --- |
+  | `GET` | `/repos/{o}/{n}/git/ref/heads/{branch}` | the branch's head, every pass (`409`: empty) |
+  | `GET` | `/repos/{o}/{n}` | after a `404` of the head: whether the repository is there to the token at all, or only the branch is missing |
+  | `GET` | `/repos/{o}/{n}/compare/{base}...{head}?per_page=100&page=…` | whether a new head descends from the last, and the commits between (provenance) |
+  | `GET` | `/repos/{o}/{n}/git/commits/{sha}` | a commit's tree |
+  | `GET` | `/repos/{o}/{n}/git/trees/{sha}`, `…?recursive=1` | the trees down to a directory, and its files |
+  | `GET` | `/repos/{o}/{n}/git/blobs/{sha}` | a file (`Accept: application/vnd.github.raw+json`) |
+  | `GET` | `/repos/{o}/{n}/commits?sha={branch or commit}&path={owner}/{name}&per_page=…&page=…` | a rubric's history, and a head's when it does not descend from the last |
+  | `POST` | `/repos/{o}/{n}/git/trees` | a proposal's tree, over its base's (Contents: write) |
+  | `POST` | `/repos/{o}/{n}/git/commits` | a proposal's commit (Contents: write) |
+  | `POST` | `/repos/{o}/{n}/git/refs` | its branch, `refs/heads/diff-reviewer/proposal/<owner>/<name>/<id>` (Contents: write) |
+  | `GET` | `/repos/{o}/{n}/git/ref/heads/diff-reviewer/proposal/…` | after a `422` making a proposal's branch: that it is at the proposal's commit |
+  | `GET` | `/repos/{o}/{n}/pulls?head={o}:{branch}&state=all` | the pull request of a proposal's branch, after a lost answer |
+  | `POST` | `/repos/{o}/{n}/pulls` | a proposal's pull request (Pull requests: write) |
+  | `GET` | `/repos/{o}/{n}/pulls/{number}` | whether it was merged or closed |
+
+  The writes are only ever to a branch under `diff-reviewer/proposal/`, and a pull request from
+  it: the platform never writes to the rubrics branch itself. A branch of a proposal's name that is
+  already there at another commit, or a pull request of it whose head is not the proposal's commit
+  in the rubrics repository, is someone else's: the proposal fails to open, saying so, rather than
+  take it. **Follow-ups, not in this
+  repository:** kleis's `diff-reviewer-poster` spec should allow the rubrics repository with
+  exactly these routes (the reads above for every repository it lists would be more than needed),
+  and restrict `POST …/git/refs` to refs under `refs/heads/diff-reviewer/proposal/`; and the
+  deployment (castor's nixos-config, PR #78) must add the rubrics repository to the grant's
+  repositories list and set `DIFF_REVIEWER_RUBRICS_REPO` (and `DIFF_REVIEWER_RUBRICS_BRANCH`, if
+  not `main`, and `DIFF_REVIEWER_RUBRICS_MAPPING` while the old versions are mapped). Neither the
+  `reviewer` nor the `rubric-proposer` spec gets anything of the rubrics repository: agents read
+  rubrics only through the platform, and never write them.
 
 ## Rubrics
 
-A repository's rubric is one document, `GET`/`PUT /api/v1/repos/{owner}/{name}/rubrics`:
+A repository's rubric — the default rubric, the kinds of pull request its reviews tell apart, each
+with its own rubric and categories, and its style notes — lives in **one git repository on
+GitHub, the rubrics repository** (`DIFF_REVIEWER_RUBRICS_REPO`, say `chrisflav/review-rubrics`),
+as a directory per reviewed repository. Git is the record: the platform only reads it, and people
+change a rubric by a commit or a pull request there. Every review is pinned to the commit it was
+reviewed against.
 
-```json
-{
-  "version": 3,
-  "defaultRubric": "Proofs must not use `sorry`. Prefer `simp only` in the middle of a proof.",
-  "prTypes": [
-    {
-      "name": "feature",
-      "description": "Adds new definitions or theorems.",
-      "rubric": "Check the names against the naming convention, and that every new definition has a docstring and the API a user needs.",
-      "categories": [
-        {"name": "correctness", "description": "Wrong, or proves the wrong thing."},
-        {"name": "naming", "description": "Against the naming convention."},
-        {"name": "docs", "description": "Missing or misleading documentation."}
-      ]
-    },
-    {"name": "refactor", "description": "Moves or renames without changing what is proved.",
-     "rubric": "Check that nothing is lost and that deprecations are added.", "categories": []}
-  ]
-}
+```
+acme/widgets/
+  rubric.md            the default rubric; front matter: fanout, types (their order)
+  style.md             the style notes
+  types/
+    feature.md         a pull request type; front matter: description, fanout, categories
+    refactor.md
 ```
 
+`acme/widgets/rubric.md`:
+
+```markdown
+---
+types:
+  - feature
+  - refactor
+---
+
+Proofs must not use `sorry`. Prefer `simp only` in the middle of a proof.
+```
+
+`acme/widgets/types/feature.md`:
+
+```markdown
+---
+description: Adds new definitions or theorems.
+fanout: false
+categories:
+  correctness: Wrong, or proves the wrong thing.
+  naming: Against the naming convention.
+  docs: Missing or misleading documentation.
+---
+
+Check the names against the naming convention, and that every new definition has a docstring and
+the API a user needs.
+```
+
+- **The files.** A file is YAML front matter between a first line `---` and the next `---`, and a
+  markdown body. `rubric.md`'s body is the default rubric; its front matter may set `fanout` (see
+  [Fan-out](#fan-out)) and `types`, the order the types are listed in (those it leaves out follow,
+  by name). A type is named by its file, `types/<name>.md`: its front matter has its
+  `description`, `fanout` and `categories`, a mapping of each category's name to its description
+  in the order they are listed; its body is its rubric. `style.md` is the style notes, the whole
+  file (see [Review style](#review-style)). A directory that is not there is no rubric; a missing
+  `rubric.md` is an empty default rubric. Front matter keys the platform does not know — of
+  `rubric.md`, of a type, or of a category written as a mapping (`docs: {description: …,
+  weight: 2}`) — are kept and passed on as fields of the document, the type or the category, so
+  that what a newer platform reads passes through an older one. The YAML read is what front matter
+  needs: mappings and lists by indentation, plain and quoted strings, `|` and `>` blocks, and flow
+  collections written as JSON; anchors, aliases, tags and tabs are refused rather than guessed at,
+  and a byte order mark is dropped. The bounds: front matter of at most 64 KiB and 1000 keys and
+  items, at most 50 types and 50 categories a type, names of at most 100 characters — two types'
+  names must differ in more than case, and `types/` holds nothing but `<type>.md` files, no
+  dotfile — rubrics of at most 64 KiB, style notes of at most 16 KiB.
 - **What to write.** The *default rubric* is what every review of the repository should look at:
   the conventions a maintainer checks first, what the repository cares about and what it does not.
   A *pull request type* is a kind of change that is reviewed differently: its `description` says
-  how to recognise it — the agent picks the type by it — and its `rubric` says what to look at in
+  how to recognise it — the agent picks the type by it — and its rubric says what to look at in
   such a change, on top of the default. Its *categories* are what its comments are filed under:
   short names (`correctness`, `naming`, `performance`), with a description of what belongs in each.
   Rubrics are markdown and go to the agent as they are, so write them as you would brief a careful
   new maintainer: concrete checks, not adjectives.
+- **Following the branch.** On every pass the workers read the head of
+  `DIFF_REVIEWER_RUBRICS_BRANCH` (`main` by default), through the platform's GitHub client — so
+  through kleis — and what that commit holds for every registered repository: its commit, its trees
+  down to the directory, and the directory's blobs, each commit once, kept in the database per
+  commit and repository (a directory whose tree was read at another commit is not read again).
+  When it reads, it is the rubric in use. **A head that does not read keeps the last one that did
+  in use**, and the API and the front-end show why, by file and line
+  (`acme/widgets/types/feature.md:4: 'naming' is given twice`); a review asked for while a
+  repository's rubric has never read waits for it, saying so. **Until the rubrics repository has
+  been read, nothing goes without a rubric:** reviews, calibration runs' jobs and proposals wait,
+  `pending`, with why in their `error`, and the rubric's answer says why too. A repository GitHub
+  does not find — or that the token cannot read, which GitHub answers the same, `404` — is told
+  apart from one without the branch by asking after the repository itself (`GET /repos/{o}/{n}`),
+  and is never taken for no rubric: a kleis grant or a token that does not reach it stops the
+  reviews rather than running them bare. Only a repository read, and empty or without the branch,
+  or without this repository's directory, is no rubric: reviews then go on without one
+  (`rubricVersion` 0), said once in the log and in the API, not retried as an error. Once read,
+  a later failure to read keeps the rubric in use, and says so.
+- **Pinning.** A job is pinned to the commit in use when it is queued (`rubricSha`; a job pinned
+  to none — no rubric — records `rubricVersion` 0, as it always has): its agent reads the rubric,
+  the types and the style notes at that commit, never a newer head, and its submission is checked
+  against them. A [fan-out](#fan-out)'s sub-runs read their job's commit; a calibration run pins
+  one commit for all its jobs when it is made — or, made before the rubrics repository was read,
+  when its first job is queued after. Running a failed review again pins it anew.
 - **How agents use them.** `agent show` gives the agent the default rubric at the end of its
-  `instructions`, and the types in `prTypes`, each with its rubric and categories. The agent picks
-  the type that fits, reviews by its rubric, and gives every comment a `severity` — `nit`,
-  `minor`, `major` or `blocker` — and a `category`. Its submission must name one of the types as
-  `prType` (or `null` when there are none), and each category must be one of that type's — or
-  is free text when that type lists none: the platform refuses anything else, saying what to fix,
-  while the agent can still fix it. A person's edit is checked the same way, for the comments
-  whose category it adds or changes; a job of no type (reviewed by hand) may use any category of
-  the document, or free text if it names none. A job reviewed with no rubric at all records
-  `rubricVersion` 0.
-- **Versions.** Every `PUT` names the version it replaces (`0` for the first) and is refused
-  (`409`) if that is no longer the current one; it becomes the next version, and every version is
-  kept (`GET …/rubrics/history`). A job records the version and the type it was reviewed against
-  (`rubricVersion`, `prType`), so a review is always read next to the rubric it was written to.
-  Fields the platform does not know, on the document, a type or a category, are kept through every
-  write, so a newer front-end's additions survive an older platform; and a `GET`'s answer may be
-  sent back as the next `PUT` as it is, edited. A version this build cannot read is shown with its
-  `documentError` and is not overwritten (`409`). Deleting a repository keeps its rubric versions,
-  as it keeps its jobs, which name them: registering it again picks its rubric up where it was.
+  `instructions`, then the style notes, the types in `prTypes`, each with its rubric and
+  categories, and the commit they are of (`rubricSha`). The agent picks the type that fits,
+  reviews by its rubric, and gives every comment a `severity` — `nit`, `minor`, `major` or
+  `blocker` — and a `category`. Its submission must name one of the types as `prType` (or `null`
+  when there are none), and each category must be one of that type's — or is free text when that
+  type lists none: the platform refuses anything else, saying what to fix, while the agent can
+  still fix it. A person's edit is checked the same way, for the comments whose category it adds
+  or changes; a job of no type (reviewed by hand) may use any category of the document, or free
+  text if it names none.
+- **Reading them.** `GET /api/v1/repos/{owner}/{name}/rubrics` is the rubric in use: the commit
+  (`sha`), the branch's head (`headSha`), why they differ (`error`, `errors`), the document, the
+  style notes, and each file with where to edit it on GitHub (`files[].editUrl`).
+  `GET …/rubrics/history` lists the commits of the branch that changed the directory, with their
+  author, date and message; `GET …/rubrics/commits/{sha}` is the rubric at any commit, and
+  `GET …/rubrics/compare?base=<sha>&head=<sha>` what changed between two, as a proposal's diff is
+  shown. The front-end's rubric page is a viewer of the same, with links to edit the files on
+  GitHub. There is no write.
 - **Not on GitHub.** Categories and severities are for the platform — reading, filtering,
   calibration, the categories of style examples — and are not part of what is posted: a posted
   review stays in the operator's plain style, which [Review style](#review-style) is how the
   agent learns.
+
+**Merge rights on the rubrics repository are control over reviews.** Everything in it goes into
+the agents' prompts: whoever can merge to its branch decides what every review looks at, and what
+a review agent is told to do. Protect the branch as you would the platform's own code — required
+reviews, no force-pushes — and give write access only to people you would let edit the platform's
+prompts. The agents never get write access to it: a review agent reads it only through the
+platform, and a [rubric proposal](#rubric-proposals) is written to it by the platform, as a pull
+request a person merges.
+
+### Checking a rubrics repository
+
+`diff-reviewer rubrics check <dir>` reads every `<owner>/<name>/` directory of a checkout as the
+platform does, prints every error as `file:line: message`, and exits 1 if there is one; a
+directory whose name is not a repository's in lower case is one (the platform names repositories
+in lower case). Run it in the rubrics repository's CI, so that a pull request that breaks a rubric
+is refused before it is merged rather than kept out of use after:
+
+```yaml
+# .github/workflows/check.yml in the rubrics repository
+name: Check the rubrics
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - name: Install diff-reviewer
+        env:
+          VERSION: v0.3.0
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p /tmp/dr
+          gh release download "$VERSION" --repo chrisflav/diff-reviewer \
+            --pattern "diff-reviewer-$VERSION-linux-x86_64*" --dir /tmp/dr
+          (cd /tmp/dr && sha256sum --check "diff-reviewer-$VERSION-linux-x86_64.sha256")
+          sudo install -m 755 "/tmp/dr/diff-reviewer-$VERSION-linux-x86_64" \
+            /usr/local/bin/diff-reviewer
+      - run: diff-reviewer rubrics check .
+```
+
+Pin the action by commit, and the release by a tag of one that has `rubrics check` (this one's or
+later); the binary is checked against the sha256 the release attaches beside it.
+
+### Moving the rubrics out of the database
+
+Rubrics lived in the database before (`repo_rubric`, and the style notes in `repo_notes`); those
+tables are kept, read-only. To move them:
+
+1. `diff-reviewer rubrics export --db reviews.db --out review-rubrics` writes a new git repository
+   in the layout above, on branch `main` (`--branch`), with one commit per version — rubric
+   versions and style notes versions interleaved in the order they were written, each authored and
+   dated when it was written — and the mapping of every version to its commit,
+   `review-rubrics.mapping.json` (`--mapping <file>`), with what each commit was derived from. A
+   version this build cannot read is left out, and said so; so is a type whose name cannot be a
+   file's. Every directory written is read back as the platform reads it, and the export stops
+   if one does not read. `--out` must not exist, or be empty.
+2. Push it to the empty rubrics repository: `git -C review-rubrics remote add origin …` and
+   `git push origin main`. Its commits keep their ids.
+3. A proposal waiting for a decision on the platform has nothing to decide it by now: the
+   upgrade's migration rejects it, noting "superseded by rubrics in git; ask again".
+4. Load the mapping: `diff-reviewer rubrics import-mapping --db reviews.db
+   review-rubrics.mapping.json`, or set `DIFF_REVIEWER_RUBRICS_MAPPING` to the file and `serve`
+   loads it on start-up (loading it again changes nothing). Old jobs and calibration scores keep
+   their integer `rubricVersion`; the API shows the commit it was exported as beside it
+   (`rubricSha`), the summary groups their scores under it, and an exported commit carries what
+   its version was derived from, so that scores made under it are judged as before.
 
 Every inline comment has an `id`, short and random, unique within its review: the platform gives
 one to each comment written without one, when the review is submitted or edited, and keeps the ones
@@ -456,7 +632,8 @@ reviewed, without being shown that review, and the two are compared.
    the samples run least so far (at most 20 either way); a sample that a live calibration job is
    reviewing already is refused (`409`), and `count` leaves those out. Each sample gets a
    `calibration` job at its commit, with its base for the diff, which is queued on orchestra and
-   reviewed as a review job is, with the same prompt and the repository's current rubric — apart
+   reviewed as a review job is, with the same prompt and the rubric in use when the run was made
+   (one commit for every job of the run, however the branch moves meanwhile) — apart
    from how the code is read, and from being told it is not posted. The prompt and what the agent
    reads name no sample and quote nothing of the person's review, and the task cannot read it
    on GitHub either: its orchestra request carries the kleis narrowing
@@ -485,7 +662,8 @@ reviewed, without being shown that review, and the two are compared.
    job; a draft that cannot be scored is marked `unscorable`, with why, once.
    `GET …/calibration/runs/{id}` shows each sample's result and the run's aggregate,
    `GET …/calibration/runs` every run's aggregate over time, and `GET …/calibration/summary` the
-   aggregate over all runs, and by the rubric version the jobs were reviewed against — so that a
+   aggregate over all runs, and by the rubric the jobs were reviewed against (`byRubric`: its
+   commit, and for the jobs of before, the version the mapping finds a commit for) — so that a
    rubric change can be judged by whether the numbers moved. A deleted sample's scores are left
    out of every aggregate, and still shown, marked, in its run.
 
@@ -509,23 +687,30 @@ an example or a proposal, and for a run, the list of runs or the summary (`GET �
   was by review may have): the examples of style ([Review style](#review-style)), a rubric
   proposal's misses, unmatched comments and pool aggregates, and its people's edits, which are of
   posted review jobs of pull requests with no `eval` sample ([Rubric proposals](#rubric-proposals)).
-- **Derived scores.** Every rubric version records what it was derived from (`derivedFrom`, the
-  samples, and `derivedFromPulls`, their pull requests): the pull requests the context of the
-  proposal it came from drew on — its misses, its unmatched comments, its people's edits — and
-  every earlier version's, since a person's edit of a derived rubric may keep what it learned.
-  Each version of the style notes records the same (kept by name, so a delete and a registration
-  again keep it), and each job records the notes version its agent was given when it read the job
-  (`notesVersion`), as it records its `rubricVersion`. A score whose sample's pull request is in
-  the set of its job's rubric version or notes version is `derived` (`scoreDerived` in a run's
-  results) — a sample of that pull request imported later too: left out of aggregates unless asked
-  (`?derived=include`), and counted (`derivedScores`), like a stale one. What it guards: the split
-  keeps eval out of what the agent learns from; this keeps what a rubric or the notes learned from
-  out of what measures them, wherever it came from — the pool when an eval sample of its pull
-  request arrives later, a pull request's posted reviews, samples split before the split was by
-  pull request. It holds for every way a proposal reaches the rubric or the notes: accepting it,
-  or saving a rebased version with `fromProposal` ([Rubric proposals](#rubric-proposals)). A
-  rubric or notes a person writes from what they read of a proposal without naming it is beyond
-  what the platform can know.
+- **Derived scores.** A merged [rubric proposal](#rubric-proposals) records what its context drew
+  on (the samples, and their pull requests) — its misses, its unmatched comments, its people's
+  edits — on its merge commit and on its own commit; the export records each old version's
+  provenance on the commit it made of it. **The rule:** a commit of the rubrics repository carries,
+  for a repository, the provenance of every commit before it on the branch that carries one,
+  itself among them — whoever changed the directory since, since a person's edit of a derived
+  rubric may keep what it learned, and a second proposal's merge keeps the first's. "Before it" is
+  known cheaply: every head the workers read is recorded as descending from the head read before
+  it, by the commits between them (one compare: `ahead` or `identical`, of at most 100 commits);
+  a head that does not descend from it — a force-push — or the first head read, is recorded by
+  the commits of the directory's history at it. So a force-push that drops a merge drops its
+  provenance too. A score whose sample's pull request (or which sample itself) is in the
+  provenance of its job's commit (`derivedFrom`, `derivedFromPulls` on the rubric's answer) is
+  `derived` (`scoreDerived` in a run's results) — a sample of that pull request imported later
+  too: left out of aggregates unless asked (`?derived=include`), and counted (`derivedScores`),
+  like a stale one. What it guards: the split keeps eval out of what the agent learns from; this
+  keeps what a rubric or the notes learned from out of what measures them, wherever it came from —
+  the pool when an eval sample of its pull request arrives later, a pull request's posted reviews,
+  samples split before the split was by pull request. The rubric and the style notes are one
+  directory, so a proposal of either is covered. A rubric or notes a person writes from what they
+  read of a proposal without merging it is beyond what the platform can know. The jobs and scores
+  of before keep the old rule, on the old tables: each rubric version and style notes version
+  recorded what it was derived from, and a score is derived by its job's `rubricVersion` and
+  `notesVersion`.
 
 ### What the numbers mean
 
@@ -618,79 +803,88 @@ or asks — is easier to show than to describe, so the agent is shown, and told 
 - **Never the pull request under review.** Every sample of the job's pull request is left out. For
   a calibration job that is the sample it is scored against and any other review of the same pull
   request, so the human review it is scored against never reaches the agent.
-- **Style notes.** `PUT /api/v1/repos/{owner}/{name}` takes `styleNotes`, markdown of at most 16
-  KiB the operator writes — what the examples cannot show: "one sentence a comment", "no
-  praise", "suggest, don't ask". It is versioned with the other settings (send the `version` you
-  read), kept by a write that leaves it out, and cleared by `""`. The agent's `instructions` end
-  with it, after the default rubric.
+- **Style notes.** `<owner>/<name>/style.md` in the rubrics repository, markdown of at most 16 KiB
+  — what the examples cannot show: "one sentence a comment", "no praise", "suggest, don't ask".
+  The agent's `instructions` end with them, after the default rubric, as they are at the commit
+  its job is pinned to. They live beside the rubric rather than in the settings so that everything
+  that shapes a review has one history, and a rubric proposal's notes travel in its pull request
+  with its rubric: the provenance of a merge commit covers both (see [Held out](#held-out)), and a
+  person who wants the rubric and not the notes drops `style.md` from the pull request before
+  merging it. A settings write naming `styleNotes` is refused, saying where they are. (Notes
+  written in the settings before are what the export writes as `style.md`.)
 
 ## Rubric proposals
 
 Calibration says where the agent and the trusted reviewers part, and the review history what
 people change in the agent's drafts before posting them. A rubric proposal is an agent reading
-both and writing the rubric it thinks the repository should have, with why. It is advisory: a
-person reads it beside the rubric and accepts or rejects it.
+both and writing the rubric it thinks the repository should have, with why. It is advisory: it is
+a pull request on the rubrics repository, which a person merges or closes.
 
 1. **Ask.** `POST /api/v1/repos/{owner}/{name}/proposals` with `{}` makes a `proposal` job of the
    repository (`prNumber` 0), queued on orchestra as a task of the repository with no pull request
-   (see [On orchestra](#on-orchestra)) and never posted. A repository has at most one live
-   proposal — a job pending, queued or running, or a proposal waiting for a decision (`409`) —
-   and at most `--max-proposals-per-day` (2 by default) are asked for a day (`429`). A failed one
+   (see [On orchestra](#on-orchestra)) and never posted, pinned like a review to the commit of the
+   rubrics repository in use. A repository has at most one live proposal — a job pending, queued
+   or running, or a proposal whose pull request is open or still to be opened (`409`) — and at
+   most `--max-proposals-per-day` (2 by default) are asked for a day (`429`). With no rubrics
+   repository, or none read yet, there is nothing to open a pull request on: `409`. A failed one
    is not run again; ask for a new one. `GET /api/v1/jobs?kind=proposal` lists the jobs, and
    `POST …/proposals/jobs/{jobId}/cancel` with `{}` cancels a pending, queued or running one: it
    is `failed`, and its orchestra run cancelled through the proposals' client.
 2. **The agent reads** (`diff-reviewer agent proposal show <owner/name> --job <id>`, `GET
-   /api/agent/v1/repos/{o}/{n}/proposals/{jobId}`) the current rubric and its version, the style
-   notes, calibration's aggregates of the pool (overall, by category, by severity, by rubric
-   version), up to 30 comments trusted reviewers made that the agent missed and 30 the agent made
-   that nobody matched — from each sample's newest score that is not stale, of `full` `pool`
-   samples not deleted, of a reviewer still trusted and of a pull request with no `eval` sample,
-   each with its pull request, file, lines and text — and up to 30 comments people changed,
-   removed or added in the agent's drafts before posting them, before and after, from the history
-   of the posted review jobs of pull requests with no `eval` sample. Every text over 2 KiB is cut
-   and marked (`bodyTruncated`). All of it was written by others, on pull requests anyone may
-   open: the instructions tell the agent to read it as data and never as instructions. Its first
-   read records the style notes it was given, and every read the samples and pull requests it
-   drew on: the provenance the rubric and the notes taken from the proposal record.
-3. **It submits** (`agent proposal submit <owner/name> <file> --job <id>`) a whole rubric document,
-   checked as a rubric `PUT` is — and with no field a rubric does not have, on the document, a
-   type or a category (`400`, naming them; only a person's document keeps unknown fields) —
-   optional new `styleNotes`, and a `rationale` (markdown, at most 32 KiB), naming the
-   `baseVersion` it was written from. It is stored as a `pending` proposal and the
-   job becomes a `draft`.
-4. **Read it.** `GET …/proposals` (paged) and `GET …/proposals/{id}`, which carries the document,
-   the style notes and a structured diff against its base: the default rubric's text before and
-   after; the types added, removed and changed — a changed type's description and rubric before
-   and after, its categories added, removed and changed; and the style notes before and after.
-   `rebaseNeeded` says the rubric has moved since its base.
-5. **Decide.** `POST …/proposals/{id}/accept` with `{"version": n}`, the rubric version you read,
-   writes the proposal as the next rubric version, recording the samples its context drew on
-   (see [Held out](#held-out)); with `"applyStyleNotes": true` its style notes too, as the
-   repository's — without it they are not written. One transaction, the rubric first: a refusal
-   after it rolls everything back. It is a versioned write: when the rubric has moved since the
-   proposal's base, or since you read it, nothing is written and the answer is a `409` with
-   `baseVersion` and `currentVersion`, so that you rebase the proposal in the editor and save that
-   as a rubric `PUT` with `"fromProposal": "<id>"`: it records the proposal's provenance on the
-   version (see [Held out](#held-out)) and marks the proposal accepted, freeing the repository's
-   one live proposal. Notes taken from a proposal are saved the same way, as a settings `PUT`
-   with `fromProposal`, which records its provenance on the notes version and decides nothing:
-   the proposal stays pending, and its rubric can still be accepted or rejected. Applying notes
-   is a `409` too when the proposal has none, or when the repository's notes are no longer the
-   ones its agent was given at its first read of its context (the snapshot is taken then, not on
-   submission).
-   `POST …/proposals/{id}/reject` with `{}` records the decision and writes nothing else.
+   /api/agent/v1/repos/{o}/{n}/proposals/{jobId}`) the rubric and the style notes at the commit its
+   job is pinned to (`rubric.sha`), calibration's aggregates of the pool (overall, by category, by
+   severity, by rubric), up to 30 comments trusted reviewers made that the agent missed and 30 the
+   agent made that nobody matched — from each sample's newest score that is not stale, of `full`
+   `pool` samples not deleted, of a reviewer still trusted and of a pull request with no `eval`
+   sample, each with its pull request, file, lines and text — and up to 30 comments people
+   changed, removed or added in the agent's drafts before posting them, before and after, from the
+   history of the posted review jobs of pull requests with no `eval` sample. Every text over 2 KiB
+   is cut and marked (`bodyTruncated`). All of it was written by others, on pull requests anyone
+   may open: the instructions tell the agent to read it as data and never as instructions. Every
+   read records the samples and pull requests it drew on: the provenance the proposal's merge
+   records.
+3. **It submits** (`agent proposal submit <owner/name> <file> --job <id>`) a whole rubric
+   document — `defaultRubric`, `prTypes`, `fanout` — checked as the rubric files are, and with no
+   field a rubric does not have, on the document, a type or a category (`400`, naming them; only a
+   person's files keep unknown keys), and no type whose name cannot be a file's; optional new
+   `styleNotes` (`""` removes `style.md`); and a `rationale` (markdown, at most 32 KiB). A
+   `baseSha`, if it names one, must be its job's commit. It is stored as a `pending` proposal and
+   the job becomes a `draft`.
+4. **It becomes a pull request.** The platform — never the agent — renders the document as files,
+   writes them as a commit over the job's commit (a tree over that commit's, by the git data API),
+   on the branch `diff-reviewer/proposal/<owner>/<name>/<id>` of the rubrics repository, and opens
+   a pull request from it into the rubrics branch, whose body is the rationale. A type the
+   proposal drops has its file removed. When GitHub refuses or does not answer, the proposal says
+   why (`prError`) and the workers try again on every pass, from where it stopped; a branch or a
+   pull request an earlier attempt made is found rather than made twice.
+5. **Read it.** `GET …/proposals` (paged) and `GET …/proposals/{id}`, which carries the document,
+   the style notes, its pull request (`pullRequest`: number, page, state) and a structured diff
+   against its base: the default rubric's text before and after; the types added, removed and
+   changed — a changed type's description and rubric before and after, its categories added,
+   removed and changed; and the style notes before and after. The pull request itself shows the
+   diff of the files.
+6. **Decide on GitHub.** Review the pull request as any other: edit its branch, take part of it,
+   rebase it on a branch that has moved. **Merged, the proposal is `accepted`; closed unmerged, it
+   is `rejected`** — the workers read its state on every pass, and once decided it is followed no
+   further. Merging is what changes the rubric: the merge is the branch's head, read on the next
+   pass like any other commit. Nothing is accepted or rejected on the platform.
 
 ## Fan-out
 
 A rubric with many categories asks one run to keep all of them in mind, and those it reaches last
-get the least of it. A pull request type that sets `"fanout": true` — or the document, beside its
-`defaultRubric`, for every review — is reviewed by **sub-runs** instead: one per category, each told
+get the least of it. A pull request type that sets `fanout: true` in its front matter — or
+`rubric.md`, for every review — is reviewed by **sub-runs** instead: one per category, each told
 to look at its category only and to file every comment under it, and one by the default rubric for
 what no category covers. Each is an orchestra task of its own.
 
-```json
-{"version": 3, "defaultRubric": "…", "prTypes": [
-  {"name": "feature", "fanout": true, "categories": [{"name": "correctness"}, {"name": "naming"}]}]}
+```markdown
+---
+description: Adds new definitions or theorems.
+fanout: true
+categories:
+  correctness: Wrong, or proves the wrong thing.
+  naming: Against the naming convention.
+---
 ```
 
 - **The type is fixed per repository.** The agent picks a pull request's type while it reviews it,
@@ -699,7 +893,7 @@ what no category covers. Each is an orchestra task of its own.
   by the default rubric's categories, which it has none of; the operator fixing the type — the last
   is the simplest that is correct: nothing runs twice, nothing waits, and the type is known when
   the job is queued. `PUT /api/v1/repos/{owner}/{name}` takes `"prType": "feature"` (a type of the
-  current rubric; `""` for none). The agent is then shown that type and must submit it, fanned out
+  rubric in use; `""` for none). The agent is then shown that type and must submit it, fanned out
   or not. Without a fixed type, a type's `fanout` does nothing — the agent picks and reviews in one
   run — while the document's fans every review out over every category of the document, as a
   review of no type may use. A fixed type the rubric has since dropped is not fixed.
@@ -708,8 +902,8 @@ what no category covers. Each is an orchestra task of its own.
   queued under `<job>.<key>`, its key made of its category's name (`default` for the default
   review), and its prompt names it so: `--job <job>.<key>`, sent as `X-Diff-Reviewer-Job`. The
   agent API binds every request to the job and the sub-run: the job alone is refused (`409`), and
-  a sub-run must be queued or running. `agent show` gives it the rubric version the job fanned out
-  under, its scope (`subRun`, and at the end of its `instructions`) and the type (`prType`). Its
+  a sub-run must be queued or running. `agent show` gives it the rubric at the commit the job
+  fanned out under, its scope (`subRun`, and at the end of its `instructions`) and the type (`prType`). Its
   submission is a partial review, checked as a review is, with every comment of its category for a
   category's sub-run, and kept on the sub-run. A run that ends without a submission is run once
   more (`<job>.<key>.2`, which its agent is named by too), charged against the day's cap like the
@@ -795,23 +989,29 @@ discovery, its cap and cancellations, queueing with the checkout each task asks 
 checkout orchestra refuses, in its own words, failing the job) and the narrowing each kind of job
 is queued with, following, posting once whatever GitHub answers,
 direct mode, settling claims on their own and posting a direct review again at most three times —
-against a fake GitHub and a fake orchestra, rubrics and their versions, the agent's submission
-checked against them, comment ids and unknown fields kept through every round trip (of reviews and
-rubrics), the history of a review from draft to post, the checks of a review against its diff,
+against a fake GitHub and a fake orchestra, rubrics in git — read from a fake rubrics repository
+that serves trees, blobs and commits at their shas and takes pull requests: an empty one, each
+head as the branch moves, the history and a compare, a broken head keeping the last good rubric
+with its errors' files and lines, a job reading the commit it was pinned to while the head moves,
+a calibration run's jobs and a fan-out's sub-runs all reading one commit; the files parsed, every
+error at its file and line, written back as they read, unknown keys kept; the check of a
+checkout; the export of the old versions as a history, and its mapping loaded so that old jobs
+find their commits — the agent's submission checked against them, comment ids and unknown fields
+kept through every round trip (of reviews and rubrics), the history of a review from draft to post, the checks of a review against its diff,
 the agent CLI against the server on loopback, calibration — trusted reviewers as a versioned
 setting, the import of past reviews (what it keeps and drops, idempotence, deleted samples, the rate
 limit and the budget of a pass), the matcher, runs and their cap, a force-pushed sample run without
 isolation and scored apart, calibration jobs left alone by
 discovery and never posted by any path, and the aggregates — learned style — the examples
-picked for variety and never of the pull request under review, the style notes as a versioned
-setting — rubric proposals — one live a repository and a cap a day, queued with no pull request
-through their own client, what the agent reads and submits, the diff, accepting as a versioned
-write that asks for a rebase when the rubric has moved and rolls back whole, the style notes
-applied only when asked and only over the notes the agent read, rejecting, cancelling, unknown
-fields refused, `fromProposal` keeping provenance, and style notes alone deciding nothing — runs
-recording their split — the held-out split by pull request, fixed
-once made, held-out pull requests teaching nothing, and derived scores, by rubric and notes
-version and by pull request, left out; the two agent tokens kept apart; the platform's
+picked for variety and never of the pull request under review, the style notes read from
+`style.md` and refused as a setting — rubric proposals — one live a repository and a cap a day,
+queued with no pull request through their own client, what the agent reads and submits, opened as
+a pull request of a tree, a commit and a branch over the job's commit and nothing else written,
+opened again by the workers when GitHub failed, accepted by its merge and rejected by its close,
+cancelling, unknown fields refused — runs recording their split — the held-out split by pull
+request, fixed once made, held-out pull requests teaching nothing, and derived scores — by the
+merge commit's tree, a later head leaving the directory alone still derived and one after a
+person's change not, by style notes alone, and by pull request — left out; the two agent tokens kept apart; the platform's
 own posts kept out of the samples; the job header required — fan-out: planned from the fixed type or the document, queued as sub-runs
 under their own external ids and cancelled with their job, each bound to its job and itself on the
 agent API, merged by the rules above, one failing and all failing, run again, `maxFanout` and the

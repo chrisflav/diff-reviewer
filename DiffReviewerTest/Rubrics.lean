@@ -2,19 +2,22 @@ import DiffReviewer
 import DiffReviewerTest.Basic
 import DiffReviewerTest.Server
 import DiffReviewerTest.Workers
+import DiffReviewerTest.FakeGit
 
 open Lean (Json)
 open DiffReviewer
 open DiffReviewer.Server
 open DiffReviewerTest.Server
 open DiffReviewerTest.Workers
+open DiffReviewerTest.FakeGit
 
 /-!
 # Rubrics, comment ids and a review's history
 
-A repository's rubric document, versioned; the agent reviewing by it and its submission checked
-against it; comments that keep their ids and the fields this build does not know; every write of a
-review in the job's history; and claims to post settled by the loop itself.
+A repository's rubric, read from the rubrics repository at its branch's head and kept while a
+head does not read; the agent reviewing by it at the commit its job is pinned to, and its
+submission checked against it; comments that keep their ids and the fields this build does not
+know; every write of a review in the job's history; and claims to post settled by the loop itself.
 -/
 
 namespace DiffReviewerTest.Rubrics
@@ -22,9 +25,13 @@ namespace DiffReviewerTest.Rubrics
 private def putRepo (st : State) (body : String) : IO Unit := do
   let _ ← route st (req .put "/api/v1/repos/acme/widgets" body)
 
-private def putRubric (st : State) (version : Nat) (doc : String) : IO Reply :=
-  route st (req .put "/api/v1/repos/acme/widgets/rubrics"
-    s!"\{\"version\": {version}, {doc}}")
+/-- Commit `doc` (the fields of a rubric document) as `acme/widgets`'s rubric, and follow the
+    branch once: the commit. -/
+def setRubric (fg : FakeGit) (svc : Workers.Services) (doc : String) (notes : String := "") :
+    IO String := do
+  let sha ← fg.setRubric "acme" "widgets" s!"\{{doc}}" notes
+  refresh svc
+  return sha
 
 /-- A document with two types: `feature`, with categories, and `docs`, without. -/
 private def twoTypes : String :=
@@ -88,40 +95,95 @@ def commentsKeepTheirIdsAndUnknownFields : Test := do
     ++ check (r'.checkCategories ["correctness"] matches .error _) "a category not allowed"
     ++ check (r'.checkCategories [] matches .ok ()) "free text when there are none"
 
-/-- A repository's rubric is one document, written whole and versioned: a write names the version
-    it replaces, and every version is kept. -/
-def rubricsAreVersioned : Test := withTempDb do
-  let st ← State.new cfg
+/-- A repository's rubric is its directory in the rubrics repository, at the head of its branch:
+    none before the repository has a branch (an empty one), said once; then each head as it moves,
+    its history of the commits that changed the directory, any commit's rubric, and a compare of
+    two. Nothing writes it: there is no `PUT`. -/
+def rubricsAreReadFromGit : Test := withTempDb do
+  let fg ← FakeGit.new
+  let logs ← IO.mkRef #[]
+  let svc := fg.attach (← Workers.Services.new (log := fun m => logs.modify (·.push m)))
+  let st ← State.new cfg svc
+  let unconfigured ← State.new cfg
   let unregistered ← route st (req .get "/api/v1/repos/acme/widgets/rubrics")
   putRepo st "{}"
-  let none_ ← route st (req .get "/api/v1/repos/acme/widgets/rubrics")
-  let first ← putRubric st 0 twoTypes
-  let staleWrite ← putRubric st 0 "\"defaultRubric\": \"other\""
-  let second ← putRubric st 1 "\"defaultRubric\": \"Be brief.\""
-  let current ← route st (req .get "/api/v1/repos/Acme/Widgets/rubrics")
+  let none_ ← route unconfigured (req .get "/api/v1/repos/acme/widgets/rubrics")
+  -- An empty repository: no branch, no rubric, said once.
+  refresh svc
+  refresh svc
+  let empty ← route st (req .get "/api/v1/repos/acme/widgets/rubrics")
+  let emptyHistory ← route st (req .get "/api/v1/repos/acme/widgets/rubrics/history")
+  let saidEmpty := (← logs.get).filter fun m => (m.splitOn "has no branch main").length > 1
+  let first ← setRubric fg svc twoTypes
+  let atFirst ← route st (req .get "/api/v1/repos/Acme/Widgets/rubrics")
+  -- Another repository's directory changing leaves this one's history alone.
+  let _ ← fg.change [("other/repo/rubric.md", some "Other.\n")]
+  let second ← setRubric fg svc "\"defaultRubric\": \"Be brief.\"" (notes := "One sentence.")
+  let current ← route st (req .get "/api/v1/repos/acme/widgets/rubrics")
   let history ← route st (req .get "/api/v1/repos/acme/widgets/rubrics/history")
-  let twice ← putRubric st 2 "\"prTypes\": [{\"name\": \"a\"}, {\"name\": \"a\"}]"
-  let nameless ← putRubric st 2 "\"prTypes\": [{\"description\": \"x\"}]"
-  let dupCategory ← putRubric st 2
-    "\"prTypes\": [{\"name\": \"a\", \"categories\": [{\"name\": \"c\"}, {\"name\": \"c\"}]}]"
-  let noVersion ← route st (req .put "/api/v1/repos/acme/widgets/rubrics" "{\"prTypes\": []}")
-  let versions := (itemsOf history).map (·.getObjValAs? Nat "version" |>.toOption)
-  let firstTypes := ((bodyJson first).getObjVal? "prTypes").toOption.bind (·.getArr?.toOption)
+  let old ← route st (req .get s!"/api/v1/repos/acme/widgets/rubrics/commits/{first}")
+  let cmp ← route st { req .get "/api/v1/repos/acme/widgets/rubrics/compare" with
+                       query := s!"base={first}&head={second}" }
+  let put ← route st (req .put "/api/v1/repos/acme/widgets/rubrics" "{\"version\": 0}")
+  let badSha ← route st (req .get "/api/v1/repos/acme/widgets/rubrics/commits/abc")
+  let shas := (itemsOf history).map (strOf · "sha")
+  let types (r : Reply) := ((bodyJson r).getObjVal? "prTypes").toOption.bind (·.getArr?.toOption)
+  let files := ((bodyJson current).getObjVal? "files").toOption.bind (·.getArr?.toOption)
+  let d := ((bodyJson cmp).getObjVal? "diff").toOption.getD .null
   return checkStatus unregistered 404 "the rubric of a repository nobody registered"
-    ++ checkStatus none_ 200 "a repository without a rubric"
-    ++ checkEq (versionOf none_) 0 "its version"
-    ++ checkStatus first 200 "the first document"
-    ++ checkEq (versionOf first) 1 "its version"
-    ++ checkEq (firstTypes.map (·.size)) (some 2) "its types"
-    ++ checkStatus staleWrite 409 "a write naming a version that is no longer current"
-    ++ checkStatus second 200 "the second document"
+    ++ checkStatus none_ 200 "with no rubrics repository configured"
+    ++ check ((bodyJson none_).getObjVal? "repository" matches .ok .null) "said so"
+    ++ checkStatus empty 200 "an empty rubrics repository"
+    ++ checkEq (field empty "sha") none "no commit"
+    ++ check (((bodyJson empty).getObjVal? "error").toOption.bind (strOf · "message") |>.any
+      fun m => (m.splitOn "has no branch main").length > 1) "why, in the answer"
+    ++ checkEq saidEmpty.size 1 "and in the log, once"
+    ++ checkEq (itemsOf emptyHistory).length 0 "no history"
+    ++ checkEq (field atFirst "sha") (some first) "the first commit, in use"
+    ++ checkEq ((types atFirst).map (·.size)) (some 2) "its types"
+    ++ checkEq (field current "sha") (some second) "the head, in use"
     ++ checkEq (field current "defaultRubric") (some "Be brief.") "the current document"
-    ++ checkEq (versionOf current) 2 "the current version"
-    ++ checkEq versions [some 2, some 1] "the history, newest first"
-    ++ checkStatus twice 400 "two types of one name"
-    ++ checkStatus nameless 400 "a type without a name"
-    ++ checkStatus dupCategory 400 "two categories of one name"
-    ++ checkStatus noVersion 400 "a write without a version"
+    ++ checkEq (field current "styleNotes") (some "One sentence.") "the style notes, from style.md"
+    ++ checkEq ((files.map (·.size))) (some 2) "its files, rubric.md and style.md"
+    ++ check (((files.bind (·[0]?)).bind (strOf · "editUrl")).any fun u =>
+      u == "https://github.com/chrisflav/review-rubrics/edit/main/acme/widgets/rubric.md")
+      "each with where to edit it"
+    ++ checkEq shas [some second, some first] "the history, the commits of the directory only"
+    ++ checkEq ((types old).map (·.size)) (some 2) "an older commit's rubric"
+    ++ checkStatus cmp 200 "a compare"
+    ++ checkEq ((d.getObjVal? "defaultRubric").toOption.bind (strOf · "after")) (some "Be brief.")
+      "what changed"
+    ++ checkEq (((d.getObjVal? "typesRemoved").toOption.bind (·.getArr?.toOption)).map (·.size))
+      (some 2) "the types removed"
+    ++ checkStatus put 405 "no write"
+    ++ checkStatus badSha 400 "a commit that is not a whole id"
+
+/-- A head that does not read is not used: the last that did stays in use, and the errors are
+    shown with their files and lines; once fixed, the head is used again. A review waits while no
+    head has ever read. -/
+def aBrokenHeadKeepsTheLastGood : Test := withTempDb do
+  let fg ← FakeGit.new
+  let svc := fg.attach (← Workers.Services.new (log := fun _ => pure ()))
+  let st ← State.new cfg svc
+  putRepo st "{}"
+  let good ← setRubric fg svc twoTypes
+  let broken ← fg.change [("acme/widgets/types/bad.md",
+    some "---\ndescription: fine\ncategories: [\n---\nBody.\n")]
+  refresh svc
+  let shown ← route st (req .get "/api/v1/repos/acme/widgets/rubrics")
+  let err := ((bodyJson shown).getObjVal? "error").toOption.getD .null
+  let pin ← Rubrics.pinFor "acme" "widgets"
+  let fixed ← fg.change [("acme/widgets/types/bad.md",
+    some "---\ndescription: fine\ncategories:\n  a: b\n---\nBody.\n")]
+  refresh svc
+  let after ← route st (req .get "/api/v1/repos/acme/widgets/rubrics")
+  return checkEq (field shown "sha") (some good) "the last good commit, still in use"
+    ++ checkEq (field shown "headSha") (some broken) "beside the head"
+    ++ checkEq (strOf err "file") (some "acme/widgets/types/bad.md") "the file"
+    ++ checkEq ((err.getObjValAs? Nat "line").toOption) (some 3) "the line"
+    ++ checkEq pin (some good) "what a job is pinned to"
+    ++ checkEq (field after "sha") (some fixed) "fixed, the head is used"
+    ++ check ((bodyJson after).getObjVal? "error" matches .ok .null) "and nothing is wrong"
 
 /-- The agent is given the rubric and reviews by it: its submission names one of the types, files
     its comments under that type's categories, and the job records both and the rubric's version;
@@ -130,15 +192,18 @@ def theAgentReviewsByTheRubric : Test := withTempDb do
   let gh ← FakeGitHub.new #[pull7]
   let orch ← FakeOrchestra.new
   let logs ← IO.mkRef #[]
-  let svc ← services gh orch logs
+  let fg ← FakeGit.new
+  let svc := fg.attach (← services gh orch logs)
   let st ← State.new cfg svc
   putRepo st "{}"
-  let _ ← putRubric st 0 twoTypes
+  let pinned ← setRubric fg svc twoTypes
   let created ← route st (req .post "/api/v1/jobs"
     s!"\{\"owner\": \"acme\", \"name\": \"widgets\", \"prNumber\": 7, \"headSha\": \"{headA}\"}")
   let id := (field created "id").getD ""
   Workers.queuePending svc
   let prompt := ((← orch.queued.get)[0]?.map (·.prompt)).getD ""
+  -- The head moves while the job runs: its agent still reads the commit it was pinned to.
+  let moved ← setRubric fg svc "\"defaultRubric\": \"Something else.\""
   let shown ← routeAgent st (agentReq .get "")
   let types := (((bodyJson shown).getObjVal? "prTypes").bind (·.getArr?)).toOption.getD #[]
   let feature := types[0]?.getD .null
@@ -165,8 +230,9 @@ def theAgentReviewsByTheRubric : Test := withTempDb do
     ++ checkEq types.size 2 "the pull request types"
     ++ checkEq (strOf feature "rubric") (some "Look at the names.") "a type's rubric"
     ++ checkEq categories.size 2 "a type's categories"
-    ++ checkEq ((bodyJson shown).getObjValAs? Nat "rubricVersion").toOption (some 1)
-      "the rubric's version"
+    ++ checkEq (field shown "rubricSha") (some pinned) "the commit the job is pinned to"
+    ++ check (moved != pinned && !mentions instructions "Something else.")
+      "not the head the branch moved to"
     ++ check (mentions prompt "prTypes") "the prompt says to pick a type"
     ++ check (mentions prompt "severity") "the prompt says to give severities"
     ++ checkStatus noType 400 "no type, where the rubric names types"
@@ -175,8 +241,7 @@ def theAgentReviewsByTheRubric : Test := withTempDb do
     ++ checkStatus badSeverity 400 "a severity that is not one"
     ++ checkStatus submitted 200 "the submission"
     ++ checkEq (field job "prType") (some "feature") "the job's type"
-    ++ checkEq (((bodyJson job).getObjValAs? Nat "rubricVersion").toOption) (some 1)
-      "the job's rubric version"
+    ++ checkEq (field job "rubricSha") (some pinned) "the job's rubric commit"
     ++ check ((strOf comment "id").any validCommentId) "the comment's id"
     ++ checkEq (strOf comment "category") (some "correctness") "the comment's category"
     ++ checkEq (strOf comment "severity") (some "major") "the comment's severity"
@@ -247,12 +312,14 @@ def oldReviewsGetIdsWhenWritten : Test := withTempDb do
 /-- A person's edit is held to the rubric too: a category of the job's type, and free text where
     the rubric names none. -/
 def editsAreCheckedAgainstTheRubric : Test := withTempDb do
-  let st ← State.new cfg
+  let fg ← FakeGit.new
+  let svc := fg.attach (← Workers.Services.new (log := fun _ => pure ()))
+  let st ← State.new cfg svc
   let job ← newJob st
   let id := (field job "id").getD ""
   let free ← route st (req .put s!"/api/v1/jobs/{id}/review"
     (reviewBody 1 (withComment ", \"category\": \"whatever\"")))
-  let _ ← putRubric st 0 twoTypes
+  let _ ← setRubric fg svc twoTypes
   let unknown ← route st (req .put s!"/api/v1/jobs/{id}/review"
     (reviewBody (versionOf free) (withComment ", \"category\": \"whatever\"")))
   let known ← route st (req .put s!"/api/v1/jobs/{id}/review"
@@ -313,37 +380,33 @@ def claimsSettleThemselves : Test := withTempDb do
     ++ checkEq said.size 2 "both logged"
     ++ checkEq (← gh.posted.get).size 1 "and nothing posted by settling"
 
-/-- A document keeps the fields this build does not know — on itself, a type and a category —
-    through a write and a read, including the write of a client that sends back what it read; the
-    answer's own fields (`version`, `owner`, …) are not kept as the document's. -/
+/-- A rubric's files keep the front-matter keys this build does not know — of `rubric.md`, a
+    type's file and a category written as a mapping — and show them; the agent is given them as
+    the document's own fields. -/
 def rubricsKeepUnknownFields : Test := withTempDb do
-  let st ← State.new cfg
+  let fg ← FakeGit.new
+  let svc := fg.attach (← Workers.Services.new (log := fun _ => pure ()))
+  let st ← State.new cfg svc
   putRepo st "{}"
-  -- As a newer build would have written it.
-  let newer := "{\"defaultRubric\": \"d\", \"tone\": \"terse\", \"prTypes\": [{\"name\": \
-\"feature\", \"weight\": 2, \"categories\": [{\"name\": \"style\", \"color\": \"red\"}]}]}"
-  Store.run <| HasModel.save
-    ({ owner := "acme", name := "widgets", version := 1, document := newer
-     , created_at := "2026-01-01T00:00:00Z", derived_samples := none
-     , derived_prs := none } : Store.RubricRow)
+  let _ ← fg.change [
+    ("acme/widgets/rubric.md", some "---\ntone: terse\n---\nd\n"),
+    ("acme/widgets/types/feature.md", some "---\nweight: 2\ncategories:\n  style:\n    \
+description: Style\n    color: red\n---\nLook.\n")]
+  refresh svc
   let read ← route st (req .get "/api/v1/repos/acme/widgets/rubrics")
-  -- An older client: changes the default rubric, sends back the rest as it read it.
-  let back := (bodyJson read).setObjVal! "defaultRubric" "d, revised"
-  let written ← route st (req .put "/api/v1/repos/acme/widgets/rubrics" back.compress)
-  let some stored ← Platform.currentRubric "acme" "widgets" | return #["no rubric"]
-  let doc := (Json.parse stored.documentRaw).toOption.getD .null
-  let ty := (((doc.getObjVal? "prTypes").bind (·.getArr?)).toOption.bind (·[0]?)).getD .null
+  let ty := (((bodyJson read).getObjVal? "prTypes").toOption.bind (·.getArr?.toOption) |>.bind
+    (·[0]?)).getD .null
   let cat := (((ty.getObjVal? "categories").bind (·.getArr?)).toOption.bind (·[0]?)).getD .null
-  return checkEq (field read "tone") (some "terse") "the document's unknown field, read"
-    ++ checkStatus written 200 "writing it back"
-    ++ checkEq (versionOf written) 2 "as the next version"
-    ++ checkEq (strOf doc "defaultRubric") (some "d, revised") "the change"
-    ++ checkEq (strOf doc "tone") (some "terse") "the document's unknown field, kept"
-    ++ checkEq ((ty.getObjValAs? Nat "weight").toOption) (some 2) "a type's, kept"
-    ++ checkEq (strOf cat "color") (some "red") "a category's, kept"
-    ++ check (!(doc.getObjVal? "owner").isOk && !(doc.getObjVal? "version").isOk)
+  -- Written back as files, they read as they were.
+  let doc := (Rubric.ofJson (bodyJson read) (ignore := Rubrics.viewFields)).toOption.getD {}
+  let again := RubricFiles.parseDir (RubricFiles.render doc)
+  return checkEq (field read "tone") (some "terse") "the document's unknown key"
+    ++ checkEq ((ty.getObjValAs? Nat "weight").toOption) (some 2) "a type's"
+    ++ checkEq (strOf cat "color") (some "red") "a category's"
+    ++ checkEq (strOf cat "description") (some "Style") "beside its description"
+    ++ check ((again.toOption.map (·.rubric == doc)).getD false) "rendered and read again, the same"
+    ++ check ((doc.extra.lookup "owner").isNone && (doc.extra.lookup "sha").isNone)
       "the answer's own fields are not the document's"
-    ++ checkEq (field written "tone") (some "terse") "and the answer shows it"
 
 /-- A `direct` repository with a running job of pull request 7; answers the job's id. -/
 private def directJob (st : State) (svc : Workers.Services) : IO String := do
@@ -471,9 +534,12 @@ def rubricEdgesAreHeld : Test := withTempDb do
   let gh ← FakeGitHub.new #[pull7]
   let orch ← FakeOrchestra.new
   let logs ← IO.mkRef #[]
-  let svc ← services gh orch logs
+  let fg ← FakeGit.new
+  let svc := fg.attach (← services gh orch logs)
   let st ← State.new cfg svc
   putRepo st "{}"
+  -- An empty rubrics repository, read: no rubric.
+  refresh svc
   let created ← route st (req .post "/api/v1/jobs"
     s!"\{\"owner\": \"acme\", \"name\": \"widgets\", \"prNumber\": 7, \"headSha\": \"{headA}\"}")
   let id := (field created "id").getD ""
@@ -483,7 +549,7 @@ def rubricEdgesAreHeld : Test := withTempDb do
     (submission headA (withComment ", \"category\": \"legacy\"")))
   let noRubric ← job! id
   -- A rubric with categories now: the job was reviewed against none, so free text still holds.
-  let _ ← putRubric st 0 twoTypes
+  let _ ← setRubric fg svc twoTypes
   let freeStill ← route st (req .put s!"/api/v1/jobs/{id}/review"
     (reviewBody noRubric.version (withComment ", \"category\": \"invented\"")))
   -- A job from before rubrics, against the current one: an unchanged category stands.
@@ -505,15 +571,6 @@ def rubricEdgesAreHeld : Test := withTempDb do
   let revs ← Platform.revisions id
   let page1 ← route st { req .get s!"/api/v1/jobs/{id}/revisions" with query := "limit=2" }
   let badLimit ← route st { req .get s!"/api/v1/jobs/{id}/revisions" with query := "limit=0" }
-  -- A rubric this build cannot read, and nulls.
-  let nullTypes ← putRubric st 1 "\"prTypes\": null"
-  let nullDefault ← putRubric st 1 "\"defaultRubric\": null"
-  Store.run <| HasModel.save
-    ({ owner := "acme", name := "widgets", version := 2, document := "{\"prTypes\": 7}"
-     , created_at := "2026-01-01T00:00:00Z", derived_samples := none
-     , derived_prs := none } : Store.RubricRow)
-  let unreadable ← route st (req .get "/api/v1/repos/acme/widgets/rubrics")
-  let overwrite ← putRubric st 2 "\"defaultRubric\": \"x\""
   let doc : Rubric := match Rubric.ofJson ((Json.parse s!"\{{twoTypes}}").toOption.getD .null) with
     | .ok d => d
     | .error _ => {}
@@ -533,15 +590,12 @@ def rubricEdgesAreHeld : Test := withTempDb do
     ++ checkEq (itemsOf page1).length 2 "a page"
     ++ checkEq ((bodyJson page1).getObjValAs? Nat "nextOffset").toOption (some 2) "the next one"
     ++ checkStatus badLimit 400 "a limit of 0"
-    ++ checkStatus nullTypes 400 "null types"
-    ++ checkStatus nullDefault 400 "a null default rubric"
-    ++ check (field unreadable "documentError" |>.isSome) "an unreadable rubric, shown so"
-    ++ checkStatus overwrite 409 "and not overwritten"
     ++ checkEq (strOf posted "decision") (some "comment") "the decision GitHub's state says"
 
 def all : List (String × Test) :=
   [("commentsKeepTheirIdsAndUnknownFields", commentsKeepTheirIdsAndUnknownFields),
-   ("rubricsAreVersioned", rubricsAreVersioned),
+   ("rubricsAreReadFromGit", rubricsAreReadFromGit),
+   ("aBrokenHeadKeepsTheLastGood", aBrokenHeadKeepsTheLastGood),
    ("theAgentReviewsByTheRubric", theAgentReviewsByTheRubric),
    ("everyWriteIsARevision", everyWriteIsARevision),
    ("oldReviewsGetIdsWhenWritten", oldReviewsGetIdsWhenWritten),

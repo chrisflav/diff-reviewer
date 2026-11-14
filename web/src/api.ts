@@ -53,20 +53,10 @@ export interface Repo {
   /** The GitHub logins, in lower case, whose past reviews calibration scores the agent against. */
   trustedReviewers: string[];
   /**
-   * How the repository's reviews are written, in markdown (at most 16 KiB): the agent's
-   * instructions end with it. Empty for none. Absent from a server older than API 0.6.0.
-   */
-  styleNotes?: string;
-  /**
    * The percent of new calibration samples held out as `eval` (what runs measure by); the rest
    * are the `pool` examples and proposals learn from. Absent before API 0.6.0.
    */
   evalShare?: number;
-  /**
-   * The version of the style notes, 0 before any; each records what it was derived from. Absent
-   * before API 0.6.0.
-   */
-  styleNotesVersion?: number;
   /**
    * The pull request type every review of the repository is of, fixed by the operator (null: the
    * agent picks). A type with `fanout` fans out only when fixed. Absent before API 0.7.0.
@@ -86,18 +76,15 @@ export interface Repo {
 /**
  * A write of a repository's settings. `mode` and `autoReview` fall back to their defaults when
  * left out; `trustedReviewers` is kept. `version` (0 for a repository not registered) makes a
- * stale write a 409; left out, it is not checked.
+ * stale write a 409; left out, it is not checked. The style notes are not a setting (API 1.0.0):
+ * they live in the rubrics repository, and a write naming `styleNotes` or `fromProposal` is a 400.
  */
 export interface RepoSettings {
   mode?: PostingMode;
   autoReview?: boolean;
   trustedReviewers?: string[];
-  /** Kept when left out; an empty string clears them. */
-  styleNotes?: string;
   /** 0 to 100; kept when left out. Changes only the pull requests split after it. */
   evalShare?: number;
-  /** The rubric proposal the style notes written were taken from: records its provenance. */
-  fromProposal?: string;
   /** A type of the current rubric to fix, or "" for none; kept when left out. */
   prType?: string;
   /** 1 to 51; kept when left out. */
@@ -135,8 +122,8 @@ export interface Review {
 }
 
 /**
- * Rubric documents, like reviews, keep the fields this client does not know: edit what was read
- * (spread it) rather than rebuild it, and the server keeps the rest.
+ * The rubric's parts keep the fields this client does not know (front matter a newer build
+ * reads), as the server sends them.
  */
 export interface Category {
   name: string;
@@ -159,27 +146,89 @@ export interface PrType {
   [field: string]: unknown;
 }
 
-/** One version of a repository's rubric document. */
-export interface RubricDocument {
+/** Where a rubric commit does not parse: the file and line, when known, and why. */
+export interface RubricError {
+  file: string | null;
+  line: number | null;
+  message: string;
+}
+
+/** One file of the rubric at its commit, with where to read it and where to edit it on GitHub. */
+export interface RubricFile {
+  path: string;
+  /** The file at the commit (`…/blob/<sha>/<path>`). */
+  url: string;
+  /** GitHub's editor of the file on the branch (`…/edit/<branch>/<path>`). */
+  editUrl: string;
+}
+
+/**
+ * A repository's rubric as the rubrics repository holds it at one commit (API 1.0.0): read only,
+ * changed by commits and pull requests on GitHub. The answer of `GET …/rubrics` (the commit in
+ * use) and of `GET …/rubrics/commits/{sha}`. Front-matter keys of `rubric.md` this build does not
+ * know are spread into it.
+ */
+export interface RubricView {
   owner: string;
   name: string;
-  /** 0 for a repository with no rubric yet; sent back with the next write. */
-  version: number;
-  createdAt: string | null;
-  /** Null only when `documentError` says why the stored document cannot be read. */
-  defaultRubric: string | null;
-  prTypes: PrType[] | null;
-  documentError: string | null;
+  /** The rubrics repository, `owner/name`; null when none is configured. */
+  repository: string | null;
+  branch: string;
+  /** The repository's directory in it, `owner/name`. */
+  directory: string;
+  /** The commit the rubric is read at; null when there is none to read (see `error`). */
+  sha: string | null;
+  /** `GET …/rubrics` only: the head of the branch last seen. Null at a commit asked for. */
+  headSha: string | null;
+  /** When the head was last read. */
+  checkedAt: string | null;
   /**
-   * The calibration samples this version was derived from (an accepted proposal's context, and
-   * every earlier version's). Absent before API 0.6.0.
+   * Of `GET …/rubrics`: why the head is not the commit in use (it does not parse), or why there
+   * is no rubric at all (an empty repository, a missing branch, none configured). Of a commit:
+   * why it does not parse.
    */
-  derivedFrom?: string[];
-  /** The pull requests (`owner/name#pr`) it was derived from. Absent before API 0.6.0. */
-  derivedFromPulls?: string[];
-  /** Whether every review fans out, over the fixed type's categories (API 0.7.0). */
-  fanout?: boolean;
+  error: RubricError | null;
+  /** Whether the directory exists at `sha`; false: no rubric there. */
+  exists: boolean;
+  defaultRubric: string;
+  prTypes: PrType[];
+  /** Whether every review fans out, over the fixed type's categories. */
+  fanout: boolean;
+  /** How the repository's reviews are written, in markdown (`style.md`); empty for none. */
+  styleNotes: string;
+  files: RubricFile[];
+  /** The directory on the branch, on GitHub; null when there is none. */
+  treeUrl: string | null;
+  /** The integer version of the old platform this commit was exported from, if any. */
+  legacyVersion: number | null;
+  /** The calibration samples the rubric was derived from. */
+  derivedFrom: string[];
+  /** The pull requests (`owner/name#pr`) it was derived from. */
+  derivedFromPulls: string[];
   [field: string]: unknown;
+}
+
+/** One commit of the rubrics repository touching a repository's directory. */
+export interface RubricCommit {
+  sha: string;
+  message: string;
+  author: string;
+  authorLogin: string | null;
+  date: string;
+  /** The commit on GitHub. */
+  url: string;
+  legacyVersion: number | null;
+}
+
+/** What changed of a repository's rubric between two commits. */
+export interface RubricCompare {
+  base: string;
+  head: string;
+  /** The comparison on GitHub. */
+  url: string;
+  /** Null with `diffError` when either commit does not parse. */
+  diff: RubricProposalDiff | null;
+  diffError: string | null;
 }
 
 /** One write of a job's review. */
@@ -229,7 +278,15 @@ export interface Job {
   postNote: string | null;
   /** The review as GitHub holds it, once posted. */
   postedReview: { id: number; url: string; body: string } | null;
-  /** The rubric version the review was checked against: 0 for none, null from before rubrics. */
+  /**
+   * The rubrics repository's commit the review was checked against (API 1.0.0); null for a job
+   * from before, or one reviewed with no rubric.
+   */
+  rubricSha: string | null;
+  /**
+   * Legacy: the rubric version of the old platform the review was checked against: 0 for none,
+   * null when not recorded. Shown when `rubricSha` is null.
+   */
   rubricVersion: number | null;
   /** How many times the platform has posted the review on its own (`direct`), at most 3. */
   directPosts: number;
@@ -244,7 +301,7 @@ export interface Job {
   /** The calibration sample and run of a `calibration` job. */
   sampleId?: string | null;
   runId?: string | null;
-  /** The style notes version the agent was given when it read the job (API 0.6.0). */
+  /** Legacy: the style notes version the agent was given, before the rubrics repository. */
   notesVersion?: number | null;
   /**
    * The sub-runs of a fan-out review, default first; empty when not fanned out. Only in the
@@ -424,8 +481,8 @@ export interface CalibrationAggregate {
   staleScores: number;
   staleIncluded: boolean;
   /**
-   * Scores of samples the rubric version (or the style notes) were derived from, and whether
-   * they are counted (`?derived=include`). Absent before API 0.6.0.
+   * Scores of samples the rubric (with its style notes) was derived from, and whether they are
+   * counted (`?derived=include`). Absent before API 0.6.0.
    */
   derivedScores?: number;
   derivedIncluded?: boolean;
@@ -454,6 +511,9 @@ export interface CalibrationRunResult {
   jobId: string;
   status: JobStatus | string;
   error: string | null;
+  /** The rubric commit its job was reviewed against (API 1.0.0). */
+  rubricSha: string | null;
+  /** Legacy: the old platform's rubric version. */
   rubricVersion: number | null;
   prType: string | null;
   sample: {
@@ -474,7 +534,7 @@ export interface CalibrationRunResult {
   score: CalibrationScore | CalibrationUnscorable | null;
   /** A review joined the sample after the score was made; the score is kept as it was. */
   scoreStale: boolean;
-  /** The score is of a sample its rubric version learned from: left out of the aggregate. */
+  /** The score is of a sample its rubric learned from: left out of the aggregate. */
   scoreDerived?: boolean;
   /**
    * Whether the job was checked out isolated at its commit: false when a force-push left the
@@ -507,10 +567,19 @@ export interface CalibrationSummary {
   runs: number;
   samples: number;
   overall: CalibrationAggregate;
-  /** Newest rubric version first; 0 is no rubric. */
-  byRubricVersion: { rubricVersion: number | null; aggregate: CalibrationAggregate }[];
+  /**
+   * By the rubric the jobs were reviewed against, newest first: its commit, or for jobs from
+   * before the rubrics repository, the legacy version (0: no rubric; both null: unrecorded).
+   */
+  byRubric: RubricAggregate[];
   /** Whose scores: `eval`. Absent before API 0.6.0. */
   split?: string;
+}
+
+export interface RubricAggregate {
+  rubricSha: string | null;
+  rubricVersion: number | null;
+  aggregate: CalibrationAggregate;
 }
 
 export type RubricProposalStatus = "pending" | "accepted" | "rejected";
@@ -521,10 +590,10 @@ export type TextChange = { before: string; after: string } | null;
 /** A flag before and after, or null when it is the same. */
 export type FlagChange = { before: boolean; after: boolean } | null;
 
-/** What a proposal changes of the rubric version it was written from. */
+/** What a proposal changes of the rubric it was written from, or one commit of another. */
 export interface RubricProposalDiff {
   defaultRubric: TextChange;
-  /** The document's `fanout`, when the proposal changes it (API 0.7.0). */
+  /** The document's `fanout`, when it changes (API 0.7.0). */
   fanout?: FlagChange;
   typesAdded: PrType[];
   /** Their names. */
@@ -544,7 +613,17 @@ export interface RubricProposalDiff {
   styleNotes: TextChange;
 }
 
-/** A rubric document an agent proposed from the calibration data, for a person to decide. */
+/** The pull request a proposal is, on the rubrics repository. */
+export interface ProposalPull {
+  number: number;
+  url: string;
+  state: "open" | "merged" | "closed" | string;
+}
+
+/**
+ * A rubric an agent proposed from the calibration data: a pull request on the rubrics repository
+ * (API 1.0.0). Merged, it is accepted; closed unmerged, rejected. Decided on GitHub.
+ */
 export interface RubricProposal {
   id: string;
   owner: string;
@@ -552,37 +631,31 @@ export interface RubricProposal {
   /** The `proposal` job that wrote it. */
   jobId: string;
   status: RubricProposalStatus | string;
-  /** The rubric version it was written from; 0 for none. */
-  baseVersion: number;
-  /** The rubric's version now. */
-  currentVersion: number;
-  /** Pending, and the rubric has moved since its base: accepting is a 409; rebase in the editor. */
-  rebaseNeeded: boolean;
+  /** The rubric commit it was written from; null when there was none. */
+  baseSha: string | null;
+  /** The rubric commit in use now. */
+  currentSha: string | null;
   /** Why, in markdown. */
   rationale: string;
   proposesStyleNotes: boolean;
   createdAt: string;
   decidedAt: string | null;
-  /** The rubric version accepting it wrote. */
-  acceptedVersion: number | null;
+  /** The branch of the rubrics repository it is written on. */
+  branch: string;
+  /** Null until it is opened. */
+  pullRequest: ProposalPull | null;
+  /** Why the pull request could not be opened yet. */
+  prError: string | null;
+  /** The commit merging it made, once merged. */
+  mergeSha: string | null;
   /** Only in the answer for one proposal. */
   document?: { defaultRubric: string; prTypes: PrType[]; [field: string]: unknown } | null;
   documentError?: string | null;
   styleNotes?: string | null;
-  /** The repository's style notes when it was submitted, when it proposes some. */
+  /** The style notes at its base, when it proposes some. */
   baseStyleNotes?: string | null;
   diff?: RubricProposalDiff | null;
   diffError?: string | null;
-}
-
-/**
- * The body of a 409 from accepting a proposal whose base the rubric has moved on from (or that was
- * read at an older version): both versions, for a rebase in the editor. On `ApiError.body`.
- */
-export interface ProposalMoved {
-  error: string;
-  baseVersion: number;
-  currentVersion: number;
 }
 
 export interface JobDiff {
@@ -679,53 +752,24 @@ export const api = {
   revisions: (id: string, limit = 50, offset = 0) =>
     request<Page<Revision>>("GET", `/api/v1/jobs/${seg(id)}/revisions?${pageQuery(limit, offset)}`),
 
+  /** The rubric in use, at its commit, and what is wrong with the branch's head, if anything. */
   rubrics: (owner: string, name: string) =>
-    request<RubricDocument>("GET", `/api/v1/repos/${seg(owner)}/${seg(name)}/rubrics`),
-  /**
-   * Replace the whole document; `version` is the one last read (0 for none). `fromProposal` names
-   * the rubric proposal it was rebased from: the version records its provenance, and the
-   * proposal is accepted (API 0.6.0).
-   */
-  putRubrics: (
-    owner: string,
-    name: string,
-    version: number,
-    doc: { defaultRubric: string; prTypes: PrType[]; [field: string]: unknown },
-    fromProposal?: string,
-  ) =>
-    request<RubricDocument>("PUT", `/api/v1/repos/${seg(owner)}/${seg(name)}/rubrics`, {
-      version,
-      ...doc,
-      ...(fromProposal === undefined ? {} : { fromProposal }),
-    }),
-  /** One page of the versions of the document, newest first. */
+    request<RubricView>("GET", rubrics(owner, name)),
+  /** One page of the commits touching the repository's rubric directory, newest first. */
   rubricHistory: (owner: string, name: string, limit = 50, offset = 0) =>
-    request<Page<RubricDocument>>(
+    request<Page<RubricCommit>>(
       "GET",
-      `/api/v1/repos/${seg(owner)}/${seg(name)}/rubrics/history?${pageQuery(limit, offset)}`,
+      `${rubrics(owner, name)}/history?${pageQuery(limit, offset)}`,
     ),
-
-  /**
-   * Version `version` of the document: the current one, or found in the history, which is newest
-   * first and numbered without gaps, so that `current - version` is where to look first.
-   */
-  rubricAt: async (owner: string, name: string, version: number): Promise<RubricDocument> => {
-    const now = await api.rubrics(owner, name);
-    if (now.version === version) return now;
-    const guess = now.version - version;
-    if (guess > 0) {
-      const page = await api.rubricHistory(owner, name, 1, guess);
-      const hit = page.items.find((v) => v.version === version);
-      if (hit !== undefined) return hit;
-    }
-    for (let offset: number | null = 0; offset !== null;) {
-      const page: Page<RubricDocument> = await api.rubricHistory(owner, name, 200, offset);
-      const hit = page.items.find((v) => v.version === version);
-      if (hit !== undefined) return hit;
-      offset = page.nextOffset;
-    }
-    throw new ApiError(404, `${owner}/${name} has no rubric version ${version}`);
-  },
+  /** The rubric at commit `sha` of the rubrics repository. */
+  rubricAt: (owner: string, name: string, sha: string) =>
+    request<RubricView>("GET", `${rubrics(owner, name)}/commits/${seg(sha)}`),
+  /** What changed of the rubric from commit `base` to commit `head`. */
+  compareRubrics: (owner: string, name: string, base: string, head: string) =>
+    request<RubricCompare>(
+      "GET",
+      `${rubrics(owner, name)}/compare?base=${seg(base)}&head=${seg(head)}`,
+    ),
 
   /** Queue an import of the `limit` (default 50, at most 200) most recent closed pull requests. */
   importCalibration: (owner: string, name: string, limit?: number) =>
@@ -807,7 +851,7 @@ export const api = {
       `${calibration(owner, name)}/runs/${seg(id)}${scoreQuery(stale, derived, "?", isolatedOnly)}`,
     ),
   /**
-   * The aggregate over every run, and by rubric version; `stale` counts stale scores too, and
+   * The aggregate over every run, and by rubric; `stale` counts stale scores too, and
    * `derived` derived ones; `isolatedOnly` leaves out those of jobs not checked out isolated.
    */
   calibrationSummary: (
@@ -824,7 +868,7 @@ export const api = {
 
   /**
    * Ask an agent for a rubric proposal: answers the `proposal` job. 409 while one is live (a job
-   * running, or a proposal waiting for a decision); 429 past the daily cap.
+   * running, or a proposal whose pull request is open); 429 past the daily cap.
    */
   createProposal: (owner: string, name: string) =>
     request<Job>("POST", proposals(owner, name), {}),
@@ -837,29 +881,14 @@ export const api = {
   /** One proposal, with its document, style notes and diff against its base. */
   proposal: (owner: string, name: string, id: string) =>
     request<RubricProposal>("GET", `${proposals(owner, name)}/${seg(id)}`),
-  /**
-   * Accept a proposal as the next rubric version; `version` is the rubric version read, and
-   * `applyStyleNotes` writes its style notes too. A 409 whose body is a `ProposalMoved` means the
-   * rubric has moved: rebase in the editor.
-   */
-  acceptProposal: (
-    owner: string,
-    name: string,
-    id: string,
-    version: number,
-    applyStyleNotes = false,
-  ) =>
-    request<{ proposal: RubricProposal; rubric: RubricDocument }>(
-      "POST",
-      `${proposals(owner, name)}/${seg(id)}/accept`,
-      { version, applyStyleNotes },
-    ),
   /** Cancel a pending, queued or running proposal job: it fails, and its run is cancelled. */
   cancelProposalJob: (owner: string, name: string, jobId: string) =>
     request<Job>("POST", `${proposals(owner, name)}/jobs/${seg(jobId)}/cancel`, {}),
-  rejectProposal: (owner: string, name: string, id: string) =>
-    request<RubricProposal>("POST", `${proposals(owner, name)}/${seg(id)}/reject`, {}),
 };
+
+function rubrics(owner: string, name: string): string {
+  return `/api/v1/repos/${seg(owner)}/${seg(name)}/rubrics`;
+}
 
 function proposals(owner: string, name: string): string {
   return `/api/v1/repos/${seg(owner)}/${seg(name)}/proposals`;

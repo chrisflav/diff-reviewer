@@ -15,7 +15,7 @@ import {
   type JobDiff,
   type JobStatus,
   type Review,
-  type RubricDocument,
+  type RubricView,
 } from "../api";
 import { CommentList } from "../components/CommentList";
 import {
@@ -53,9 +53,10 @@ import {
 } from "../review";
 import {
   categoriesFor,
-  documentOf,
   reviewCategoryProblem,
-  rubricVersionOfJob,
+  rubricLabel,
+  rubricOfJob,
+  rubricPath,
   storedCategories,
 } from "../rubric";
 import { dropStash, reopen, stash, unstash, type Edits, type Stashed } from "../stash";
@@ -248,8 +249,9 @@ function JobView({ id, onUnauthorized }: { id: string; onUnauthorized: () => voi
   // The rubric the review was written to, for the categories its comments may carry.
   const owner = job?.owner;
   const repoName = job?.name;
-  const rubricWanted = job === null ? null : rubricVersionOfJob(job.rubricVersion);
-  const fetchRubric = useCallback((): Promise<RubricDocument | null> => {
+  const wanted = job === null ? null : rubricOfJob(job);
+  const rubricWanted = wanted === null ? null : wanted.kind === "sha" ? wanted.sha : wanted.kind;
+  const fetchRubric = useCallback((): Promise<RubricView | null> => {
     if (owner === undefined || repoName === undefined || rubricWanted === null)
       return Promise.resolve(null);
     if (rubricWanted === "none") return Promise.resolve(null);
@@ -271,12 +273,12 @@ function JobView({ id, onUnauthorized }: { id: string; onUnauthorized: () => voi
         note: `The rubric could not be loaded (${rubricError}), so a category is free text here; the server checks it on save.`,
       };
     if (rubric === null) return { ...none, note: "Loading the rubric's categories…" };
-    const doc = documentOf(rubric);
-    if (doc === null)
+    if (rubric.sha === null || (rubricWanted !== "current" && rubric.error !== null))
       return {
         ...none,
-        note: `The rubric (version ${rubric.version}) cannot be read by this version, so a category is free text here; the server checks it on save.`,
+        note: `The rubric cannot be read${rubric.error === null ? "" : ` (${rubric.error.message})`}, so a category is free text here; the server checks it on save.`,
       };
+    const doc = rubric;
     const prType = job?.prType ?? null;
     const allowed = categoriesFor(doc, prType);
     const descriptions = new Map<string, string>();
@@ -500,36 +502,44 @@ function JobView({ id, onUnauthorized }: { id: string; onUnauthorized: () => voi
         <dd>{job.prType ?? <span className="mute">—</span>}</dd>
         <dt>Rubric</dt>
         <dd>
-          {job.rubricVersion === null ? (
+          {typeof job.rubricSha === "string" ? (
+            <Link
+              className="data"
+              to={rubricPath(job.owner, job.name, job.rubricSha)}
+              title={job.rubricSha}
+            >
+              {rubricLabel(job)}
+              {job.prType !== null && `, type ${job.prType}`}
+            </Link>
+          ) : job.rubricVersion === null ? (
             <>
               <span className="mute">none recorded; categories are checked against the </span>
-              <Link
-                to={`/repos/${encodeURIComponent(job.owner)}/${encodeURIComponent(job.name)}/rubric`}
-              >
-                current rubric
-              </Link>
+              <Link to={rubricPath(job.owner, job.name)}>rubric in use</Link>
             </>
           ) : job.rubricVersion === 0 ? (
             <span className="mute">none (reviewed with no rubric)</span>
           ) : (
-            <Link
-              to={`/repos/${encodeURIComponent(job.owner)}/${encodeURIComponent(job.name)}/rubric?version=${job.rubricVersion}`}
-            >
-              version {job.rubricVersion}
+            <>
+              <span className="data">{rubricLabel(job)}</span>
               {job.prType !== null && `, type ${job.prType}`}
-            </Link>
+              <span className="mute">
+                {" "}
+                (from before the rubrics repository; categories are checked against the{" "}
+              </span>
+              <Link to={rubricPath(job.owner, job.name)}>rubric in use</Link>
+              <span className="mute">)</span>
+            </>
           )}
         </dd>
-        {job.notesVersion !== undefined && (
+        {typeof job.notesVersion === "number" && job.rubricSha === null && (
           <>
+            {/* Style notes come with the rubric now: a version is a legacy job's. */}
             <dt>Style notes</dt>
             <dd>
-              {job.notesVersion === null ? (
-                <span className="mute">not recorded</span>
-              ) : job.notesVersion === 0 ? (
+              {job.notesVersion === 0 ? (
                 <span className="mute">none (the agent was given no style notes)</span>
               ) : (
-                <span className="data">version {job.notesVersion}</span>
+                <span className="data">v{job.notesVersion}</span>
               )}
             </dd>
           </>
@@ -788,8 +798,9 @@ function CalibrationNotice({ job }: { job: Job }) {
       <div className="notice calibration-notice">
         <p>
           <strong>A rubric proposal job: never posted.</strong> An agent reads the repository's
-          calibration data and the people's edits of its drafts, and proposes a rubric for a person
-          to accept or reject. It is of the repository, not of a pull request.
+          calibration data and the people's edits of its drafts, and proposes a rubric, as a pull
+          request on the rubrics repository for a person to merge or close. It is of the
+          repository, not of a pull request.
         </p>
         <p>
           <Link to={proposalsPath(job.owner, job.name)}>The repository's rubric proposals</Link>

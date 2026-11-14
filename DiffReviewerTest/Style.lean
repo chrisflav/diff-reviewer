@@ -3,6 +3,7 @@ import DiffReviewerTest.Basic
 import DiffReviewerTest.Server
 import DiffReviewerTest.Workers
 import DiffReviewerTest.Calibration
+import DiffReviewerTest.FakeGit
 
 open Lean (Json)
 open DiffReviewer
@@ -10,15 +11,17 @@ open DiffReviewer.Server
 open DiffReviewerTest.Server
 open DiffReviewerTest.Workers
 open DiffReviewerTest.Calibration
+open DiffReviewerTest.FakeGit
 
 /-!
 # Learned review style and rubric proposals, against fakes
 
 The examples `agent show` carries, picked from the calibration samples for variety and never
-from the pull request under review; the style notes, a versioned setting the instructions carry;
-and a rubric proposal's whole life — asked for, queued as a task of the repository through its own
-orchestra client, written from the calibration data and the people's edits, and accepted as the
-next rubric version, or refused when the rubric has moved since.
+from the pull request under review; the style notes, the rubrics repository's `style.md`, which the
+instructions carry; and a rubric proposal's whole life — asked for, queued as a task of the
+repository through its own orchestra client, written from the calibration data and the people's
+edits, opened as a pull request on the rubrics repository, and accepted by its merge or rejected
+by its close.
 -/
 
 namespace DiffReviewerTest.Style
@@ -84,10 +87,12 @@ def examplesLeaveOutThePullUnderReview : Test := withTempDb do
   f.reviews.modify (·.map fun (n, r) =>
     (n, if n == 13 then r else { r with submittedAt := some "2026-09-01T00:00:00Z" }))
   let orch ← FakeOrchestra.new
-  let svc ← DiffReviewerTest.Calibration.services f orch
+  let fg ← FakeGit.new
+  let svc := fg.attach (← DiffReviewerTest.Calibration.services f orch)
   let st ← State.new cfg svc
   let _ ← imported st svc f (evalShare := 0)
-  let _ ← putRepo st "{\"styleNotes\": \"Keep comments to one sentence.\"}"
+  let _ ← fg.setRubric "acme" "widgets" "{}" (notes := "Keep comments to one sentence.")
+  refresh svc
   let evalRun ← runOf st [← sampleId st 301]
   let made ← poolRunOf st [← sampleId st 301]
   let jobId := ((resultsOf made).head?.bind (str · ["jobId"])).getD ""
@@ -137,27 +142,29 @@ def examplesLeaveOutThePullUnderReview : Test := withTempDb do
     ++ check (!has (bodies heldOut) "rename that") "an eval sample is never an example"
     ++ checkEq (examplesOf none_).length 0 "with nobody trusted, no examples"
 
-/-- The style notes are a setting: kept by a write that leaves them out, bounded, versioned. -/
-def styleNotesAreASetting : Test := withTempDb do
+/-- The style notes are no setting but the rubrics repository's `style.md`: a write of the settings
+    that names them, or a proposal to adopt them from, is refused, saying where they are; and the
+    file is read, bounded. -/
+def styleNotesAreInTheRubricsRepository : Test := withTempDb do
   let st ← State.new cfg
   let made ← putRepo st "{\"styleNotes\": \"Be brief.\"}"
-  let kept ← putRepo st "{\"mode\": \"staged\"}"
-  let stale ← putRepo st "{\"version\": 1, \"styleNotes\": \"Be long.\"}"
+  let adopted ← putRepo st "{\"fromProposal\": \"x\"}"
+  let plain ← putRepo st "{\"mode\": \"staged\"}"
   let long := String.ofList (List.replicate (maxStyleNotesBytes + 1) 'x')
-  let tooLong ← putRepo st s!"\{\"styleNotes\": \"{long}\"}"
-  let notText ← putRepo st "{\"styleNotes\": 3}"
-  let cleared ← putRepo st s!"\{\"version\": {versionOf kept}, \"styleNotes\": \"\"}"
-  return checkEq (field made "styleNotes") (some "Be brief.") "written"
-    ++ checkEq (field kept "styleNotes") (some "Be brief.")
-      "a write that leaves them out keeps them"
-    ++ checkStatus stale 409 "a write of a version that is no longer current"
-    ++ checkStatus tooLong 400 "past 16 KiB"
-    ++ checkStatus notText 400 "not a string"
-    ++ checkEq (field cleared "styleNotes") (some "") "cleared"
+  let read := RubricFiles.parseDir [{ path := "style.md", content := "\nBe brief.\n\n" }]
+  let tooLong := RubricFiles.parseDir [{ path := "style.md", content := long }]
+  return checkStatus made 400 "notes in the settings"
+    ++ check ((field made "error").any fun e => (e.splitOn "acme/widgets/style.md").length > 1)
+      "saying where they are"
+    ++ checkStatus adopted 400 "notes adopted from a proposal"
+    ++ checkStatus plain 201 "the other settings"
+    ++ check (!((bodyJson plain).getObjVal? "styleNotes" |>.isOk)) "which hold no notes"
+    ++ checkEq (read.toOption.map (·.styleNotes)) (some "Be brief.") "style.md, read"
+    ++ check (tooLong matches .error _) "past 16 KiB"
     ++ checkEq (Workers.instructionsFor none "") Workers.instructions "no notes, nothing added"
 
 def rubricV1 : String :=
-  "{\"version\": 0, \"defaultRubric\": \"Check names.\", \"prTypes\": [\
+  "{\"defaultRubric\": \"Check names.\", \"prTypes\": [\
 {\"name\": \"feature\", \"description\": \"Adds things.\", \"rubric\": \"Check docs.\", \
 \"categories\": [{\"name\": \"naming\", \"description\": \"Names.\"}]}, \
 {\"name\": \"refactor\", \"description\": \"Moves.\", \"categories\": []}]}"
@@ -169,36 +176,56 @@ def proposedRubric : String :=
 {\"name\": \"docs\", \"description\": \"Docstrings.\"}]}, \
 {\"name\": \"fix\", \"description\": \"Fixes a bug.\", \"categories\": []}]}"
 
-def proposal (base : Nat) (rubric : String := proposedRubric)
-    (notes : String := "\"One sentence a comment.\"") : String :=
-  s!"\{\"baseVersion\": {base}, \"rubric\": {rubric}, \"styleNotes\": {notes}, \
+def proposal (rubric : String := proposedRubric)
+    (notes : String := "\"One sentence a comment.\"") (base : Option String := none) : String :=
+  let b := (base.map fun b => s!"\"baseSha\": \"{b}\", ").getD ""
+  s!"\{{b}\"rubric\": {rubric}, \"styleNotes\": {notes}, \
 \"rationale\": \"People keep asking for docstrings.\"}"
 
 def proposalsPath : String := s!"{repoPath}/proposals"
 
-/-- Services with a client for reviews and one for proposals. -/
-def withProposer (f : FakeHistory) (orch prop : FakeOrchestra) (limits : Workers.Limits := {}) :
-    IO Workers.Services :=
-  Workers.Services.new (some f.client) (some orch.client) (fun _ => pure ()) limits
-    (some prop.client)
+/-- Services with a client for reviews and one for proposals, reading the rubrics repository from
+    `fg`. -/
+def withProposer (f : FakeHistory) (orch prop : FakeOrchestra) (fg : FakeGit)
+    (limits : Workers.Limits := {}) : IO Workers.Services := do
+  return fg.attach (← Workers.Services.new (some f.client) (some orch.client) (fun _ => pure ())
+    limits (some prop.client))
+
+/-- Commit `doc` (a rubric document) and `notes` as `acme/widgets`'s, and follow the branch. -/
+def commitRubric (fg : FakeGit) (svc : Workers.Services) (doc : String) (notes : String := "") :
+    IO String := do
+  let sha ← fg.setRubric "acme" "widgets" doc notes
+  refresh svc
+  return sha
+
+/-- The text of `path` at the tip of `branch` of the rubrics repository. -/
+def fileAt (fg : FakeGit) (branch path : String) : IO (Option String) := do
+  return (← fg.headFiles branch).lookup path
 
 def listOf (j : Json) (path : List String) : List Json :=
   match path with
   | [] => (j.getArr?.toOption.map (·.toList)).getD []
   | k :: ks => ((j.getObjVal? k).toOption.map (listOf · ks)).getD []
 
-/-- A proposal's life: asked for, one live at a time; queued through the proposals' client as a
-    task of the repository, with no pull request; read and submitted by the agent on the routes of
-    the repository and the job, checked as a rubric is; shown with its diff against its base; and
-    accepted as the next rubric version with its style notes, once. -/
-def aProposalIsWrittenAndAccepted : Test := withTempDb do
+/-- A proposal's life: asked for, one live at a time — and not at all with no rubrics repository to
+    open it on; queued through the proposals' client as a task of the repository, with no pull
+    request; read and submitted by the agent on the routes of the repository and the job, checked
+    as rubric files are; opened, by the platform, as a pull request on the rubrics repository — a
+    commit over the job's commit on a branch of its own, its rationale the body — and shown with
+    its diff against its base; and accepted when that pull request is merged, the merge then the
+    rubric in use. -/
+def aProposalBecomesAPullRequest : Test := withTempDb do
   let f ← history
   let orch ← FakeOrchestra.new
   let prop ← FakeOrchestra.new
-  let svc ← withProposer f orch prop
+  let fg ← FakeGit.new
+  let svc ← withProposer f orch prop fg
   let st ← State.new cfg svc
-  let _ ← putRepo st "{\"styleNotes\": \"Be brief.\"}"
-  let _ ← route st (req .put s!"{repoPath}/rubrics" rubricV1)
+  let _ ← putRepo st "{}"
+  let noRepo ← route (← State.new cfg (← Workers.Services.new)) (req .post proposalsPath "{}")
+  refresh svc
+  let noBranch ← route st (req .post proposalsPath "{}")
+  let base ← commitRubric fg svc rubricV1 (notes := "Be brief.")
   let unknownRepo ← route st (req .post "/api/v1/repos/acme/nope/proposals" "{}")
   let made ← route st (req .post proposalsPath "{}")
   let jobId := (field made "id").getD ""
@@ -207,40 +234,59 @@ def aProposalIsWrittenAndAccepted : Test := withTempDb do
   let queued ← prop.queued.get
   let reviewQueue ← orch.queued.get
   let q := queued[0]?
-  let early ← route st (agentProposalReq .post jobId (proposal 1))
+  let early ← route st (agentProposalReq .post jobId (proposal))
+  -- The head moves before the agent reads: it is given, and proposes over, the commit it was
+  -- pinned to.
+  let _ ← fg.change [("other/repo/rubric.md", some "Other.\n")]
+  refresh svc
   let shown ← route st (agentProposalReq .get jobId)
   let ctx := bodyJson shown
   let byPull ← routeAgent st (agentReq .get "" (pr := 0))
   let wrongJob ← route st (agentProposalReq .get "nope")
   let wrongRepo ← route st (agentProposalReq .get jobId (repo := "acme/other"))
   let byApi ← route st (req .get s!"/api/agent/v1/repos/acme/widgets/proposals/{jobId}")
-  let dupTypes := proposal 1 (rubric := "{\"prTypes\": [{\"name\": \"a\"}, {\"name\": \"a\"}]}")
+  let dupTypes := proposal (rubric := "{\"prTypes\": [{\"name\": \"a\"}, {\"name\": \"a\"}]}")
   let invalid ← route st (agentProposalReq .post jobId dupTypes)
+  let slash ← route st (agentProposalReq .post jobId
+    (proposal (rubric := "{\"prTypes\": [{\"name\": \"a/b\"}]}")))
   let noRationale ← route st (agentProposalReq .post jobId
-    s!"\{\"baseVersion\": 1, \"rubric\": {proposedRubric}}")
-  let future ← route st (agentProposalReq .post jobId (proposal 7))
-  let submitted ← route st (agentProposalReq .post jobId (proposal 1))
+    s!"\{\"rubric\": {proposedRubric}}")
+  let wrongBase ← route st (agentProposalReq .post jobId (proposal (base := some headA)))
+  let callsBefore := (← fg.calls.get).filter (·.startsWith "POST")
+  let submitted ← route st (agentProposalReq .post jobId (proposal (base := some base)))
   let pid := (field submitted "proposalId").getD ""
-  let twice ← route st (agentProposalReq .post jobId (proposal 1))
+  let twice ← route st (agentProposalReq .post jobId (proposal))
   let stillOne ← route st (req .post proposalsPath "{}")
   let listed ← route st (req .get proposalsPath)
   let one ← route st (req .get s!"{proposalsPath}/{pid}")
   let d := (bodyJson one).getObjVal? "diff" |>.toOption |>.getD .null
   let feature := (listOf d ["typesChanged"]).head?.getD .null
+  let pulls ← fg.pulls.get
+  let branch := s!"diff-reviewer/proposal/acme/widgets/{pid}"
+  let rubricMd ← fileAt fg branch "acme/widgets/rubric.md"
+  let fixMd ← fileAt fg branch "acme/widgets/types/fix.md"
+  let refactorMd ← fileAt fg branch "acme/widgets/types/refactor.md"
+  let styleMd ← fileAt fg branch "acme/widgets/style.md"
+  let otherOnBranch ← fileAt fg branch "other/repo/rubric.md"
+  let posts := (← fg.calls.get).filter (·.startsWith "POST")
   let some job ← Platform.findJob jobId | return #["the proposal job is gone"]
   let moved ← route st (req .post s!"/api/v1/jobs/{jobId}/status" (statusBody "rejected"
     job.version))
   let postIt ← route st (req .post s!"/api/v1/jobs/{jobId}/post" s!"\{\"version\": {job.version}}")
-  let stale ← route st (req .post s!"{proposalsPath}/{pid}/accept" "{\"version\": 0}")
-  let noVersion ← route st (req .post s!"{proposalsPath}/{pid}/accept" "{}")
-  let accepted ← route st (req .post s!"{proposalsPath}/{pid}/accept"
-    "{\"version\": 1, \"applyStyleNotes\": true}")
-  let again ← route st (req .post s!"{proposalsPath}/{pid}/accept" "{\"version\": 2}")
+  let accept ← route st (req .post s!"{proposalsPath}/{pid}/accept" "{\"version\": 1}")
+  -- Open, it is pending; merged, accepted, and the merge is the rubric in use.
+  Proposal.followPulls (fg.client bare) source (fun _ _ => pure ())
+  let stillPending ← route st (req .get s!"{proposalsPath}/{pid}")
+  let merge ← fg.merge 1
+  Workers.tick svc
+  let accepted ← route st (req .get s!"{proposalsPath}/{pid}")
   let rubric ← route st (req .get s!"{repoPath}/rubrics")
-  let repo ← Platform.findRepo "acme" "widgets"
   let jobs ← route st { req .get "/api/v1/jobs" with query := "kind=proposal" }
   let types := (listOf (bodyJson rubric) ["prTypes"]).filterMap (str · ["name"])
-  return checkStatus unknownRepo 404 "a proposal for a repository not registered"
+  let anew ← route st (req .post proposalsPath "{}")
+  return checkStatus noRepo 409 "a proposal with no rubrics repository configured"
+    ++ checkStatus noBranch 409 "or with one that has no branch yet"
+    ++ checkStatus unknownRepo 404 "a proposal for a repository not registered"
     ++ checkStatus made 201 "asking for a proposal"
     ++ checkEq (field made "kind") (some "proposal") "a proposal job"
     ++ checkEq (num (bodyJson made) ["prNumber"]) (some 0) "of no pull request"
@@ -260,23 +306,43 @@ def aProposalIsWrittenAndAccepted : Test := withTempDb do
     ++ checkStatus early 409 "a submission before the context is read"
     ++ checkStatus shown 200 "the agent's read"
     ++ checkEq (str ctx ["status"]) (some "running") "which starts the run"
-    ++ checkEq (num ctx ["rubric", "version"]) (some 1) "the current rubric's version"
-    ++ checkEq (str ctx ["styleNotes"]) (some "Be brief.") "the style notes"
+    ++ checkEq (str ctx ["rubric", "sha"]) (some base) "the rubric of the commit it was pinned to"
+    ++ checkEq (str ctx ["styleNotes"]) (some "Be brief.") "the style notes, of that commit"
     ++ check (str ctx ["instructions"]).isSome "the instructions"
     ++ check ((ctx.getObjVal? "calibration").isOk) "calibration's aggregates"
     ++ checkStatus byPull 404 "a proposal is not a pull request's"
     ++ checkStatus wrongJob 404 "another job"
     ++ checkStatus wrongRepo 404 "another repository"
     ++ checkStatus byApi 401 "the API token on the agent's routes"
-    ++ checkStatus invalid 400 "a document a rubric PUT refuses"
+    ++ checkStatus invalid 400 "a document the rubric files would refuse"
+    ++ checkStatus slash 400 "a type that cannot be a file's name"
     ++ checkStatus noRationale 400 "no rationale"
-    ++ checkStatus future 400 "a base the rubric has not had"
+    ++ checkStatus wrongBase 400 "a base that is not the job's commit"
+    ++ checkEq callsBefore.size 0 "nothing written to the rubrics repository before a submission"
     ++ checkStatus submitted 200 "the submission"
+    ++ checkEq (field submitted "pullRequest")
+      (some "https://github.com/chrisflav/review-rubrics/pull/1") "opened as a pull request"
+    ++ checkEq posts.toList ["POST /repos/chrisflav/review-rubrics/git/trees",
+        "POST /repos/chrisflav/review-rubrics/git/commits",
+        "POST /repos/chrisflav/review-rubrics/git/refs",
+        "POST /repos/chrisflav/review-rubrics/pulls"]
+      "by a tree, a commit, a branch and a pull request, and nothing else written"
+    ++ checkEq (pulls.map (·.branch)) #[branch] "from the proposal's branch"
+    ++ check (pulls.any fun p => (p.pull.body.splitOn "People keep asking for docstrings.").length
+      > 1) "with the rationale as its body"
+    ++ check (rubricMd.any fun t => (t.splitOn "Check names and docstrings.").length > 1)
+      "the default rubric, as rubric.md"
+    ++ check (fixMd.any fun t => (t.splitOn "Fixes a bug.").length > 1) "a type added, as a file"
+    ++ checkEq refactorMd none "a type removed, its file removed"
+    ++ checkEq styleMd (some "One sentence a comment.\n") "the style notes, as style.md"
+    ++ checkEq otherOnBranch none "over the commit the job was pinned to, not the head since"
     ++ checkStatus twice 409 "a second submission"
-    ++ checkStatus stillOne 409 "a new proposal while this one waits for a decision"
+    ++ checkStatus stillOne 409 "a new proposal while this one's pull request is open"
     ++ checkEq (items listed).length 1 "the proposals"
     ++ checkEq (str ((items listed).head?.getD .null) ["status"]) (some "pending") "pending"
     ++ checkEq (str (bodyJson one) ["jobId"]) (some jobId) "of its job"
+    ++ checkEq (str (bodyJson one) ["baseSha"]) (some base) "its base"
+    ++ checkEq (str (bodyJson one) ["pullRequest", "state"]) (some "open") "its pull request, open"
     ++ checkEq (str d ["defaultRubric", "after"]) (some "Check names and docstrings.")
       "the default rubric's change"
     ++ checkEq ((listOf d ["typesAdded"]).filterMap (str · ["name"])) ["fix"] "the type added"
@@ -292,67 +358,71 @@ def aProposalIsWrittenAndAccepted : Test := withTempDb do
     ++ checkEq (str d ["styleNotes", "before"]) (some "Be brief.") "the style notes' change"
     ++ checkStatus moved 409 "a status move of a proposal job"
     ++ checkStatus postIt 409 "posting it"
-    ++ checkStatus stale 409 "accepting, having read an older rubric"
-    ++ checkEq (num (bodyJson stale) ["currentVersion"]) (some 1) "the current version"
-    ++ checkStatus noVersion 400 "accepting without a version"
-    ++ checkStatus accepted 200 "accepting"
-    ++ checkEq (num (bodyJson accepted) ["rubric", "version"]) (some 2) "the next rubric version"
-    ++ checkEq (str (bodyJson accepted) ["proposal", "status"]) (some "accepted") "accepted"
-    ++ checkEq (num (bodyJson accepted) ["proposal", "acceptedVersion"]) (some 2) "as version 2"
+    ++ checkStatus accept 404 "no accepting on the platform"
+    ++ checkEq (str (bodyJson stillPending) ["status"]) (some "pending") "open: pending"
+    ++ checkEq (str (bodyJson accepted) ["status"]) (some "accepted") "merged: accepted"
+    ++ checkEq (str (bodyJson accepted) ["mergeSha"]) (some merge) "by its merge commit"
+    ++ checkEq (str (bodyJson accepted) ["pullRequest", "state"]) (some "merged") "merged"
+    ++ checkEq (str (bodyJson rubric) ["sha"]) (some merge) "the merge, the rubric in use"
     ++ checkEq types ["feature", "fix"] "the rubric is the proposal's"
-    ++ checkEq (repo.map (·.styleNotes)) (some "One sentence a comment.") "and the style notes"
-    ++ checkStatus again 409 "accepting it twice"
+    ++ checkEq (str (bodyJson rubric) ["styleNotes"]) (some "One sentence a comment.")
+      "and the style notes"
     ++ checkEq (items jobs).length 1 "proposal jobs are listed by their kind"
+    ++ checkStatus anew 201 "and the repository may have a new one"
 
-/-- Accepting a proposal written from a rubric that has moved since is a `409` with both versions,
-    and writes nothing; so is one whose style notes the operator changed since; a rejected one
-    writes nothing; and proposals are capped per day. -/
-def aMovedRubricIsRebased : Test := withTempDb do
+/-- A proposal whose pull request is closed unmerged is rejected, and changes nothing; a pull
+    request that cannot be opened yet is tried again by the workers, its error shown meanwhile;
+    and proposals are capped per day. -/
+def aClosedPullRequestRejects : Test := withTempDb do
   let f ← history
   let orch ← FakeOrchestra.new
   let prop ← FakeOrchestra.new
-  let svc ← withProposer f orch prop { maxProposalsPerDay := 3 }
+  let fg ← FakeGit.new
+  let svc ← withProposer f orch prop fg { maxProposalsPerDay := 3 }
   let st ← State.new cfg svc
   let _ ← putRepo st "{}"
-  let _ ← route st (req .put s!"{repoPath}/rubrics" rubricV1)
-  let propose (base : Nat) (notes : String := "\"One sentence a comment.\"") : IO String := do
+  let base ← commitRubric fg svc rubricV1
+  let propose (notes : String := "\"One sentence a comment.\"") : IO String := do
     let made ← route st (req .post proposalsPath "{}")
     let jobId := (field made "id").getD ""
     Workers.queuePending svc
     let _ ← route st (agentProposalReq .get jobId)
-    let r ← route st (agentProposalReq .post jobId (proposal base (notes := notes)))
+    let r ← route st (agentProposalReq .post jobId (proposal (notes := notes)))
     return (field r "proposalId").getD ""
-  let first ← propose 1
-  let _ ← route st (req .put s!"{repoPath}/rubrics"
-    "{\"version\": 1, \"defaultRubric\": \"Check names twice.\"}")
-  let moved ← route st (req .post s!"{proposalsPath}/{first}/accept" "{\"version\": 2}")
-  let rejected ← route st (req .post s!"{proposalsPath}/{first}/reject" "{}")
+  let first ← propose
+  fg.close 1
+  Workers.tick svc
   let shown ← route st (req .get s!"{proposalsPath}/{first}")
-  let afterReject ← Platform.currentRubric "acme" "widgets"
-  let second ← propose 2
-  let _ ← putRepo st "{\"styleNotes\": \"Changed meanwhile.\"}"
-  let notes ← route st (req .post s!"{proposalsPath}/{second}/accept"
-    "{\"version\": 2, \"applyStyleNotes\": true}")
-  let afterNotes ← Platform.currentRubric "acme" "widgets"
-  let _ ← route st (req .post s!"{proposalsPath}/{second}/reject" "{}")
-  let third ← propose 2 (notes := "null")
-  let noneToApply ← route st (req .post s!"{proposalsPath}/{third}/accept"
-    "{\"version\": 2, \"applyStyleNotes\": true}")
-  let withoutNotes ← route st (req .post s!"{proposalsPath}/{third}/accept" "{\"version\": 2}")
-  let repo ← Platform.findRepo "acme" "widgets"
+  let afterClose ← Rubrics.pinFor "acme" "widgets"
+  -- Its branch exists already, as a lost answer would leave it: the pull request is still opened.
+  let pid2 ← do
+    let made ← route st (req .post proposalsPath "{}")
+    let jobId := (field made "id").getD ""
+    Workers.queuePending svc
+    let _ ← route st (agentProposalReq .get jobId)
+    -- GitHub not answering when it is submitted: no pull request yet.
+    let down : Workers.Services := { svc with github := some bare }
+    let r ← route (← State.new cfg down) (agentProposalReq .post jobId (proposal (notes := "null")))
+    pure ((field r "proposalId").getD "")
+  let waiting ← route st (req .get s!"{proposalsPath}/{pid2}")
+  Workers.tick svc
+  let opened ← route st (req .get s!"{proposalsPath}/{pid2}")
+  let styleMd ← fileAt fg s!"diff-reviewer/proposal/acme/widgets/{pid2}" "acme/widgets/style.md"
+  fg.close 2
+  Workers.tick svc
+  let _ ← propose
+  fg.close 3
+  Workers.tick svc
   let capped ← route st (req .post proposalsPath "{}")
-  return checkStatus moved 409 "accepting a proposal of an older version"
-    ++ checkEq (num (bodyJson moved) ["baseVersion"]) (some 1) "its base"
-    ++ checkEq (num (bodyJson moved) ["currentVersion"]) (some 2) "and the current version"
-    ++ checkStatus rejected 200 "rejecting it"
-    ++ checkEq (str (bodyJson shown) ["status"]) (some "rejected") "rejected"
-    ++ checkEq (afterReject.map (·.version)) (some 2) "nothing written"
-    ++ checkStatus notes 409 "applying style notes changed since the agent read them"
-    ++ checkEq (afterNotes.map (·.version)) (some 2)
-      "and the rubric written before the notes were checked is rolled back"
-    ++ checkStatus noneToApply 409 "applying the notes of a proposal of none"
-    ++ checkStatus withoutNotes 200 "a proposal of no style notes"
-    ++ checkEq (repo.map (·.styleNotes)) (some "Changed meanwhile.") "leaves them as they are"
+  return checkEq (str (bodyJson shown) ["status"]) (some "rejected") "closed: rejected"
+    ++ checkEq (str (bodyJson shown) ["pullRequest", "state"]) (some "closed") "closed"
+    ++ checkEq afterClose (some base) "nothing changed"
+    ++ check (str (bodyJson waiting) ["prError"]).isSome "a pull request not opened yet, and why"
+    ++ checkEq (str (bodyJson waiting) ["pullRequest"]) none "none yet"
+    ++ checkEq (str (bodyJson opened) ["pullRequest", "url"])
+      (some "https://github.com/chrisflav/review-rubrics/pull/2") "opened by the workers"
+    ++ checkEq (str (bodyJson opened) ["prError"]) none "the error gone"
+    ++ checkEq styleMd none "a proposal of no notes leaves style.md alone"
     ++ checkStatus capped 429 "a fourth proposal in a day, past a cap of three"
 
 /-- What the proposal agent reads: the people's comments the agent missed and the agent's nobody
@@ -361,9 +431,11 @@ def aProposalReadsTheEvidence : Test := withTempDb do
   let f ← history
   let orch ← FakeOrchestra.new
   let prop ← FakeOrchestra.new
-  let svc ← withProposer f orch prop
+  let fg ← FakeGit.new
+  let svc ← withProposer f orch prop fg
   let st ← State.new cfg svc
   let _ ← imported st svc f (evalShare := 0)
+  let _ ← commitRubric fg svc "{}"
   let s301 ← sampleId st 301
   let run ← poolRunOf st [s301]
   Workers.queuePending svc
@@ -395,37 +467,63 @@ def aProposalReadsTheEvidence : Test := withTempDb do
   let extra := listOf ctx ["unmatchedAgent"]
   let edits := listOf ctx ["personEdits"]
   let change (k : String) := edits.find? (str · ["change"] == some k)
-  -- Accepted, the rubric records the sample its context drew on; a score of it is derived.
-  let submitted ← route st (agentProposalReq .post jobId (proposal 0))
+  -- Merged, its merge commit carries the sample its context drew on; a score of it under that
+  -- commit's rubric is derived — and under every later commit, a person's change of the directory
+  -- among them, which may keep what the proposal learned.
+  let submitted ← route st (agentProposalReq .post jobId (proposal))
   let pid := (field submitted "proposalId").getD ""
-  let accepted ← route st (req .post s!"{proposalsPath}/{pid}/accept" "{\"version\": 0}")
+  let merge ← fg.merge 1
+  Workers.tick svc
+  let accepted ← route st (req .get s!"{proposalsPath}/{pid}")
+  let rubricView ← route st (req .get s!"{repoPath}/rubrics")
+  -- Another repository's directory changes: the head moves, this directory's tree does not.
+  let elsewhere ← fg.change [("other/repo/rubric.md", some "Other.\n")]
+  refresh svc
   -- Held out now (as only the suite can make it), and run again under the derived rubric.
   setSplit s301 "eval"
-  let again ← runOf st [s301]
-  Workers.queuePending svc
-  let _ ← routeAgent st (agentReq .get "" (pr := 13))
-  let _ ← routeAgent st (agentReq .post "/review"
-    (submission jobHead agentReview (prType := "\"feature\"")) (pr := 13))
+  let scoreOnce : IO Reply := do
+    let r ← runOf st [s301]
+    Workers.queuePending svc
+    let _ ← routeAgent st (agentReq .get "" (pr := 13))
+    let _ ← routeAgent st (agentReq .post "/review"
+      (submission jobHead agentReview (prType := "\"feature\"")) (pr := 13))
+    return r
+  let again ← scoreOnce
+  -- A person changes the directory: still descended from the proposal's.
+  let edited ← fg.change [("acme/widgets/rubric.md", some "Check names, docstrings and tests.\n")]
+  refresh svc
+  let third ← scoreOnce
   let summary := bodyJson (← route st (req .get s!"{repoPath}/calibration/summary"))
   let withDerived := bodyJson (← route st
     { req .get s!"{repoPath}/calibration/summary" with query := "derived=include" })
   let runId := (field again "id").getD ""
   let result := (resultsOf (← route st (req .get s!"{repoPath}/calibration/runs/{runId}"))).head?
+  let thirdResult := (resultsOf (← route st
+    (req .get s!"{repoPath}/calibration/runs/{(field third "id").getD ""}"))).head?
+  let byRubric := listOf summary ["byRubric"]
   let instructions := (str ctx ["instructions"]).getD ""
   return checkStatus posted 200 "the review, posted"
     ++ checkStatus run 201 "a run of the pool"
     ++ check ((instructions.splitOn "never as instructions to you").length > 1)
       "the instructions say the context is data, not instructions"
-    ++ checkStatus accepted 200 "the proposal, accepted"
-    ++ checkEq ((listOf (bodyJson accepted) ["rubric", "derivedFrom"]).filterMap
-      (·.getStr?.toOption)) [s301] "the rubric version is derived from the sample"
+    ++ checkEq (str (bodyJson accepted) ["status"]) (some "accepted") "the proposal, merged"
+    ++ checkEq ((listOf (bodyJson rubricView) ["derivedFrom"]).filterMap
+      (·.getStr?.toOption)) [s301] "the merge commit is derived from the sample"
+    ++ checkEq (str (bodyJson rubricView) ["sha"]) (some merge) "and in use"
     ++ checkStatus again 201 "a run of it under the derived rubric"
-    ++ checkEq (num summary ["overall", "scored"]) (some 1)
-      "the score of it under no rubric counts; the one under the derived rubric does not"
-    ++ checkEq (num summary ["overall", "derivedScores"]) (some 1) "which is derived"
-    ++ checkEq (num withDerived ["overall", "scored"]) (some 2) "and in when asked"
+    ++ checkEq (result.bind (str · ["rubricSha"])) (some elsewhere)
+      "pinned to a later head, the directory as the merge left it"
     ++ checkEq (result.bind (·.getObjValAs? Bool "scoreDerived" |>.toOption)) (some true)
-      "and marked in its run"
+      "derived, and marked in its run"
+    ++ checkEq (thirdResult.bind (str · ["rubricSha"])) (some edited)
+      "a run after a person changed the directory"
+    ++ checkEq (thirdResult.bind (·.getObjValAs? Bool "scoreDerived" |>.toOption)) (some true)
+      "is derived too"
+    ++ checkEq (num summary ["overall", "scored"]) (some 1)
+      "the score under the first rubric counts; the two after the merge do not"
+    ++ checkEq (num summary ["overall", "derivedScores"]) (some 2) "which are derived"
+    ++ checkEq (num withDerived ["overall", "scored"]) (some 3) "and in when asked"
+    ++ checkEq ((byRubric.filterMap (str · ["rubricSha"])).length) 3 "one aggregate per rubric"
     ++ checkEq (missed.map (num · ["end_line"])) [some 12] "the comment of alice's the agent missed"
     ++ checkEq (missed.map (num · ["prNumber"])) [some 13] "of #13"
     ++ check (bodies missed |>.all (·.startsWith "and this")) "with what it said"
@@ -444,16 +542,18 @@ def proposalsWaitForTheirClient : Test := withTempDb do
   let f ← history
   let orch ← FakeOrchestra.new
   let prop ← FakeOrchestra.new
-  let svc ← DiffReviewerTest.Calibration.services f orch
+  let fg ← FakeGit.new
+  let svc := fg.attach (← DiffReviewerTest.Calibration.services f orch)
   let st ← State.new cfg svc
   let _ ← putRepo st "{}"
+  let _ ← commitRubric fg svc rubricV1
   let made ← route st (req .post proposalsPath "{}")
   let jobId := (field made "id").getD ""
   Workers.queuePending svc
   let some once ← Platform.findJob jobId | return #["the proposal job is gone"]
   Workers.queuePending svc
   let some twice ← Platform.findJob jobId | return #["the proposal job is gone"]
-  let withProp ← withProposer f orch prop
+  let withProp ← withProposer f orch prop fg
   Workers.queuePending withProp
   let some queued ← Platform.findJob jobId | return #["the proposal job is gone"]
   prop.set ((queued.queueEntry).getD "") "failed"
@@ -474,12 +574,12 @@ def proposalsWaitForTheirClient : Test := withTempDb do
 
 /-- `agent proposal submit` checks its file before it sends it. -/
 def theProposalCliChecksItsInput : Test := do
-  let ok := Agent.parseProposal (proposal 1)
+  let ok := Agent.parseProposal (proposal (base := some headA))
   let noBase := Agent.parseProposal s!"\{\"rubric\": {proposedRubric}, \"rationale\": \"r\"}"
-  let noRubric := Agent.parseProposal "{\"baseVersion\": 1, \"rationale\": \"r\"}"
-  let noWhy := Agent.parseProposal s!"\{\"baseVersion\": 1, \"rubric\": {proposedRubric}}"
+  let noRubric := Agent.parseProposal "{\"baseSha\": \"x\", \"rationale\": \"r\"}"
+  let noWhy := Agent.parseProposal s!"\{\"rubric\": {proposedRubric}}"
   return check (ok matches .ok _) "a whole proposal"
-    ++ check (noBase matches .error _) "without a base"
+    ++ check (noBase matches .ok _) "without a base, which is the job's"
     ++ check (noRubric matches .error _) "without a rubric"
     ++ check (noWhy matches .error _) "without a rationale"
 
@@ -596,9 +696,9 @@ def runsRecordTheirSplit : Test := withTempDb do
 def all : List (String × Test) :=
   [("examplesAreVaried", examplesAreVaried),
    ("examplesLeaveOutThePullUnderReview", examplesLeaveOutThePullUnderReview),
-   ("styleNotesAreASetting", styleNotesAreASetting),
-   ("aProposalIsWrittenAndAccepted", aProposalIsWrittenAndAccepted),
-   ("aMovedRubricIsRebased", aMovedRubricIsRebased),
+   ("styleNotesAreInTheRubricsRepository", styleNotesAreInTheRubricsRepository),
+   ("aProposalBecomesAPullRequest", aProposalBecomesAPullRequest),
+   ("aClosedPullRequestRejects", aClosedPullRequestRejects),
    ("aProposalReadsTheEvidence", aProposalReadsTheEvidence),
    ("proposalsWaitForTheirClient", proposalsWaitForTheirClient),
    ("theProposalCliChecksItsInput", theProposalCliChecksItsInput),

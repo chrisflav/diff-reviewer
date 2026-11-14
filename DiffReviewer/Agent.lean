@@ -156,13 +156,11 @@ private def callProposal (method slug job : String) (body : Option String) : IO 
 def showProposal (slug job : String) : IO UInt32 :=
   callProposal "GET" slug job none
 
-/-- What `proposal submit` sends, read from the file the agent wrote: an object with a
-    `baseVersion`, a `rubric` object and a `rationale`, checked before a request is made. The
-    platform checks the rest. -/
+/-- What `proposal submit` sends, read from the file the agent wrote: an object with a `rubric`
+    object and a `rationale`, checked before a request is made. The platform checks the rest — the
+    `baseSha`, when it is given, among it. -/
 def parseProposal (contents : String) : Except String Json := do
   let j ← (Json.parse contents).mapError (s!"the proposal is not JSON: " ++ ·)
-  if (j.getObjValAs? Nat "baseVersion").toOption.isNone then
-    throw "the proposal must name the \"baseVersion\" of the rubric it was written from"
   unless ((j.getObjVal? "rubric").toOption.bind (·.getObj?.toOption)).isSome do
     throw "the proposal must carry the whole \"rubric\" document, as an object"
   if (j.getObjValAs? String "rationale").toOption.isNone then

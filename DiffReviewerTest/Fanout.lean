@@ -3,6 +3,7 @@ import DiffReviewerTest.Basic
 import DiffReviewerTest.Server
 import DiffReviewerTest.Workers
 import DiffReviewerTest.Calibration
+import DiffReviewerTest.FakeGit
 
 open Lean (Json)
 open DiffReviewer
@@ -24,7 +25,7 @@ namespace DiffReviewerTest.Fanout
 
 /-- A rubric whose `feature` type fans out over two categories. -/
 def fanoutRubric : String :=
-  "{\"version\": 0, \"defaultRubric\": \"Be careful.\", \"prTypes\": [\
+  "{\"defaultRubric\": \"Be careful.\", \"prTypes\": [\
 {\"name\": \"feature\", \"fanout\": true, \"description\": \"New things.\", \"categories\": [\
 {\"name\": \"correctness\", \"description\": \"Wrong, or proves the wrong thing.\"}, \
 {\"name\": \"naming\", \"description\": \"Against the naming convention.\"}]}, \
@@ -47,7 +48,7 @@ def asJob (r : Req) (id : String) : Req :=
 def fannedRepo (st : State) (repo : String := "{\"mode\": \"staged\", \"prType\": \"feature\"}")
     (pr : Nat := 7) : IO String := do
   let _ ← route st (req .put "/api/v1/repos/acme/widgets" "{\"mode\": \"staged\"}")
-  let _ ← route st (req .put "/api/v1/repos/acme/widgets/rubrics" fanoutRubric)
+  let _ ← DiffReviewerTest.FakeGit.commitRubric "acme" "widgets" fanoutRubric
   let _ ← route st (req .put "/api/v1/repos/acme/widgets" repo)
   let job ← route st (req .post "/api/v1/jobs"
     s!"\{\"owner\": \"acme\", \"name\": \"widgets\", \"prNumber\": {pr}, \
@@ -91,11 +92,11 @@ def theFanoutIsPlanned : Test := do
     ++ check (back == some doc) "the fanout flag survives a round trip"
     ++ check (!has (doc.toJson.compress) "\"fanout\":false") "and is written only when on"
     ++ check ((Rubric.ofJson (.mkObj [("fanout", "yes")])) matches .error _) "a fanout not a bool"
-    ++ checkEq (str? (Proposal.diffJson doc docWide) ["fanout", "after"]) (some "true")
+    ++ checkEq (str? (diffJson doc docWide) ["fanout", "after"]) (some "true")
       "a proposal's diff shows the document's fanout"
-    ++ checkEq (str? (Proposal.diffJson docWide docWide) ["fanout"]) (some "null")
+    ++ checkEq (str? (diffJson docWide docWide) ["fanout"]) (some "null")
       "and nothing when it is the same"
-    ++ checkEq (str? (Proposal.diffJson doc { doc with prTypes := doc.prTypes.map fun t =>
+    ++ checkEq (str? (diffJson doc { doc with prTypes := doc.prTypes.map fun t =>
         { t with fanout := false } }) ["typesChanged"])
       (some "[{\"categoriesAdded\":[],\"categoriesChanged\":[],\"categoriesRemoved\":[],\
 \"description\":null,\"fanout\":{\"after\":false,\"before\":true},\"name\":\"feature\",\
@@ -163,6 +164,7 @@ def aFanoutIsQueued : Test := withTempDb do
   let orch ← FakeOrchestra.new
   let logs ← IO.mkRef #[]
   let svc ← services gh orch logs
+  let svc ← DiffReviewerTest.FakeGit.withGit svc
   let st ← State.new cfg svc
   let id ← fannedRepo st "{\"mode\": \"staged\", \"prType\": \"feature\", \"autoReview\": true}"
   Workers.queuePending svc
@@ -207,6 +209,7 @@ def subRunsAreBound : Test := withTempDb do
   let orch ← FakeOrchestra.new
   let logs ← IO.mkRef #[]
   let svc ← services gh orch logs
+  let svc ← DiffReviewerTest.FakeGit.withGit svc
   let st ← State.new cfg svc
   let id ← fannedRepo st
   Workers.queuePending svc
@@ -259,7 +262,8 @@ def subRunsAreBound : Test := withTempDb do
     ++ checkStatus last 200 "the last review"
     ++ checkEq (field last "status") (some "draft") "the job, merged"
     ++ checkEq job.prType (some "feature") "of its type"
-    ++ checkEq job.rubricVersion (some 1) "under the rubric it fanned out by"
+    ++ check (job.rubricSha.isSome && job.rubricSha == (← Rubrics.pinFor "acme" "widgets"))
+      "under the rubric it fanned out by"
     ++ checkEq ((review.map (·.comments.map (·.range.startLine))).getD []) [4, 8]
       "the duplicate merged, the more severe kept"
     ++ checkEq (review.map (·.decision)) (some .comment) "the strictest decision"
@@ -274,6 +278,7 @@ def aSubRunFails : Test := withTempDb do
   let orch ← FakeOrchestra.new
   let logs ← IO.mkRef #[]
   let svc ← services gh orch logs
+  let svc ← DiffReviewerTest.FakeGit.withGit svc
   let st ← State.new cfg svc
   let id ← fannedRepo st
   Workers.queuePending svc
@@ -335,6 +340,7 @@ def fanoutsAreCapped : Test := withTempDb do
   let logs ← IO.mkRef #[]
   let svc ← Workers.Services.new (some gh.client) (some orch.client)
     (fun m => logs.modify (·.push m)) { maxJobsPerDay := 3 }
+  let svc ← DiffReviewerTest.FakeGit.withGit svc
   let st ← State.new cfg svc
   let id ← fannedRepo st "{\"mode\": \"staged\", \"prType\": \"feature\", \"maxFanout\": 2}"
   Workers.queuePending svc
@@ -381,11 +387,12 @@ def calibrationFansOut : Test := withTempDb do
   let f ← DiffReviewerTest.Calibration.FakeHistory.new
   let orch ← FakeOrchestra.new
   let svc ← DiffReviewerTest.Calibration.services f orch { maxCalibrationJobsPerDay := 3 }
+  let svc ← DiffReviewerTest.FakeGit.withGit svc
   let st ← State.new cfg svc
   let _ ← DiffReviewerTest.Calibration.imported st svc f
-  let _ ← route st (req .put "/api/v1/repos/acme/widgets/rubrics"
-    "{\"version\": 0, \"fanout\": true, \"prTypes\": [{\"name\": \"feature\", \"categories\": [\
-{\"name\": \"naming\"}, {\"name\": \"docs\"}]}]}")
+  let _ ← DiffReviewerTest.FakeGit.commitRubric "acme" "widgets"
+    "{\"fanout\": true, \"prTypes\": [{\"name\": \"feature\", \"categories\": [\
+{\"name\": \"naming\"}, {\"name\": \"docs\"}]}]}"
   let s301 ← DiffReviewerTest.Calibration.sampleId st 301
   let s201 ← DiffReviewerTest.Calibration.sampleId st 201
   let two ← DiffReviewerTest.Calibration.runOf st [s301, s201]
@@ -428,6 +435,7 @@ def aStaleRoundIsHistory : Test := withTempDb do
   let orch ← FakeOrchestra.new
   let logs ← IO.mkRef #[]
   let svc ← services gh orch logs
+  let svc ← DiffReviewerTest.FakeGit.withGit svc
   let st ← State.new cfg svc
   let id ← fannedRepo st
   Workers.queuePending svc
@@ -468,6 +476,7 @@ def aGivenUpRunMaySubmit : Test := withTempDb do
   let orch ← FakeOrchestra.new
   let logs ← IO.mkRef #[]
   let svc ← services gh orch logs
+  let svc ← DiffReviewerTest.FakeGit.withGit svc
   let st ← State.new cfg svc
   let id ← fannedRepo st
   Workers.queuePending svc
@@ -494,6 +503,7 @@ def retriesKeepToTheCap : Test := withTempDb do
   let orch ← FakeOrchestra.new
   let svc ← Workers.Services.new (some gh.client) (some orch.client) (fun _ => pure ())
     { maxJobsPerDay := 4 }
+  let svc ← DiffReviewerTest.FakeGit.withGit svc
   let st ← State.new cfg svc
   let id ← fannedRepo st
   Workers.queuePending svc
@@ -523,8 +533,10 @@ def aRetiredJobsRunIsCancelled : Test := withTempDb do
         let _ ← Platform.updateJob j.id fun j => return { j with statusRaw := "stale" }
       return e }
   let svc ← Workers.Services.new (some gh.client) (some retiring) (fun _ => pure ())
+  let svc ← DiffReviewerTest.FakeGit.withGit svc
   let st ← State.new cfg svc
   let _ ← newJob st
+  DiffReviewerTest.FakeGit.refresh svc
   Workers.queuePending svc
   let single ← orch.cancelled.get
   let _ ← fannedRepo st
@@ -544,6 +556,7 @@ def aRefusedSubRunFailsTheJob : Test := withTempDb do
       if (← orch.queued.get).size ≥ 1 then return .error (.refused why)
       orch.client.queue r }
   let svc ← Workers.Services.new (some gh.client) (some refusing) (fun _ => pure ())
+  let svc ← DiffReviewerTest.FakeGit.withGit svc
   let st ← State.new cfg svc
   let id ← fannedRepo st
   Workers.queuePending svc

@@ -2,7 +2,7 @@ import { useEffect, useState, type FormEvent } from "react";
 import { Link } from "react-router-dom";
 import { api, ApiError, UnauthorizedError, type PostingMode, type Repo } from "../api";
 import { formOf, onlyAutoReviewChanged, putBody, registerBody } from "../repoSettings";
-import { rubricStashKey } from "../stash";
+import { repoKey } from "../stash";
 import { useLoad } from "../useLoad";
 import { repoPath } from "./Calibration";
 
@@ -28,7 +28,7 @@ export function ReposPage({ onUnauthorized }: { onUnauthorized: () => void }) {
     // Registering one listed already writes over the version listed, keeping what this form
     // does not set; one registered meanwhile is a 409, not overwritten.
     const listed = (repos ?? []).find(
-      (r) => rubricStashKey(r.owner, r.name) === rubricStashKey(owner, name),
+      (r) => repoKey(r.owner, r.name) === repoKey(owner, name),
     );
     const body =
       listed === undefined
@@ -238,8 +238,8 @@ async function toggleAutoReview(repo: Repo, want: boolean): Promise<void> {
     );
   } catch (err) {
     if (!(err instanceof ApiError && err.status === 409)) throw err;
-    const key = rubricStashKey(repo.owner, repo.name);
-    const now = (await api.repos()).find((r) => rubricStashKey(r.owner, r.name) === key);
+    const key = repoKey(repo.owner, repo.name);
+    const now = (await api.repos()).find((r) => repoKey(r.owner, r.name) === key);
     if (now === undefined) throw new ApiError(404, `${repo.owner}/${repo.name} is not registered`);
     if (!onlyAutoReviewChanged(repo, now))
       throw new ApiError(

@@ -13,6 +13,8 @@ open Lean (Json)
 
 What `serve` does without being asked, on a loop every `--interval` seconds (`start`):
 
+  * **following the rubrics** — read the head of the rubrics repository's branch, and what it
+    holds for every repository: the rubric in use, or why the head is not (`Rubrics.refresh`).
   * **discovery** — for each repository with `autoReview`, list its open pull requests and make a
     job for every head commit that has none, at most `maxJobsPerDay` a day per repository. A job of
     an older head of the same pull request is `stale` — its line numbers no longer name the code
@@ -22,13 +24,15 @@ What `serve` does without being asked, on a loop every `--interval` seconds (`st
     (a diff past `maxDiffBytes` fails the job), and put it on orchestra, as the platform's API
     client, recording the queue entry. Orchestra's `external_id` is the job's id (with the attempt
     for a retry), so a request whose answer was lost is answered with the entry it made rather than
-    queued twice.
+    queued twice. The job is pinned to the rubric commit in use as it is queued (`pinOf`).
   * **following** — read each queued or running job's entry (and whatever entry continues it) and
     move the job to `running` when the run starts, or to `failed` when it ends without the agent
     having submitted a review.
   * **calibration** — the queued imports of past reviews read on (`Calibration.importStep`, a
     bounded number of pull requests a pass), and every calibration job with a draft and no score
     scored (`Calibration.scorePending`).
+  * **rubric proposals** — each pending proposal's pull request opened on the rubrics repository,
+    and followed: merged, accepted; closed, rejected (`Proposal.followPulls`).
   * **settling** — every claim to post older than its window is settled as
     `POST /api/v1/jobs/{id}/reconcile` would settle it (`settleClaims`): a post whose outcome was
     unknown is not left holding its job until a person looks, which in a `direct` repository
@@ -144,6 +148,8 @@ structure Services where
   proposer  : Option Orchestra.Client
   log       : String → IO Unit
   limits    : Limits
+  /-- The rubrics repository, read through `github` (`DiffReviewer.Rubrics`); none, no rubrics. -/
+  rubrics   : Option Rubrics.Source := none
   /-- The jobs being posted right now, so that two requests to post one review post it once. -/
   posting   : IO.Ref (List String)
   /-- The keys of the messages `logOnce` has already written. -/
@@ -152,9 +158,14 @@ structure Services where
 def Services.new (github : Option GitHub.Client := none)
     (orchestra : Option Orchestra.Client := none)
     (log : String → IO Unit := fun m => IO.eprintln s!"diff-reviewer: {m}")
-    (limits : Limits := {}) (proposer : Option Orchestra.Client := none) : IO Services := do
-  return { github, orchestra, proposer, log, limits, posting := ← IO.mkRef []
+    (limits : Limits := {}) (proposer : Option Orchestra.Client := none)
+    (rubrics : Option Rubrics.Source := none) : IO Services := do
+  return { github, orchestra, proposer, log, limits, rubrics, posting := ← IO.mkRef []
          , logged := ← IO.mkRef [] }
+
+/-- GitHub and the rubrics repository, when both are configured: what reading a rubric needs. -/
+def Services.rubricsAt (s : Services) : Option (GitHub.Client × Rubrics.Source) := do
+  return (← s.github, ← s.rubrics)
 
 /-- The orchestra client `job` is queued, followed and cancelled through. -/
 def Services.orchestraFor (s : Services) (job : Job) : Option Orchestra.Client :=
@@ -262,7 +273,8 @@ instructions describe, and submit it with \
 `diff-reviewer agent proposal submit {slug} <file> --job {job.id}`. Fix what it reports and submit \
 again until it is accepted.
 
-The proposal is advisory: a person reads it beside the current rubric and accepts or rejects it. \
+The proposal is advisory: the platform opens it as a pull request on the rubrics repository, and a \
+person merges it or closes it. \
 Do not change the repository, and do not comment on, review or otherwise write to anything on \
 GitHub."
 
@@ -457,12 +469,13 @@ def categoryOf (doc : Rubric) (prType : Option String) (name : String) : Option 
   | some t => t.categories.find? (·.name == name)
   | none => (doc.prTypes.flatMap (·.categories)).find? (·.name == name)
 
-/-- The scope of each of `subs`, the sub-runs of `job`, under the rubric version the job fanned
-    out by; named for the run about to be queued (`next`), or for the latest. -/
-def scopesOf (job : Job) (subs : Array Fanout.SubRun) (next := true) : IO (Array Scope) := do
-  let doc ← match job.rubricVersion with
-    | some v => pure ((← Platform.rubricAt job.owner job.name v).bind (·.rubric?.toOption))
-    | none => pure none
+/-- The scope of each of `subs`, the sub-runs of `job`, under the rubric the job fanned out by (at
+    its pinned commit); named for the run about to be queued (`next`), or for the latest. -/
+def scopesOf (s : Services) (job : Job) (subs : Array Fanout.SubRun) (next := true) :
+    IO (Array Scope) := do
+  let doc := match ← Rubrics.ofJob s.rubricsAt job with
+    | .ok r => r.rubric
+    | .error _ => none
   let cats := (subs.filterMap (·.category)).toList
   return subs.map fun sub =>
     let category := sub.category.map fun name =>
@@ -970,13 +983,32 @@ ancestor of {head} — a force-push (GitHub compares them as {c.status}); review
 reviewed in full"))
     | .error e => return .error s!"reading the diff since the last posted review: {e.message}"
 
-/-- The fan-out plan of a review of `repo` under its current rubric, and that rubric's version;
-    `none` when it is one run — or when the rubric cannot be read, which the agent is told when it
-    reads the job. -/
-private def fanoutPlanOf (repo : Repo) : IO (Option (FanoutPlan × Nat)) := do
-  let some v ← Platform.currentRubric repo.owner repo.name | return none
-  let .ok doc := v.rubric? | return none
-  return (doc.fanoutPlan repo.prType).map (·, v.version)
+/-- The commit of the rubrics repository `job` is to be reviewed by, as it is queued: the one in
+    use for its repository now — for a calibration job, the one its run was pinned to, which it
+    keeps — or why a job waits: the rubrics repository has never been read for its repository
+    (`Rubrics.pinOrWait`), or, for a review, its rubric does not read, and none that did is there
+    to keep. -/
+private def pinOf (s : Services) (job : Job) : IO (Except String (Option String)) := do
+  let calibration := job.kind? == some .calibration
+  -- A calibration job keeps its run's commit: pinned when the run was made, or, when the rubrics
+  -- repository had not been read then, by the first of its jobs queued once it has.
+  if calibration && (job.rubricSha.isSome || job.rubricVersion.isSome) then
+    return .ok job.rubricSha
+  let some src := s.rubrics | return .ok none
+  let pin ← match ← Rubrics.pinOrWait src job.owner job.name with
+    | .ok p => pure p
+    | .error why => return .error why
+  if calibration then
+    let some runId := job.runId | return .ok pin
+    return .ok (← Calibration.pinRun runId pin)
+  match ← Rubrics.headOf job.owner job.name with
+  | some h =>
+    if h.goodSha.isNone && h.headSha.isSome && !h.errors.isEmpty && job.isReview then
+      return .error s!"the rubric of {job.owner}/{job.name} does not read \
+({Rubrics.errorsLine h.errors}), and none that did is there to review by; the review waits for \
+it to be fixed"
+    return .ok pin
+  | none => return .ok pin
 
 /-- Queue every `pending` sub-run of fan-out job `job` on orchestra, each a task of its own under
     `<base>.<key>`, with a prompt narrowed to its category. A failure is recorded on the sub-run,
@@ -984,7 +1016,7 @@ private def fanoutPlanOf (repo : Repo) : IO (Option (FanoutPlan × Nat)) := do
 def queueSubRuns (s : Services) (job : Job) : IO Unit := do
   let some orch := s.orchestraFor job | return
   let subs ← Fanout.current job.id
-  for scope in ← scopesOf job subs do
+  for scope in ← scopesOf s job subs do
     let sub := scope.sub
     unless sub.status == "pending" do continue
     let req : Orchestra.QueueRequest :=
@@ -1122,9 +1154,30 @@ and GitHub is not configured to read them"
                             incrementalHead := decided.incrementalHead } with
         | .ok j => job := { decided with version := j.version, updatedAt := j.updatedAt }
         | .error _ => continue
+    -- Pinned to the rubric in use now: what its agent, and every sub-run, reads.
+    match ← pinOf s job with
+    | .error why =>
+      recordError job.id .pending why
+      continue
+    -- Pinned to none: reviewed against no rubric, which version 0 has always said.
+    | .ok pin =>
+      let calibration := job.kind? == some .calibration
+      job := { job with rubricSha := pin
+                        rubricVersion := if pin.isSome then none
+                          else if calibration then job.rubricVersion.orElse fun _ => some 0
+                          else some 0 }
+    if proposal && job.rubricSha.isNone then
+      retire s job .failed s!"a rubric proposal is a pull request on the rubrics repository, and \
+{job.owner}/{job.name} has no commit of it to be made over: \
+{(s.rubrics.map Rubrics.noBranchMessage).getD "no rubrics repository is configured \
+(DIFF_REVIEWER_RUBRICS_REPO)"}"
+      continue
     -- A rubric that asks for fan-out: the job's sub-runs are queued, not the job.
     if !proposal then
-      if let some (plan, version) ← fanoutPlanOf repo then
+      let doc := match ← Rubrics.ofJob s.rubricsAt job with
+        | .ok r => r.rubric
+        | .error _ => none
+      if let some plan := doc.bind (·.fanoutPlan repo.prType) then
         if plan.size > repo.maxFanout then
           retire s job .failed s!"the review would fan out to {plan.size} sub-runs (the \
 default and {plan.categories.length} categories), more than {repo.slug}'s maxFanout, \
@@ -1140,7 +1193,8 @@ default and {plan.categories.length} categories), more than {repo.slug}'s maxFan
                    incrementalSince := job.incrementalSince
                    incrementalCommitsRaw := job.incrementalCommitsRaw
                    fullReviewReason := job.fullReviewReason }
-        match ← Fanout.begin job learnt plan version (externalId job.id job.attempts) charge with
+        match ← Fanout.begin job learnt plan job.rubricSha (externalId job.id job.attempts)
+            charge with
         | .error .moved => s.log s!"job {job.id} changed while it was fanned out"
         | .error (.capped why) => recordError job.id .pending why
         | .ok (j, subs) =>
@@ -1167,7 +1221,8 @@ default and {plan.categories.length} categories), more than {repo.slug}'s maxFan
         return { j with headSha := job.headSha, baseSha := job.baseSha, title := job.title
                         prBody := job.prBody, statusRaw := JobStatus.queued.toString
                         queueEntry := some entry.id, attempts := j.attempts + 1, error := none
-                        fanoutRound := none
+                        fanoutRound := none, rubricSha := job.rubricSha
+                        rubricVersion := job.rubricVersion
                         previousJob := job.previousJob, incrementalSince := job.incrementalSince
                         incrementalCommitsRaw := job.incrementalCommitsRaw
                         fullReviewReason := job.fullReviewReason }
@@ -1369,10 +1424,16 @@ def tick (s : Services) : IO Unit := do
       Calibration.importStep gh s.log s.limits.importPullsPerPass s.limits.githubReserve
     let n ← Calibration.scorePending
     if n > 0 then s.log s!"scored {n} calibration job(s)"
-  for (what, step) in [("discovery", discover s), ("queueing", queuePending s),
+  let rubrics : IO Unit := do
+    if let some (gh, src) := s.rubricsAt then Rubrics.refresh gh src s.logOnce
+  let proposals : IO Unit := do
+    if let some (gh, src) := s.rubricsAt then Proposal.followPulls gh src s.logOnce
+  for (what, step) in [("following the rubrics", rubrics), ("discovery", discover s),
+                       ("queueing", queuePending s),
                        ("queueing sub-runs", queueRetries s), ("following", follow s),
                        ("following sub-runs", followSubRuns s), ("settling claims", settleClaims s),
-                       ("calibration", calibrate), ("pruning diffs", prune)] do
+                       ("calibration", calibrate), ("rubric proposals", proposals),
+                       ("pruning diffs", prune)] do
     try step catch e => s.log s!"{what}: {e}"
 
 /-- Run `tick` every `interval` seconds, on a thread of its own, for as long as the process. A pass
