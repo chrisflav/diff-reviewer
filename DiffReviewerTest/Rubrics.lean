@@ -113,7 +113,7 @@ def rubricsAreReadFromGit : Test := withTempDb do
   refresh svc
   let empty ← route st (req .get "/api/v1/repos/acme/widgets/rubrics")
   let emptyHistory ← route st (req .get "/api/v1/repos/acme/widgets/rubrics/history")
-  let saidEmpty := (← logs.get).filter fun m => (m.splitOn "has no branch main").length > 1
+  let saidEmpty := (← logs.get).filter fun m => (m.splitOn "is empty").length > 1
   let first ← setRubric fg svc twoTypes
   let atFirst ← route st (req .get "/api/v1/repos/Acme/Widgets/rubrics")
   -- Another repository's directory changing leaves this one's history alone.
@@ -136,7 +136,7 @@ def rubricsAreReadFromGit : Test := withTempDb do
     ++ checkStatus empty 200 "an empty rubrics repository"
     ++ checkEq (field empty "sha") none "no commit"
     ++ check (((bodyJson empty).getObjVal? "error").toOption.bind (strOf · "message") |>.any
-      fun m => (m.splitOn "has no branch main").length > 1) "why, in the answer"
+      fun m => (m.splitOn "is empty").length > 1) "why, in the answer"
     ++ checkEq saidEmpty.size 1 "and in the log, once"
     ++ checkEq (itemsOf emptyHistory).length 0 "no history"
     ++ checkEq (field atFirst "sha") (some first) "the first commit, in use"

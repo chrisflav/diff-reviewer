@@ -1410,7 +1410,7 @@
       ],
       "get": {
         "summary": "A repository's rubric",
-        "description": "The rubric in use, read from the rubrics repository at `sha`: the branch head, or the last commit that parses when the head does not (`error` says why, and `headSha` is the head). While the rubrics repository has never been read — or cannot be: not found, or not readable with the token — `sha` is null, `error` says why, and the repository's reviews wait rather than going without a rubric. With no rubric at all — no rubrics repository configured (`repository` null), an empty repository, a missing branch — `sha` is null and `error` says why. `exists` is false when the repository's directory is not there at `sha`: then the rubric is empty. `404` for a repository that is not registered.",
+        "description": "The rubric in use, read from the rubrics repository at `sha`: the branch head, or the last commit that parses when the head does not (`error` says why, and `headSha` is the head). While the rubrics repository has never been read — or cannot be: not found, or not readable with the token — `sha` is null, `error` says why, and the repository's reviews wait rather than going without a rubric. With no rubric at all — no rubrics repository configured (`repository` null), an empty repository — `sha` is null and `error` says why; a repository that has commits but not the configured branch is a misconfiguration the jobs wait on, with `error` naming the branch. `exists` is false when the repository's directory is not there at `sha`: then the rubric is empty. `404` for a repository that is not registered.",
         "operationId": "getRubrics",
         "responses": {
           "200": {
@@ -3465,7 +3465,7 @@
               "object",
               "null"
             ],
-            "description": "`GET …/rubrics`: why the head is not the commit in use (it does not parse), or why there is no rubric at all (an empty repository, a missing branch, none configured). `…/commits/{sha}`: why that commit does not parse.",
+            "description": "`GET …/rubrics`: why the head is not the commit in use (it does not parse), or why there is no rubric at all (an empty repository, none configured), or why the repository cannot be read (not found, not readable by the token, or without the configured branch). `…/commits/{sha}`: why that commit does not parse.",
             "required": [
               "file",
               "line",

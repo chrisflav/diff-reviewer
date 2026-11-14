@@ -193,7 +193,13 @@ def FakeGit.client (fg : FakeGit) (base : GitHub.Client) : GitHub.Client :=
       if ← fg.hidden.get then
         return .error (.definite s!"{o}/{n} was not found, or the token cannot read it \
 (GitHub answered 404: Not Found)")
-      return .ok (← fg.head b)
+      -- An empty repository has no head; one with commits and not this branch is an error, as
+      -- the client makes it of GitHub's 404 and the repository's 200.
+      match ← fg.head b with
+      | some h => return .ok (some h)
+      | none =>
+        if (← fg.refs.get).isEmpty then return .ok none
+        return .error (.definite s!"{o}/{n} has no branch {b}")
     compare := fun o n b h => do
       unless mine o n do return ← base.compare o n b h
       log s!"GET /repos/{o}/{n}/compare/{b}...{h}"

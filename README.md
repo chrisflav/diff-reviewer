@@ -338,12 +338,15 @@ The platform holds no real credential of GitHub, and agents hold none of the pla
 - **The rubrics repository.** The same token reads it, and opens rubric proposals' pull requests
   on it. A private one (`chrisflav/review-rubrics` is) needs the fine-grained PAT behind kleis to
   include it, with **Contents: read** — and, for proposals only, **Contents: write** and **Pull
-  requests: write**. These are every request the platform makes of it (`{o}/{n}` the rubrics
-  repository, `{branch}` its branch):
+  requests: write**. **It must not have Workflows: write**, on the rubrics repository or any
+  other it reaches: with it, a proposal's branch could carry a `.github/workflows/` file, and the
+  workflow would run with the rubrics repository's secrets. (kleis refuses a proposal tree with
+  anything under `.github/` too; keep both.) These are every request the platform makes of it
+  (`{o}/{n}` the rubrics repository, `{branch}` its branch):
 
   | Method | Path | What for |
   | --- | --- | --- |
-  | `GET` | `/repos/{o}/{n}/git/ref/heads/{branch}` | the branch's head, every pass (`409`: empty) |
+  | `GET` | `/repos/{o}/{n}/git/ref/heads/{branch}` | the branch's head, every pass (`409`: empty; `404` with the repository there: the branch is missing, and the jobs wait) |
   | `GET` | `/repos/{o}/{n}` | after a `404` of the head: whether the repository is there to the token at all, or only the branch is missing |
   | `GET` | `/repos/{o}/{n}/compare/{base}...{head}?per_page=100&page=…` | whether a new head descends from the last, and the commits between (provenance) |
   | `GET` | `/repos/{o}/{n}/git/commits/{sha}` | a commit's tree |
@@ -457,8 +460,10 @@ the API a user needs.
   does not find — or that the token cannot read, which GitHub answers the same, `404` — is told
   apart from one without the branch by asking after the repository itself (`GET /repos/{o}/{n}`),
   and is never taken for no rubric: a kleis grant or a token that does not reach it stops the
-  reviews rather than running them bare. Only a repository read, and empty or without the branch,
-  or without this repository's directory, is no rubric: reviews then go on without one
+  reviews rather than running them bare. Nor is a repository that has commits but not the branch
+  `DIFF_REVIEWER_RUBRICS_BRANCH` names — a misconfiguration: the jobs wait, and the error names
+  the branch. Only an empty repository (GitHub answers `409`), or one without this repository's
+  directory, is no rubric: reviews then go on without one
   (`rubricVersion` 0), said once in the log and in the API, not retried as an error. Once read,
   a later failure to read keeps the rubric in use, and says so.
 - **Pinning.** A job is pinned to the commit in use when it is queued (`rubricSha`; a job pinned
@@ -545,7 +550,10 @@ tables are kept, read-only. To move them:
 1. `diff-reviewer rubrics export --db reviews.db --out review-rubrics` writes a new git repository
    in the layout above, on branch `main` (`--branch`), with one commit per version — rubric
    versions and style notes versions interleaved in the order they were written, each authored and
-   dated when it was written — and the mapping of every version to its commit,
+   dated when it was written; a version that changes nothing (the same notes again, say) is no
+   commit of its own, but the commit before it, which what it was derived from is folded into, so
+   that a history of the directory, which skips an empty commit, cannot lose it — and the mapping
+   of every version to its commit,
    `review-rubrics.mapping.json` (`--mapping <file>`), with what each commit was derived from. A
    version this build cannot read is left out, and said so; so is a type whose name cannot be a
    file's. Every directory written is read back as the platform reads it, and the export stops
@@ -697,9 +705,10 @@ an example or a proposal, and for a run, the list of runs or the summary (`GET �
   known cheaply: every head the workers read is recorded as descending from the head read before
   it, by the commits between them (one compare: `ahead` or `identical`, of at most 100 commits);
   a head that does not descend from it — a force-push — or the first head read, is recorded by
-  the commits of the directory's history at it. So a force-push that drops a merge drops its
-  provenance too. A score whose sample's pull request (or which sample itself) is in the
-  provenance of its job's commit (`derivedFrom`, `derivedFromPulls` on the rubric's answer) is
+  the commits of the directory's history at it, and a force-push by the head before it too: a
+  merge it drops keeps its provenance, the conservative choice, since the new head may have been
+  written from what was in use. A score whose sample's pull request (or which sample itself) is in
+  the provenance of its job's commit (`derivedFrom`, `derivedFromPulls` on the rubric's answer) is
   `derived` (`scoreDerived` in a run's results) — a sample of that pull request imported later
   too: left out of aggregates unless asked (`?derived=include`), and counted (`derivedScores`),
   like a stale one. What it guards: the split keeps eval out of what the agent learns from; this
