@@ -336,9 +336,9 @@ structure Client where
     fun _ _ _ _ => return .error (.definite "comparing commits is not supported")
   /-- What GitHub last said of the rate limit, if it has said anything. -/
   rateLimit : IO (Option RateLimit) := pure none
-  /-- The commit branch `branch` of `owner/name` is at; `none` when the repository has no such
-      branch, an empty repository among them. A repository not found — or one the token cannot
-      read, which GitHub answers the same — is an error, never `none`. -/
+  /-- The commit branch `branch` of `owner/name` is at; `none` when the repository is empty. A
+      repository that has commits and not the branch is an error, and so is one not found — or
+      one the token cannot read, which GitHub answers the same: never `none`. -/
   branchHead : (owner name branch : String) → IO (Except Error (Option String)) :=
     fun _ _ _ => return .error (.definite "reading branches is not supported")
   getCommit : (owner name sha : String) → IO (Except Error GitCommit) :=
@@ -485,8 +485,10 @@ def Client.curl (token : String) (api : String) (maxDiffBytes : Nat := defaultMa
       | .error (.definite why) =>
         if why.startsWith "GitHub answered 409" then return .ok none
         unless why.startsWith "GitHub answered 404" do return .error (.definite why)
+        -- There, and not empty (that is a 409): the branch is missing — a misconfiguration,
+        -- never taken for no rubric.
         match ← call "GET" s!"/repos/{owner}/{name}" with
-        | .ok _ => return .ok none
+        | .ok _ => return .error (.definite s!"{owner}/{name} has no branch {branch}")
         | .error (.definite w) =>
           if w.startsWith "GitHub answered 404" then
             return .error (.definite s!"{owner}/{name} was not found, or the token cannot read \

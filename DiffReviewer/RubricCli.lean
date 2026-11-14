@@ -14,8 +14,10 @@ open Lean (Json)
   * `diff-reviewer rubrics export --db <db> --out <dir>` (`exportDb`): the rubrics, and the style
     notes, the database kept before rubrics lived in git, as a new git repository in the layout of
     the rubrics repository — one commit per version, in the order they were written, each dated
-    when its version was written — and a mapping of each version to its commit, beside it
-    (`<dir>.mapping.json`, or `--mapping <file>`), with what each commit was derived from.
+    when its version was written; a version that changes nothing is the commit before it, with
+    what it was derived from folded into that commit's — and a mapping of each version to its
+    commit, beside it (`<dir>.mapping.json`, or `--mapping <file>`), with what each commit was
+    derived from.
   * `diff-reviewer rubrics import-mapping --db <db> <file>` (`importMapping`): that mapping loaded
     into a database (`Rubrics.importMapping`), so that the jobs and scores that name a version
     find its commit. `serve` loads it too, on start-up, when `DIFF_REVIEWER_RUBRICS_MAPPING` names
@@ -149,6 +151,8 @@ private structure DirState where
   notes        : String := ""
   rubricProv   : Provenance := {}
   notesProv    : Provenance := {}
+  /-- The last commit that changed the directory. -/
+  lastCommit   : Option String := none
 
 /-- Write `owner/name`'s directory under `out` as `st` says, replacing what was there. -/
 private def writeDir (out : System.FilePath) (owner name : String) (st : DirState) : IO Unit := do
@@ -211,19 +215,55 @@ read: {Rubrics.errorsLine (es.map (·.under (Rubrics.directory v.owner v.name)))
     let what := if v.kind == "rubric" then "rubric" else "style notes"
     let msg := s!"{v.owner}/{v.name}: {what} version {v.version}\n\nExported from the \
 diff-reviewer database, where it was written at {v.createdAt}."
-    if let .error e ← git out #["commit", "-q", "--allow-empty", "--no-verify", "-m", msg]
-        (date := some v.createdAt) then
-      return ← fail e
-    let sha ← match ← git out #["rev-parse", "HEAD"] with
-      | .ok s => pure s
+    let dir := Rubrics.directory v.owner v.name
+    let changed ← match ← git out #["status", "--porcelain", "--", dir] with
+      | .ok s => pure !s.isEmpty
       | .error e => return ← fail e
     -- The commit carries what both its rubric and its notes were derived from.
     let prov := st.rubricProv.union st.notesProv
-    entries := entries.push (.mkObj [("owner", v.owner), ("name", v.name), ("kind", v.kind),
-      ("version", v.version), ("commit", sha), ("createdAt", v.createdAt),
-      ("derivedFrom", .arr (prov.samples.map Json.str).toArray),
-      ("derivedFromPulls", .arr (prov.prs.map Json.str).toArray)])
-    IO.println s!"{sha} {v.owner}/{v.name} {what} version {v.version}"
+    let provJson (p : Provenance) : List (String × Json) :=
+      [("derivedFrom", .arr (p.samples.map Json.str).toArray),
+       ("derivedFromPulls", .arr (p.prs.map Json.str).toArray)]
+    let sha ← match changed, st.lastCommit with
+      | false, some last =>
+        -- A version that changes nothing is no commit — a history of the directory would skip
+        -- an empty one, and what it was derived from with it — but the last commit that changed
+        -- the directory: what it was derived from is folded into that commit's.
+        entries := entries.map fun e =>
+          let same := (e.getObjValAs? String "commit").toOption == some last &&
+            (e.getObjValAs? String "owner").toOption == some v.owner &&
+            (e.getObjValAs? String "name").toOption == some v.name
+          if !same then e else
+            let old : Provenance :=
+              { samples := ((e.getObjVal? "derivedFrom" >>= (·.getArr?)).toOption.getD #[]).toList
+                  |>.filterMap (·.getStr?.toOption)
+                prs := ((e.getObjVal? "derivedFromPulls" >>= (·.getArr?)).toOption.getD #[]).toList
+                  |>.filterMap (·.getStr?.toOption) }
+            (provJson (old.union prov)).foldl (fun e (k, x) => e.setObjVal! k x) e
+        IO.println s!"{last} {v.owner}/{v.name} {what} version {v.version} (no change: the \
+commit before)"
+        pure last
+      | _, _ =>
+        if let .error e ← git out #["commit", "-q", "--no-verify", "-m", msg]
+            (date := some v.createdAt) then
+          return ← fail e
+        match ← git out #["rev-parse", "HEAD"] with
+        | .ok s =>
+          IO.println s!"{s} {v.owner}/{v.name} {what} version {v.version}"
+          pure s
+        | .error e => return ← fail e
+    states := (key, { st with lastCommit := some sha }) :: states.filter (·.1 != key)
+    let prov := if changed then prov else
+      (((entries.find? fun e => (e.getObjValAs? String "commit").toOption == some sha &&
+          (e.getObjValAs? String "owner").toOption == some v.owner &&
+          (e.getObjValAs? String "name").toOption == some v.name).map fun e =>
+        ({ samples := ((e.getObjVal? "derivedFrom" >>= (·.getArr?)).toOption.getD #[]).toList
+              |>.filterMap (·.getStr?.toOption)
+           prs := ((e.getObjVal? "derivedFromPulls" >>= (·.getArr?)).toOption.getD #[]).toList
+              |>.filterMap (·.getStr?.toOption) } : Provenance)).getD prov)
+    let fields : List (String × Json) := [("owner", v.owner), ("name", v.name), ("kind", v.kind),
+      ("version", v.version), ("commit", sha), ("createdAt", v.createdAt)]
+    entries := entries.push (.mkObj (fields ++ provJson prov))
   IO.FS.writeFile mappingPath (Json.mkObj [("branch", branch), ("entries", .arr entries)]).pretty
   IO.println s!"{entries.size} version(s) exported to {out}; the mapping is {mappingPath}"
   return 0

@@ -275,8 +275,8 @@ private def saveHead (owner name : String) (h : Head) : IO Unit := do
 
 /-- The message of a rubrics repository without the branch. -/
 def noBranchMessage (src : Source) : String :=
-  s!"the rubrics repository {src.slug} has no branch {src.branch} — it may be empty: no rubric \
-is read from it until it has"
+  s!"the rubrics repository {src.slug} is empty: no rubric is read from it until its branch \
+{src.branch} has a commit"
 
 /-- Every commit a provenance is recorded on, read, so that its directory's tree is known. -/
 private def provenanceCommits : IO (Array (String × String × String)) := do
@@ -301,7 +301,10 @@ def maxHistory : Nat := 1000
     (`Store.LineageRow`): from the head read before, `prev`, by the commits between them when it
     descends from it (GitHub's compare says `ahead`, of at most 100 commits, or `identical`); and
     otherwise — no head before, a force-push, a longer way — by the commits of the directory's
-    history at `h`. An error is GitHub not answering: nothing is recorded, and it is tried again. -/
+    history at `h`, and still from `prev`: a force-push may drop a commit that carried provenance,
+    but what was in use before it may be what the new head was written from, so what it learned is
+    kept rather than forgotten. An error is GitHub not answering: nothing is recorded, and it is
+    tried again. -/
 def recordLineage (gh : GitHub.Client) (src : Source) (owner name h : String)
     (prev : Option String) : IO (Except String Unit) := do
   if (← fetchLineage owner name h).isSome then return .ok ()
@@ -321,7 +324,7 @@ def recordLineage (gh : GitHub.Client) (src : Source) (owner name h : String)
         return ← save (some p) (c.commits.map (·.1))
   match ← gh.listCommits src.owner src.name h (directory owner name) maxHistory with
   | .error e => return .error (ghError s!"reading the history of {directory owner name} at {h}" e)
-  | .ok cs => save none (cs.map (·.sha))
+  | .ok cs => save (prev.filter (· != h)) (cs.map (·.sha))
 
 /-- One pass of following the branch of `src`: see the module's description. `note key msg` says
     `msg` once for `key`. -/
@@ -333,7 +336,9 @@ def refresh (gh : GitHub.Client) (src : Source) (note : String → String → IO
   | .error e =>
     -- Not read: every repository keeps what it has in use, and says why — a review of one that
     -- was never read waits rather than going without a rubric.
-    let why := s!"the rubrics repository {src.slug} cannot be read: {e.message}"
+    let why := s!"the rubrics repository {src.slug} cannot be read: {e.message}{
+      if (e.message.splitOn "has no branch").length > 1 then
+        " — set DIFF_REVIEWER_RUBRICS_BRANCH to one it has" else ""}"
     note s!"rubrics-head-{e.message}" s!"{why}; the rubrics in use stay"
     for r in repos do
       let cur := (← headOf r.owner r.name).getD {}

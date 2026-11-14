@@ -159,6 +159,11 @@ def theExportRoundTrips : Test := withTempDb do
     ({ owner := "acme", name := "widgets", version := 1, notes := "Be brief."
      , derived_samples := "[]", derived_prs := "[\"acme/widgets#9\"]"
      , created_at := "2026-02-01T10:00:00Z" } : Store.NotesRow)
+  -- The same notes again, derived from more: no commit of its own.
+  Store.run <| HasModel.save
+    ({ owner := "acme", name := "widgets", version := 2, notes := "Be brief."
+     , derived_samples := "[]", derived_prs := "[\"acme/widgets#11\"]"
+     , created_at := "2026-03-15T10:00:00Z" } : Store.NotesRow)
   let some repo ← Platform.findRepo "acme" "widgets" | return #["the repository"]
   let old ← Platform.createJob repo 7 (some headA)
   let _ ← Platform.updateJob old.id fun j => return { j with rubricVersion := some 2 }
@@ -188,18 +193,22 @@ def theExportRoundTrips : Test := withTempDb do
       ++ checkEq lines ["acme/widgets: rubric version 1|2026-01-01T10:00:00Z",
           "acme/widgets: style notes version 1|2026-02-01T10:00:00Z",
           "acme/widgets: rubric version 2|2026-03-01T10:00:00Z"]
-        "a commit a version, in order, dated when it was written; one that does not read, none"
+        "a commit a version, in order, dated when it was written; one that does not read, or
+          changes nothing, none"
       ++ checkEq errors.size 0 "a checkout the check reads"
       ++ checkEq notesAt2.toOption (some "Be brief.") "the notes, kept with the later rubric"
       ++ check (typesGone matches .error _) "a type the later version dropped, gone"
-      ++ checkEq entries.size 3 "three versions mapped"
+      ++ checkEq entries.size 4 "four versions mapped"
+      ++ checkEq (commitOf "notes" 2) (commitOf "rubric" 2)
+        "a version that changes nothing, to the commit before it"
       ++ checkEq (commitOf "rubric" 3) none "and not the one that does not read"
-      ++ checkEq loaded.toOption (some 3) "loaded"
-      ++ checkEq again.toOption (some 3) "loaded again, the same"
+      ++ checkEq loaded.toOption (some 4) "loaded"
+      ++ checkEq again.toOption (some 4) "loaded again, the same"
       ++ checkEq (field shown "rubricSha") (some v2) "an old job shows its version's commit"
       ++ checkEq (← Rubrics.legacyVersion "acme" "widgets" v2) (some 2) "and the commit its version"
-      ++ checkEq ((prov.head?.map (·.2.prs)).getD []) ["acme/widgets#7", "acme/widgets#9"]
-        "the commit carries what its rubric and its notes were derived from"
+      ++ checkEq ((prov.head?.map (·.2.prs)).getD []) ["acme/widgets#7", "acme/widgets#9",
+          "acme/widgets#11"]
+        "the commit carries what its rubric and its notes were derived from, the folded too"
       ++ checkEq refusedOut 1 "an export over a directory that is not empty"
   finally
     try IO.FS.removeDirAll out catch _ => pure ()
@@ -285,7 +294,8 @@ def provenanceIsCumulative : Test := withTempDb do
   refresh svc
   let both := (← pullsOf after).toArray.qsort (· < ·) |>.toList
   let compares := (← fg.calls.get).filter fun c => (c.splitOn "/compare/").length > 1
-  -- A force-push to before the second merge: its provenance is gone with it.
+  -- A force-push to before the second merge: the head does not descend from the last, and what
+  -- was in use before it is kept, as the new head may have been written from it.
   let some c1 ← fg.commitOf m1 | return #["the first merge"]
   let back ← fg.commitFiles (← fg.filesOf c1.tree) #[m1] "the second merge, undone by a rewrite"
   fg.forcePush back
@@ -296,8 +306,8 @@ def provenanceIsCumulative : Test := withTempDb do
     ++ checkEq both ["acme/widgets#1", "acme/widgets#7", "acme/widgets#8"]
       "after two merges and an edit: all of it"
     ++ checkEq compares.size 4 "each later head by a compare with the one before"
-    ++ checkEq rewritten ["acme/widgets#1", "acme/widgets#7"]
-      "a force-push that drops a merge drops its provenance"
+    ++ checkEq rewritten ["acme/widgets#1", "acme/widgets#7", "acme/widgets#8"]
+      "a force-push that drops a merge keeps what was in use before it"
 
 /-- Until the rubrics repository has been read, reviews, calibration runs and proposals wait,
     saying why — one not found, or that the token cannot read, above all, which is never taken for
@@ -324,8 +334,13 @@ def anUnreadRepositoryWaits : Test := withTempDb do
   let some waiting ← Platform.findJob reviewId | return #["the review"]
   let shown ← route st (req .get "/api/v1/repos/acme/widgets/rubrics")
   let queuedWhileHidden := (← orch.queued.get).size + (← prop.queued.get).size
-  -- Readable, and with a rubric: every job goes on, the run's all at one commit.
+  -- Readable, with commits, and without the branch: a misconfiguration, which still waits.
   fg.hidden.set false
+  let _ ← fg.change [("README.md", some "Rubrics.\n")] (branch := "trunk")
+  refresh svc
+  Workers.queuePending svc
+  let some stillWaiting ← Platform.findJob reviewId | return #["the review"]
+  -- Readable, and with a rubric: every job goes on, the run's all at one commit.
   let pinned ← fg.setRubric "acme" "widgets" "{\"defaultRubric\": \"Now.\"}"
   refresh svc
   Workers.queuePending svc
@@ -350,6 +365,9 @@ def anUnreadRepositoryWaits : Test := withTempDb do
     ++ check (waiting.error.any fun e => (e.splitOn "not found, or the token cannot read").length
       > 1) "saying why"
     ++ checkEq queuedWhileHidden 0 "nothing queued: no review, no run, no proposal"
+    ++ checkEq stillWaiting.statusRaw "pending" "a repository without the branch: still waiting"
+    ++ check (stillWaiting.error.any fun e => (e.splitOn "has no branch main").length > 1)
+      "naming the branch"
     ++ check (((bodyJson shown).getObjVal? "error").toOption.bind
       (DiffReviewerTest.Calibration.str · ["message"]) |>.any fun m =>
         (m.splitOn "cannot be read").length > 1) "the API says it cannot be read"
@@ -358,7 +376,7 @@ def anUnreadRepositoryWaits : Test := withTempDb do
     ++ checkEq shas [some pinned, some pinned] "its jobs, pinned once read, to one commit"
     ++ checkEq reviewed.rubricSha (some pinned) "the review, too"
     ++ checkEq (proposalJob.map (·.statusRaw)) (some "queued") "and the proposal"
-    ++ checkEq noRubric.rubricVersion (some 0) "a repository read with no branch: no rubric"
+    ++ checkEq noRubric.rubricVersion (some 0) "an empty repository, read: no rubric"
     ++ checkEq noRubric.statusRaw "queued" "and the review goes on"
 
 /-- A proposal's branch or pull request that is someone else's is never taken for its own: a
