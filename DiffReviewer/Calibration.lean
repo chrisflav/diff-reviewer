@@ -2,6 +2,7 @@ import Lean.Data.Json
 import DiffReviewer.Platform
 import DiffReviewer.GitHub
 import DiffReviewer.Score
+import DiffReviewer.Rubrics
 
 open Lean (Json)
 
@@ -52,9 +53,10 @@ repository trusts (`Repo.trustedReviewers`) wrote on its past pull requests:
     pool aggregates — is of `pool` samples whose pull request has no `eval` sample (which samples
     stored before the split was by pull request may have).
   * **Derived** (`derivedOf`). A score is `derived`, and left out of aggregates unless asked like
-    a stale one, when its sample's pull request is one the rubric version or the style notes
-    version its job was reviewed under was derived from (`Platform.Provenance`): what a rubric
-    learned from is no test of it.
+    a stale one, when its sample's pull request is one the rubric its job was reviewed by was
+    derived from — the commit of the rubrics repository it was pinned to (`Rubrics.provenanceOf`),
+    or for a job of before, its rubric version and style notes version (`Platform.Provenance`):
+    what a rubric learned from is no test of it.
   * **Not the platform's own.** An import skips the reviews the platform posted — by GitHub's id
     of a job's `postedReview`, or by the marker in their body — and counts them as `ownPosts`: the
     agent is not to be scored against, nor learn from, itself.
@@ -727,13 +729,16 @@ structure Run where
   /-- `eval` or `pool`, as the run was asked for; `none` for a run stored before runs recorded
       it (`splitOfRun`). -/
   split     : Option String := none
+  /-- The commit of the rubrics repository every job of the run reviews by, pinned when it was
+      made; `none` for a run of before, or with no rubric in use. -/
+  rubricSha : Option String := none
 
 private def Run.ofRow (r : Store.RunRow) : Run :=
   let ids := match Json.parse r.sample_ids >>= (·.getArr?) with
     | .ok xs => xs.toList.filterMap (·.getStr?.toOption)
     | .error _ => []
   { id := r.id, owner := r.owner, name := r.name, sampleIds := ids, createdAt := r.created_at
-    split := r.split }
+    split := r.split, rubricSha := r.rubric_sha }
 
 /-- The runs of `owner/name`, newest first (ties broken by id). -/
 def runsOf (owner name : String) : IO (Array Run) := do
@@ -813,14 +818,12 @@ most allowed, {cap} (--max-calibration-jobs-per-day)"
 private def capError (slug : String) (made more cap : Nat) : RunError :=
   .capped (capMessage slug made more cap)
 
-/-- How many charges a calibration job of `repo` will cost: the sub-runs it fans out to under
-    the current rubric (`Rubric.fanoutPlan`), or one. -/
-private def fanoutWeightIn (repo : Repo) : Sqlite.M Nat := do
-  let some v ← Platform.fetchCurrentRubric repo.owner repo.name | return 1
-  let .ok doc := v.rubric? | return 1
-  match doc.fanoutPlan repo.prType with
-  | some plan => if plan.size ≤ repo.maxFanout then return plan.size else return 1
-  | none => return 1
+/-- How many charges a calibration job of `repo` will cost under `doc`, the rubric its run is
+    pinned to: the sub-runs it fans out to (`Rubric.fanoutPlan`), or one. -/
+private def fanoutWeight (repo : Repo) (doc : Option Rubric) : Nat :=
+  match doc.bind (·.fanoutPlan repo.prType) with
+  | some plan => if plan.size ≤ repo.maxFanout then plan.size else 1
+  | none => 1
 
 /-- The charges a calibration job fanned out to `size` sub-runs costs beyond the one it was
     charged when it was made or run again, inside the transaction that fans it out: why not when
@@ -848,13 +851,15 @@ def chargeRetryIn (job : Job) (cap : Nat) : Sqlite.M (Except String Unit) := do
   return .ok ()
 
 /-- A run of `repo` over `sampleIds`: one `pending` calibration job for each, at the sample's
-    commit and with its base. In one transaction with the checks that every sample is the
-    repository's, not deleted and not being reviewed by a live calibration job already — one
-    sample is one job at a time — and that the jobs fit in what is left of `cap`, the charges on
-    the repository's cap in the last 24 hours; each job is a charge, and one that will fan out
-    is counted for each of its sub-runs. Every sample must be of
-    `split`: `eval`, what calibration measures by, unless the run is asked of the `pool`, whose
-    scores give rubric proposals evidence and are never in an aggregate. -/
+    commit and with its base, every one pinned to the commit of the rubrics repository in use now
+    (`Rubrics.pinFor`), so that the run measures one rubric. In one transaction with the checks
+    that every sample is the repository's, not deleted and not being reviewed by a live
+    calibration job already — one sample is one job at a time — and that the jobs fit in what is
+    left of `cap`, the charges on the repository's cap in the last 24 hours; each job is a
+    charge, and one that will fan out — under the rubric pinned — is counted for each of its
+    sub-runs. Every sample must be of `split`: `eval`, what calibration measures by, unless the
+    run is asked of the `pool`, whose scores give rubric proposals evidence and are never in an
+    aggregate. -/
 def createRun (repo : Repo) (sampleIds : List String) (cap : Nat) (split := "eval") :
     IO (Except RunError (Run × Array Job)) := do
   assignSplits repo
@@ -862,6 +867,11 @@ def createRun (repo : Repo) (sampleIds : List String) (cap : Nat) (split := "eva
   let since := isoOfEpoch ((← nowEpoch) - 86400)
   let runId ← randomHex 8
   let ids ← sampleIds.mapM fun _ => randomHex 8
+  let pin ← Rubrics.pinFor repo.owner repo.name
+  let doc ← match pin with
+    | some sha => pure (((← Rubrics.cached sha repo.owner repo.name).bind
+        (·.rubric?.toOption)).bind id)
+    | none => pure none
   Store.transact do
     let samples ← fetchSamples repo.owner repo.name
     let jobs := (← fetchKindedJobs).filter fun j =>
@@ -880,7 +890,7 @@ which calibration does not measure by" else ""}")
     let made ← chargesSince repo.owner repo.name since
     -- A job that will fan out is charged for each of its sub-runs: one now, the rest when it is
     -- fanned out (`chargeFanoutIn`); a run that cannot pay for all of them is refused now.
-    let weight ← fanoutWeightIn repo
+    let weight := fanoutWeight repo doc
     if made + picked.size * weight > cap then
       return .error (capError repo.slug made (picked.size * weight) cap)
     let jobs : Array Job := Array.zipWith (fun (s : Sample) id =>
@@ -888,16 +898,17 @@ which calibration does not measure by" else ""}")
        , headSha := some s.commitId, baseSha := some s.baseSha, title := some s.title
        , prBody := some s.prBody, createdAt := now, updatedAt := now
        , kindRaw := some JobKind.calibration.toString, sampleId := some s.id
-       , runId := some runId } : Job)) picked ids.toArray
+       , runId := some runId, rubricSha := pin
+       , rubricVersion := if pin.isSome then none else some 0 } : Job)) picked ids.toArray
     for j in jobs do
       HasModel.save j.toRow
       charge repo.owner repo.name j.id now
     let run : Run :=
       { id := runId, owner := repo.owner, name := repo.name, sampleIds, createdAt := now
-        split := some split }
+        split := some split, rubricSha := pin }
     HasModel.save ({ id := runId, owner := repo.owner, name := repo.name
                    , sample_ids := (Json.arr (sampleIds.map Json.str).toArray).compress
-                   , created_at := now, split := some split } : Store.RunRow)
+                   , created_at := now, split := some split, rubric_sha := pin } : Store.RunRow)
     return .ok (run, jobs)
 
 /-- A person's `failed → pending` of calibration job `id`, read at `version`: run it again, which
@@ -954,7 +965,8 @@ private def saveScore (job : Job) (sampleId : String) (score : Json) : IO Unit :
     ({ job_id := job.id, matcher_version := Score.matcherVersion, run_id := job.runId
      , sample_id := sampleId, owner := job.owner, name := job.name
      , rubric_version := job.rubricVersion.map Int.ofNat, score := score.compress
-     , created_at := ← nowIso, stale := some false } : Store.ScoreRow)
+     , created_at := ← nowIso, stale := some false, rubric_sha := job.rubricSha }
+     : Store.ScoreRow)
 
 /-- Score calibration job `job` against its sample, by the current matcher, unless that is done:
     the agent's first draft — what it submitted, before anything a person did — against what the
@@ -993,23 +1005,38 @@ def scorePending : IO Nat := do
 
 private def isStale (r : Store.ScoreRow) : Bool := r.stale == some true
 
+/-- The commit of the rubrics repository score `r`'s job reviewed by: the one the score records,
+    or its job's. -/
+private def shaOfScore (jobs : Array Job) (r : Store.ScoreRow) : Option String :=
+  r.rubric_sha <|> (jobs.find? (·.id == r.job_id)).bind (·.rubricSha)
+
 /-- Which of the scores of `owner/name` are `derived`: of a sample whose pull request — or which
-    itself — the rubric version the job was reviewed against, or the style notes version its agent
-    was given (`Job.notesVersion`), was derived from. By pull request, so that a sample of such a
+    itself — what its job reviewed by was derived from. Of a job pinned to a commit of the rubrics
+    repository, what that commit carries (`Rubrics.provenanceOf`): a merged rubric proposal's, or
+    an exported version's, the rubric and the style notes together. Of a job of before, the
+    rubric version it was reviewed against, or the style notes version its agent was given
+    (`Job.notesVersion`), as the database kept them. By pull request, so that a sample of such a
     pull request imported later is flagged too. Neither is a test of what learned from it. -/
 def derivedOf (owner name : String) : IO (Store.ScoreRow → Bool) := do
   let rubrics ← Platform.rubricHistory owner name
   let notes ← Platform.notesHistory owner name
   let samples ← Store.run (fetchSamples owner name)
   let jobs ← calibrationJobs owner name
+  let scores ← scoresOf owner name
+  let shas := (scores.toList.filterMap (shaOfScore jobs)).eraseDups
+  let byCommit ← Rubrics.provenanceOf owner name shas
   return fun r =>
     let pr := (samples.find? (·.id == r.sample_id)).map fun s => prKey owner name s.prNumber
     let hit (p : Provenance) : Bool :=
       p.samples.contains r.sample_id || pr.any (p.prs.contains ·)
-    let byRubric := rubrics.any fun v => r.rubric_version == some (v.version : Int) && hit v.derived
-    let notesVersion := (jobs.find? (·.id == r.job_id)).bind (·.notesVersion)
-    let byNotes := notes.any fun n => notesVersion == some n.version && hit n.derived
-    byRubric || byNotes
+    match shaOfScore jobs r with
+    | some sha => ((byCommit.lookup sha).map hit).getD false
+    | none =>
+      let byRubric := rubrics.any fun v =>
+        r.rubric_version == some (v.version : Int) && hit v.derived
+      let notesVersion := (jobs.find? (·.id == r.job_id)).bind (·.notesVersion)
+      let byNotes := notes.any fun n => notesVersion == some n.version && hit n.derived
+      byRubric || byNotes
 
 /-- What an aggregate leaves out, and what it is asked to take in. -/
 structure Filter where
@@ -1088,10 +1115,12 @@ def runJson (run : Run) (detail : Bool) (includeStale := false) (includeDerived 
     includeUnisolated)
   let fields : List (String × Json) :=
     [("id", run.id), ("owner", run.owner), ("name", run.name), ("createdAt", run.createdAt),
-     ("split", split), ("samples", run.sampleIds.length), ("jobs", statusCounts jobs),
+     ("split", split), ("rubricSha", optStr run.rubricSha), ("samples", run.sampleIds.length),
+     ("jobs", statusCounts jobs),
      ("aggregate", aggregateOf scores f)]
   unless detail do return .mkObj fields
   let results ← jobs.mapM fun j => do
+    let rubricSha ← Rubrics.shaOfJob j
     let sample ← match j.sampleId with
       | some sid => findSample sid
       | none => pure none
@@ -1100,7 +1129,7 @@ def runJson (run : Run) (detail : Bool) (includeStale := false) (includeDerived 
     return Json.mkObj [
       ("jobId", j.id), ("status", j.statusRaw), ("error", optStr j.error),
       ("rubricVersion", (j.rubricVersion.map fun v => (v : Json)).getD .null),
-      ("prType", optStr j.prType),
+      ("rubricSha", optStr rubricSha), ("prType", optStr j.prType),
       ("isolated", (j.isolated.map fun b => (b : Json)).getD .null),
       ("sample", (sample.map fun s => Json.mkObj [("id", s.id), ("prNumber", s.prNumber),
         ("reviewer", s.reviewer), ("state", s.state), ("commitId", s.commitId),
@@ -1112,21 +1141,36 @@ def runJson (run : Run) (detail : Bool) (includeStale := false) (includeDerived 
 
 /-- The aggregate over every scored calibration job of `owner/name` whose sample is not deleted
     and not of the pool (and whose score is neither stale nor derived, unless asked), and the same
-    for each rubric version the jobs were reviewed against (`null`: before rubrics), newest version
-    first. -/
+    for each rubric the jobs were reviewed by (`byRubric`): each commit of the rubrics repository,
+    a version of before rubrics lived in git at the commit the export made of it, and a version
+    the mapping does not have by its number (both `null`: before rubrics) — the rubric scored
+    most recently first. -/
 def summaryJson (owner name : String) (includeStale := false) (includeDerived := false)
     (split := "eval") (includeUnisolated := true) : IO Json := do
   let f ← filterOf owner name includeStale includeDerived split includeUnisolated
   let scores := (← scoresOf owner name).filter (!f.deleted.contains ·.sample_id)
-  let versions := ((scores.map (·.rubric_version)).toList.eraseDups.toArray.qsort fun a b =>
-    a.getD (-1) > b.getD (-1)).toList
+  let jobs ← calibrationJobs owner name
+  let mapping ← Rubrics.mappingRows owner name
+  -- Each score's rubric: its commit, or its old version's, or the old version alone.
+  let keyOf (r : Store.ScoreRow) : Option String × Option Int :=
+    match shaOfScore jobs r with
+    | some sha => (some sha, ((mapping.find? fun m => m.kind == "rubric" && m.commit_sha == sha).map
+        (·.version)))
+    | none =>
+      let mapped := r.rubric_version.bind fun v =>
+        (mapping.find? fun m => m.kind == "rubric" && m.version == v).map (·.commit_sha)
+      (mapped, r.rubric_version)
+  let newest (k : Option String × Option Int) : String :=
+    ((scores.filter (keyOf · == k)).map (·.created_at)).foldl (fun a b => if b > a then b else a) ""
+  let keys := ((scores.map keyOf).toList.eraseDups.toArray.qsort fun a b =>
+    newest a > newest b).toList
   return .mkObj [
     ("owner", owner), ("name", name), ("split", split), ("runs", (← runsOf owner name).size),
     ("samples", (← listSamples owner name).size),
     ("overall", aggregateOf scores f),
-    ("byRubricVersion", .arr (versions.map fun v =>
-      Json.mkObj [("rubricVersion", (v.map fun n => (n.toNat : Json)).getD .null),
-        ("aggregate", aggregateOf (scores.filter (·.rubric_version == v)) f)]
-      ).toArray)]
+    ("byRubric", .arr (keys.map fun k =>
+      Json.mkObj [("rubricSha", optStr k.1),
+        ("rubricVersion", (k.2.map fun n => (n.toNat : Json)).getD .null),
+        ("aggregate", aggregateOf (scores.filter (keyOf · == k)) f)]).toArray)]
 
 end DiffReviewer.Calibration

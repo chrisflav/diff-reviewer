@@ -73,7 +73,8 @@ queue_entry, review, version, created_at, updated_at) VALUES ('j1', 'acme', 'wid
     ++ checkEq job.directPosts 0 "no posts by the platform"
     ++ checkEq job.postDirect false "no post of the platform's to make again"
     ++ checkEq (← Platform.revisions "j1").size 0 "no history"
-    ++ check (← Platform.currentRubric "acme" "widgets").isNone "no rubric"
+    ++ checkEq job.rubricSha none "pinned to no commit of a rubrics repository"
+    ++ check (← Rubrics.current "acme" "widgets").isNone "no rubric"
 
 def all : List (String × Test) :=
   [("reviewRoundTrips", reviewRoundTrips),

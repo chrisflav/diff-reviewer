@@ -1,6 +1,7 @@
 import DiffReviewer
 import DiffReviewerTest.Basic
 import DiffReviewerTest.Server
+import DiffReviewerTest.FakeGit
 
 open Lean (Json)
 open DiffReviewer
@@ -225,11 +226,11 @@ def anAgentReviewsAndItIsPosted : Test := withTempDb do
   let gh ← FakeGitHub.new #[pull7]
   let orch ← FakeOrchestra.new
   let logs ← IO.mkRef #[]
-  let svc ← services gh orch logs
+  let svc ← DiffReviewerTest.FakeGit.withGit (← services gh orch logs)
   let st ← State.new cfg svc
   putRepo st "{\"mode\": \"staged\"}"
-  let _ ← route st (req .put "/api/v1/repos/acme/widgets/rubrics"
-    "{\"version\": 0, \"prTypes\": [{\"name\": \"feature\"}]}")
+  let _ ← DiffReviewerTest.FakeGit.commitRubric "acme" "widgets"
+    "{\"prTypes\": [{\"name\": \"feature\"}]}"
   -- A job asked for without a head: queueing reads it from GitHub.
   let created ← route st (req .post "/api/v1/jobs"
     "{\"owner\": \"acme\", \"name\": \"widgets\", \"prNumber\": 7}")

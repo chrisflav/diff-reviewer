@@ -1,5 +1,8 @@
 import DiffReviewer.Types
 import DiffReviewer.Rubric
+import DiffReviewer.RubricFiles
+import DiffReviewer.Rubrics
+import DiffReviewer.RubricCli
 import DiffReviewer.Http
 import DiffReviewer.Diff
 import DiffReviewer.Orchestra

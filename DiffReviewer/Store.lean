@@ -137,6 +137,11 @@ structure JobRow where
       default branch because its pull request's head no longer reaches the commit (`0008`); none
       until decided, and for a job of another kind. -/
   isolated : Option Bool
+  /-- The commit of the rubrics repository the job's agent reviews by (`0009`): pinned when it is
+      queued — for a calibration job, when its run is made — and never moved. None for a job
+      reviewed before rubrics lived in git (its `rubric_version` says), or with no rubrics
+      repository to read. -/
+  rubric_sha : Option String
   deriving Repr
 
 /-- The diff of a pull request at one head commit, as GitHub gave it. A commit's diff never
@@ -287,6 +292,8 @@ structure RunRow where
   /-- The split its samples are of, `eval` or `pool` (`0008`); none for a run made before, whose
       samples say. -/
   split : Option String
+  /-- The commit of the rubrics repository every job of the run reviews by (`0009`). -/
+  rubric_sha : Option String
   deriving Repr
 
 /-- The score of one calibration job's review against its sample, by one version of the matcher
@@ -308,6 +315,9 @@ structure ScoreRow where
       it — so that the score is of a sample that is no longer the whole of it. The score itself is
       left as it was; aggregates leave a stale one out unless asked. None is `false`. -/
   stale : Option Bool
+  /-- The commit of the rubrics repository its job reviewed by (`0009`), as `rubric_version`
+      records the version of a job of before. -/
+  rubric_sha : Option String
   deriving Repr
 
 /-- The last version of a deleted repository's settings (`0005`), so that registering it again
@@ -331,7 +341,8 @@ structure ProposalRow where
   name : String
   /-- The `proposal` job that wrote it. -/
   job_id : String
-  /-- The rubric version it was written from, 0 for none. -/
+  /-- The rubric version it was written from, 0 for none, before rubrics lived in git; 0 since,
+      when `base_sha` says. -/
   base_version : Int
   /-- The proposed document, as `Rubric.toJson`. -/
   document : String
@@ -349,8 +360,22 @@ structure ProposalRow where
   status : String
   created_at : String
   decided_at : Option String
-  /-- The rubric version accepting it wrote. -/
+  /-- The rubric version accepting it wrote, before rubrics lived in git. -/
   accepted_version : Option Int
+  /-- The commit of the rubrics repository it was written from: its job's (`0009`). -/
+  base_sha : Option String
+  /-- Its branch in the rubrics repository, and the pull request opened from it, once it is:
+      its number, its page, `open`, `merged` or `closed`, and the commit its merge made — what
+      `status` follows (`0009`). -/
+  branch : Option String
+  pr_number : Option Int
+  pr_url : Option String
+  pr_state : Option String
+  merge_sha : Option String
+  /-- Why the pull request is not open yet, while the workers try again (`0009`). -/
+  pr_error : Option String
+  /-- The commit of the proposal on its branch, once written (`0009`). -/
+  commit_sha : Option String
   deriving Repr
 
 /-- What a rubric proposal job's agent was first given (`0005`): the style notes it read, which
@@ -415,6 +440,66 @@ structure SubRunRow where
   error : Option String
   created_at : String
   updated_at : String
+  deriving Repr
+
+/-- What one commit of the rubrics repository holds for one repository (`0009`): the tree of its
+    directory, none when it has none, and the document and style notes it reads as, or the errors
+    it does not read for, as a JSON array of `{"file", "line", "message"}`. A commit never changes,
+    so this is read from GitHub once. -/
+@[model (dbName := "rubric_snapshot") (primaryKey := ["commit_sha", "owner", "name"]) reviewdb]
+structure SnapshotRow where
+  commit_sha : String
+  owner : String
+  name : String
+  tree_sha : Option String
+  /-- The document, as `Rubric.toJson`, when it reads. -/
+  document : Option String
+  style_notes : Option String
+  errors : Option String
+  fetched_at : String
+  deriving Repr
+
+/-- Where a repository's rubric stands (`0009`): the head of the rubrics repository's branch last
+    read, the commit whose rubric is in use — the head, unless it does not read, when the last that
+    did stays — and why the head is not it, or why there is none. -/
+@[model (dbName := "rubric_head") (primaryKey := ["owner", "name"]) reviewdb]
+structure HeadRow where
+  owner : String
+  name : String
+  head_sha : Option String
+  good_sha : Option String
+  /-- As `{"file", "line", "message"}`. -/
+  error : Option String
+  checked_at : String
+  deriving Repr
+
+/-- Which commit of the rubrics repository an old version of a repository's rubric, or of its
+    style notes (`kind` `rubric` or `notes`), was exported as (`diff-reviewer rubrics export`), so
+    that the jobs and scores that name the version find it (`0009`). -/
+@[model (dbName := "rubric_mapping") (primaryKey := ["owner", "name", "kind", "version"]) reviewdb]
+structure MappingRow where
+  owner : String
+  name : String
+  kind : String
+  version : Int
+  commit_sha : String
+  imported_at : String
+  deriving Repr
+
+/-- What a commit of the rubrics repository was derived from, for a repository (`0009`): the
+    samples and pull requests (`owner/name#pr`) of a merged rubric proposal, on its merge commit, or
+    of an exported version, on its commit, as JSON arrays. Every commit whose directory is the same
+    tree carries it (`Rubrics.provenanceOf`). `source` names it: `proposal:<id>` or `export`. -/
+@[model (dbName := "rubric_provenance") (primaryKey := ["owner", "name", "commit_sha", "source"])
+  reviewdb]
+structure ProvenanceRow where
+  owner : String
+  name : String
+  commit_sha : String
+  source : String
+  samples : String
+  prs : String
+  created_at : String
   deriving Repr
 
 /-- Calibration's jobs are found by their kind, among every review the platform has made. -/
@@ -720,10 +805,71 @@ def migration0008 : Db.Migration.Migration where
   steps := [.addColumn "calibration_run" "split" { type := .text, nullable := true },
             .addColumn "review_job" "isolated" { type := .bool, nullable := true }]
 
+/-- `0009_rubrics_in_git`: rubrics live in a git repository — the commit each job, run and score
+    reviewed by, a proposal's branch and pull request, what each commit of the rubrics repository
+    holds for a repository, where each repository's rubric stands, the commits the old versions
+    were exported as, and what commits were derived from. The new columns are nullable: a job
+    before names its `rubric_version`, and a proposal before was decided on the platform. The old
+    tables, `repo_rubric` and `repo_notes`, are kept as they are: what the export reads, and what
+    the jobs of before are judged by. -/
+def migration0009 : Db.Migration.Migration where
+  name := "0009_rubrics_in_git"
+  steps := [
+    .addColumn "review_job" "rubric_sha" { type := .text, nullable := true },
+    .addColumn "calibration_run" "rubric_sha" { type := .text, nullable := true },
+    .addColumn "calibration_score" "rubric_sha" { type := .text, nullable := true },
+    .addColumn "rubric_proposal" "base_sha" { type := .text, nullable := true },
+    .addColumn "rubric_proposal" "branch" { type := .text, nullable := true },
+    .addColumn "rubric_proposal" "pr_number" { type := .int, nullable := true },
+    .addColumn "rubric_proposal" "pr_url" { type := .text, nullable := true },
+    .addColumn "rubric_proposal" "pr_state" { type := .text, nullable := true },
+    .addColumn "rubric_proposal" "merge_sha" { type := .text, nullable := true },
+    .addColumn "rubric_proposal" "pr_error" { type := .text, nullable := true },
+    .addColumn "rubric_proposal" "commit_sha" { type := .text, nullable := true },
+    .createTable "rubric_snapshot"
+      { columns := .ofList
+          [("commit_sha", { type := .text, nullable := false }),
+           ("owner", { type := .text, nullable := false }),
+           ("name", { type := .text, nullable := false }),
+           ("tree_sha", { type := .text, nullable := true }),
+           ("document", { type := .text, nullable := true }),
+           ("style_notes", { type := .text, nullable := true }),
+           ("errors", { type := .text, nullable := true }),
+           ("fetched_at", { type := .text, nullable := false })],
+        primaryKey := ["commit_sha", "owner", "name"] },
+    .createTable "rubric_head"
+      { columns := .ofList
+          [("owner", { type := .text, nullable := false }),
+           ("name", { type := .text, nullable := false }),
+           ("head_sha", { type := .text, nullable := true }),
+           ("good_sha", { type := .text, nullable := true }),
+           ("error", { type := .text, nullable := true }),
+           ("checked_at", { type := .text, nullable := false })],
+        primaryKey := ["owner", "name"] },
+    .createTable "rubric_mapping"
+      { columns := .ofList
+          [("owner", { type := .text, nullable := false }),
+           ("name", { type := .text, nullable := false }),
+           ("kind", { type := .text, nullable := false }),
+           ("version", { type := .int, nullable := false }),
+           ("commit_sha", { type := .text, nullable := false }),
+           ("imported_at", { type := .text, nullable := false })],
+        primaryKey := ["owner", "name", "kind", "version"] },
+    .createTable "rubric_provenance"
+      { columns := .ofList
+          [("owner", { type := .text, nullable := false }),
+           ("name", { type := .text, nullable := false }),
+           ("commit_sha", { type := .text, nullable := false }),
+           ("source", { type := .text, nullable := false }),
+           ("samples", { type := .text, nullable := false }),
+           ("prs", { type := .text, nullable := false }),
+           ("created_at", { type := .text, nullable := false })],
+        primaryKey := ["owner", "name", "commit_sha", "source"] }]
+
 /-- The migrations, in the order they are applied. Appended to, never edited. -/
 def migrations : List Db.Migration.Migration :=
   [migration0001, migration0002, migration0003, migration0004, migration0005, migration0006,
-   migration0007, migration0008]
+   migration0007, migration0008, migration0009]
 
 /-- Where the database is. Set once at start-up (`serve --db`), and by the tests. -/
 initialize pathRef : IO.Ref System.FilePath ← IO.mkRef (System.FilePath.mk "diff-reviewer.db")

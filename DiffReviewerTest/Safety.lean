@@ -2,6 +2,7 @@ import DiffReviewer
 import DiffReviewerTest.Basic
 import DiffReviewerTest.Server
 import DiffReviewerTest.Workers
+import DiffReviewerTest.FakeGit
 
 open Lean (Json)
 open DiffReviewer
@@ -355,7 +356,7 @@ def anAgentRunsOnlyItsOwnJob : Test := withTempDb do
   let gh ← FakeGitHub.new #[pull7 jobHead]
   let orch ← FakeOrchestra.new
   let logs ← IO.mkRef #[]
-  let svc ← servicesWith gh orch logs
+  let svc ← DiffReviewerTest.FakeGit.withGit (← servicesWith gh orch logs)
   let st ← State.new cfg svc
   let first ← newJob st
   let second ← newJob st
@@ -363,6 +364,7 @@ def anAgentRunsOnlyItsOwnJob : Test := withTempDb do
   let a := (field first "id").getD ""
   let b := (field second "id").getD ""
   let unnamed ← route st (agentReq .get "")
+  let _ ← DiffReviewerTest.FakeGit.commitRubric "acme" "widgets" "{}"
   let proposal ← route st (req .post "/api/v1/repos/acme/widgets/proposals" "{}")
   let byProposal ← route st { agentReq .get "" with
     header := fun n => if n == "x-diff-reviewer-job" then field proposal "id" else

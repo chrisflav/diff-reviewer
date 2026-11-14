@@ -1000,29 +1000,7 @@ ul.changes {
   border-left: 3px dashed var(--danger);
 }
 
-/* The rubric editor. */
-
-.rubric-text {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-  gap: 12px;
-  margin: 8px 0;
-}
-
-.rubric-text .pane {
-  display: grid;
-  align-content: start;
-  gap: 4px;
-  min-width: 0;
-}
-
-.rubric-text textarea {
-  margin: 0;
-}
-
-.rubric-text .pane-label {
-  color: var(--mute);
-}
+/* The rubric, as the rubrics repository holds it. */
 
 .preview {
   white-space: pre-wrap;
@@ -1035,36 +1013,6 @@ ul.changes {
   min-height: 3em;
 }
 
-ol.types,
-ol.cats {
-  list-style: none;
-  padding: 0;
-  margin: 0;
-}
-
-fieldset.type {
-  border: 1px solid var(--rule);
-  border-radius: 6px;
-  background: var(--raised);
-  margin: 0 0 16px;
-  padding: 8px 12px 12px;
-  min-width: 0;
-}
-
-fieldset.type legend {
-  font-weight: 600;
-  padding: 0 4px;
-  overflow-wrap: anywhere;
-}
-
-fieldset.type .preview {
-  background: var(--page);
-}
-
-.type-tools {
-  justify-content: flex-end;
-}
-
 label.field {
   display: grid;
   gap: 2px;
@@ -1073,30 +1021,6 @@ label.field {
 
 label.field textarea {
   margin: 0;
-}
-
-h3.cats-h {
-  font-size: 1rem;
-  margin: 16px 0 2px;
-}
-
-li.cat {
-  border-top: 1px solid var(--rule);
-  padding: 6px 0;
-}
-
-.cat-fields {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0 12px;
-}
-
-.cat-fields label.field {
-  flex: 0 1 20ch;
-}
-
-.cat-fields label.field.grow {
-  flex: 1 1 28ch;
 }
 
 [aria-invalid="true"] {
@@ -1113,9 +1037,32 @@ section.viewed h3 {
   padding: 6px 0;
 }
 
+.shown-type h4,
 .shown-type h5 {
   font-size: 1rem;
   margin: 4px 0;
+}
+
+ul.rubric-files {
+  padding-left: 1.2em;
+}
+
+ul.rubric-files li {
+  margin: 4px 0;
+  overflow-wrap: anywhere;
+}
+
+ul.rubric-files .actions {
+  display: inline-flex;
+}
+
+dl.extras div {
+  display: contents;
+}
+
+dl.extras dd {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .shown-type .body,
@@ -1140,10 +1087,6 @@ dl.cats-shown dd {
 }
 
 @media (max-width: 720px) {
-  .rubric-text {
-    grid-template-columns: minmax(0, 1fr);
-  }
-
   dl.cats-shown {
     grid-template-columns: minmax(0, 1fr);
   }
@@ -1599,20 +1542,6 @@ fieldset.split-pick legend {
   font-size: 0.9em;
 }
 
-textarea.notes {
-  width: 100%;
-  margin-top: 4px;
-}
-
-.adopt-notice {
-  border-left: 3px solid var(--info);
-}
-
-.adopt-notice h2 {
-  margin: 0 0 8px;
-  font-size: 1.1em;
-}
-
 .p-pending {
   color: var(--warn);
 }
@@ -1715,4 +1644,15 @@ section.provenance h5 {
 
 ul.failed-jobs {
   padding-left: 20px;
+}
+.pr-open {
+  color: var(--warn);
+}
+
+.pr-merged {
+  color: var(--accent);
+}
+
+.pr-closed {
+  color: var(--danger);
 }

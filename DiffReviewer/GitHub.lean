@@ -10,8 +10,11 @@ open Lean (Json)
 What the platform needs of GitHub's REST API: the open pull requests of a repository (discovery),
 one pull request's title, body, base and head, its diff, and posting a review; and for
 calibration, the recent closed pull requests, their reviews and inline review comments, and the
-merge base a commit of one had. Every path is under `/repos/{owner}/{name}/`, which is what kleis's
-`diff-reviewer-poster` grant allows.
+merge base a commit of one had. Of the rubrics repository (`DiffReviewer.Rubrics`): its branch's
+head, commits, trees and blobs, the commits that change a directory, and — for a rubric proposal
+only — a tree, a commit, a branch and a pull request of its own, and reading that pull request.
+Every path is under `/repos/{owner}/{name}/`, which is what kleis's `diff-reviewer-poster` grant
+allows.
 
 `Client` is a record of functions rather than a module of them, so that the workers and the
 server can be run against a fake in the suite; `Client.curl` is the real one. It sends
@@ -36,6 +39,12 @@ structure Pull where
   author  : String := ""
   /-- `open` or `closed`. -/
   state   : String := "open"
+  /-- Whether a closed pull request was merged, and the commit its merge made: a rubric proposal
+      follows its pull request by them. -/
+  merged  : Bool := false
+  mergeCommitSha : Option String := none
+  /-- The pull request on github.com. -/
+  htmlUrl : String := ""
   deriving Repr, BEq
 
 def Pull.ofJson (j : Json) : Except String Pull := do
@@ -48,8 +57,60 @@ def Pull.ofJson (j : Json) : Except String Pull := do
   let draft := (j.getObjValAs? Bool "draft").toOption.getD false
   let author := ((j.getObjVal? "user").bind (·.getObjValAs? String "login")).toOption.getD ""
   let state := (j.getObjValAs? String "state").toOption.getD "open"
+  -- A listing has no `merged`, but has `merged_at`.
+  let merged := (j.getObjValAs? Bool "merged").toOption.getD false ||
+    (j.getObjValAs? String "merged_at").toOption.isSome
+  let mergeCommitSha := (j.getObjValAs? String "merge_commit_sha").toOption.map String.toLower
+  let htmlUrl := (j.getObjValAs? String "html_url").toOption.getD ""
   return { number, title, body, headSha := headSha.toLower, baseSha := baseSha.toLower, draft
-         , author, state }
+         , author, state, merged, mergeCommitSha, htmlUrl }
+
+/-- A commit, as the git data API gives it (`GET /repos/{o}/{n}/git/commits/{sha}`) — or as a
+    listing of commits does (`GET /repos/{o}/{n}/commits`), which nests it. -/
+structure GitCommit where
+  sha     : String
+  tree    : String := ""
+  parents : Array String := #[]
+  message : String := ""
+  authorName : String := ""
+  /-- The GitHub login of the author, when GitHub knows one (listings only). -/
+  authorLogin : Option String := none
+  /-- When it was authored, RFC 3339. -/
+  date    : String := ""
+  deriving Repr, BEq, Inhabited
+
+def GitCommit.ofJson (j : Json) : Except String GitCommit := do
+  let sha ← j.getObjValAs? String "sha"
+  -- A listing nests the commit under `commit`; the git data API gives it bare.
+  let c := (j.getObjVal? "commit").toOption.getD j
+  let tree := ((c.getObjVal? "tree").bind (·.getObjValAs? String "sha")).toOption.getD ""
+  let parents := match j.getObjVal? "parents" >>= (·.getArr?) with
+    | .ok ps => ps.filterMap fun p => (p.getObjValAs? String "sha").toOption.map String.toLower
+    | .error _ => #[]
+  let author := (c.getObjVal? "author").toOption.getD .null
+  let login := ((j.getObjVal? "author").bind (·.getObjValAs? String "login")).toOption
+  return { sha := sha.toLower, tree := tree.toLower, parents
+         , message := (c.getObjValAs? String "message").toOption.getD ""
+         , authorName := (author.getObjValAs? String "name").toOption.getD ""
+         , authorLogin := login, date := (author.getObjValAs? String "date").toOption.getD "" }
+
+/-- One entry of a git tree: its path (within the tree read), `blob` or `tree`, and its object. -/
+structure TreeEntry where
+  path : String
+  type : String
+  sha  : String
+  deriving Repr, BEq, Inhabited
+
+def TreeEntry.ofJson (j : Json) : Except String TreeEntry := do
+  return { path := ← j.getObjValAs? String "path", type := ← j.getObjValAs? String "type"
+         , sha := (← j.getObjValAs? String "sha").toLower }
+
+/-- One change of a tree written on top of another (`POST /repos/{o}/{n}/git/trees` with
+    `base_tree`): the file at `path` with `content`, or, `none`, the file removed. -/
+structure TreeChange where
+  path    : String
+  content : Option String
+  deriving Repr, BEq
 
 /-- A review on a pull request, as the platform looks for its own among them. -/
 structure PostedReview where
@@ -271,6 +332,40 @@ structure Client where
     fun _ _ _ _ => return .error (.definite "comparing commits is not supported")
   /-- What GitHub last said of the rate limit, if it has said anything. -/
   rateLimit : IO (Option RateLimit) := pure none
+  /-- The commit branch `branch` of `owner/name` is at; `none` when it has no such branch, an
+      empty repository among them. -/
+  branchHead : (owner name branch : String) → IO (Except Error (Option String)) :=
+    fun _ _ _ => return .error (.definite "reading branches is not supported")
+  getCommit : (owner name sha : String) → IO (Except Error GitCommit) :=
+    fun _ _ _ => return .error (.definite "reading commits is not supported")
+  /-- The entries of tree `sha`; with `recursive`, of every tree below it too, by their paths
+      from it. -/
+  getTree : (owner name sha : String) → (recursive : Bool) → IO (Except Error (Array TreeEntry)) :=
+    fun _ _ _ _ => return .error (.definite "reading trees is not supported")
+  /-- The contents of blob `sha`, as text. -/
+  getBlob : (owner name sha : String) → IO (Except Error String) :=
+    fun _ _ _ => return .error (.definite "reading blobs is not supported")
+  /-- The newest commits of `branch` that change `path`, at most `limit`, newest first. -/
+  listCommits : (owner name branch path : String) → (limit : Nat) →
+      IO (Except Error (Array GitCommit)) :=
+    fun _ _ _ _ _ => return .error (.definite "listing commits is not supported")
+  /-- A tree of `changes` over tree `baseTree`: its sha. -/
+  createTree : (owner name baseTree : String) → (changes : Array TreeChange) →
+      IO (Except Error String) :=
+    fun _ _ _ _ => return .error (.definite "writing trees is not supported")
+  /-- A commit of `tree` on `parents` with `message`: its sha. -/
+  createCommit : (owner name message tree : String) → (parents : Array String) →
+      IO (Except Error String) :=
+    fun _ _ _ _ _ => return .error (.definite "writing commits is not supported")
+  /-- Branch `branch` at `sha`, made. -/
+  createBranch : (owner name branch sha : String) → IO (Except Error Unit) :=
+    fun _ _ _ _ => return .error (.definite "writing branches is not supported")
+  /-- A pull request from `head` (a branch of `owner/name`) into `base`. -/
+  createPull : (owner name title head base body : String) → IO (Except Error Pull) :=
+    fun _ _ _ _ _ _ => return .error (.definite "opening pull requests is not supported")
+  /-- The pull request from branch `head` of `owner/name`, open or closed, if there is one. -/
+  findPull : (owner name head : String) → IO (Except Error (Option Pull)) :=
+    fun _ _ _ => return .error (.definite "listing pull requests is not supported")
 
 /-- The API's root, `https://api.github.com` unless `DIFF_REVIEWER_GITHUB_API` names another. -/
 def defaultApi : IO String := do
@@ -377,7 +472,67 @@ def Client.curl (token : String) (api : String) (maxDiffBytes : Nat := defaultMa
       compareNewest fun page => do
         return (← call "GET" (comparePagePath owner name base head page)).bind
           (parse Comparison.ofJson)
-    rateLimit := lastRateLimit.get }
+    rateLimit := lastRateLimit.get
+    branchHead := fun owner name branch => do
+      -- An empty repository answers 409, a branch it does not have 404: neither has a head.
+      match ← call "GET" s!"/repos/{owner}/{name}/git/ref/heads/{branch}" with
+      | .error (.definite why) =>
+        if why.startsWith "GitHub answered 404" || why.startsWith "GitHub answered 409" then
+          return .ok none
+        return .error (.definite why)
+      | .error e => return .error e
+      | .ok r => return (parse (fun j => do
+          return some (← (← j.getObjVal? "object").getObjValAs? String "sha").toLower) r)
+    getCommit := fun owner name sha => do
+      return (← call "GET" s!"/repos/{owner}/{name}/git/commits/{sha}").bind
+        (parse GitCommit.ofJson)
+    getTree := fun owner name sha recursive => do
+      let q := if recursive then "?recursive=1" else ""
+      return (← call "GET" s!"/repos/{owner}/{name}/git/trees/{sha}{q}").bind
+        (parse fun j => do
+          if (j.getObjValAs? Bool "truncated").toOption == some true then
+            throw "the tree is too large for GitHub to list whole"
+          (← (← j.getObjVal? "tree").getArr?).mapM TreeEntry.ofJson)
+    getBlob := fun owner name sha => do
+      return (← call "GET" s!"/repos/{owner}/{name}/git/blobs/{sha}"
+        (accept := "application/vnd.github.raw+json")).map (·.body)
+    listCommits := fun owner name branch path limit => do
+      let per := min limit 100
+      let mut all := #[]
+      for page in [1:(limit + per - 1) / max per 1 + 1] do
+        match (← call "GET" s!"/repos/{owner}/{name}/commits?sha={branch}&path={path}\
+&per_page={per}&page={page}").bind (parse fun j => do (← j.getArr?).mapM GitCommit.ofJson) with
+        | .error e => return .error e
+        | .ok xs =>
+          all := all ++ xs
+          if xs.size < per then break
+      return .ok (all.extract 0 limit)
+    createTree := fun owner name baseTree changes => do
+      let entries := changes.map fun c =>
+        Json.mkObj [("path", c.path), ("mode", "100644"), ("type", "blob"),
+          match c.content with
+          | some t => ("content", (t : Json))
+          | none => ("sha", Json.null)]
+      return (← call "POST" s!"/repos/{owner}/{name}/git/trees"
+          (body := some (.mkObj [("base_tree", baseTree), ("tree", .arr entries)]))).bind
+        (parse fun j => return (← j.getObjValAs? String "sha").toLower)
+    createCommit := fun owner name message tree parents => do
+      return (← call "POST" s!"/repos/{owner}/{name}/git/commits"
+          (body := some (.mkObj [("message", message), ("tree", tree),
+                                 ("parents", .arr (parents.map Json.str))]))).bind
+        (parse fun j => return (← j.getObjValAs? String "sha").toLower)
+    createBranch := fun owner name branch sha => do
+      return (← call "POST" s!"/repos/{owner}/{name}/git/refs"
+          (body := some (.mkObj [("ref", s!"refs/heads/{branch}"), ("sha", sha)]))).map
+        fun _ => ()
+    createPull := fun owner name title head base body => do
+      return (← call "POST" s!"/repos/{owner}/{name}/pulls"
+          (body := some (.mkObj [("title", title), ("head", head), ("base", base),
+                                 ("body", body)]))).bind
+        (parse Pull.ofJson)
+    findPull := fun owner name head => do
+      return (← call "GET" s!"/repos/{owner}/{name}/pulls?head={owner}:{head}&state=all").bind
+        (parse fun j => do return (← (← j.getArr?).mapM Pull.ofJson)[0]?) }
 
 /-- The client configured by the environment: the token in `DIFF_REVIEWER_GITHUB_TOKEN_FILE`, or
     `none` when it is unset. -/

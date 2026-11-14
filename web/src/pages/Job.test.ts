@@ -27,6 +27,7 @@ const job: Job = {
   postedUrl: null,
   postNote: null,
   postedReview: null,
+  rubricSha: null,
   rubricVersion: null,
   directPosts: 0,
   postDirect: false,

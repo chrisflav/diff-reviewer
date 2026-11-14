@@ -138,13 +138,19 @@ function ShownType({ t, added }: { t: PrType; added: boolean }) {
 }
 
 /**
- * What a proposal changes of the rubric it was written from, as the server worked it out: the
- * default rubric's text and fan-out, the types added and removed, and each type changed — its
- * description, its rubric, its fan-out and its categories. All of it text.
+ * What a proposal changes of the rubric it was written from, or one commit of the rubric of
+ * another, as the server worked it out: the default rubric's text and fan-out, the types added
+ * and removed, and each type changed — its description, its rubric, its fan-out and its
+ * categories. All of it text. `subject` names what changes, for when nothing does.
  */
-export function ProposalDiffView({ diff }: { diff: RubricProposalDiff }) {
-  if (rubricUnchanged(diff))
-    return <p className="mute">The proposal changes nothing of the rubric.</p>;
+export function ProposalDiffView({
+  diff,
+  subject = "The proposal changes",
+}: {
+  diff: RubricProposalDiff;
+  subject?: string;
+}) {
+  if (rubricUnchanged(diff)) return <p className="mute">{subject} nothing of the rubric.</p>;
   return (
     <div className="proposal-diff">
       {diff.defaultRubric === null ? (
@@ -245,12 +251,12 @@ export function ProposedDocumentView({
   );
 }
 
-/** The style notes a proposal proposes, against those its agent was given. */
+/** The style notes a proposal proposes, against those at its base. */
 export function StyleNotesDiff({ change }: { change: TextChange }) {
   if (change === null)
     return (
       <p className="mute small-text">
-        The proposal's style notes say what the notes its agent was given said.
+        The proposal's style notes say what the notes at its base said.
       </p>
     );
   return <TextDiff before={change.before} after={change.after} label="Style notes" />;

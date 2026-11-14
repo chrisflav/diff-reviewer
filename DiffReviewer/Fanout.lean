@@ -398,12 +398,13 @@ inductive BeginError where
   /-- The day's cap would be passed: the job waits, with why. -/
   | capped (why : String)
 
-/-- Fan job `job`, read `pending`, out by `plan` under rubric version `rubricVersion`: in one
+/-- Fan job `job`, read `pending`, out by `plan` under the rubric at `rubricSha`: in one
     transaction with the check that it is still `pending` at the version read, and `charge` —
     the check of the day's cap for the sub-runs and its charge, answering why not — a new round
     of `pending` sub-runs, their external ids under `base`, and the job `queued`, of the plan's
-    type and rubric version, with what queueing learnt of its pull request (`learnt`). -/
-def begin (job : Job) (learnt : Job → Job) (plan : FanoutPlan) (rubricVersion : Nat)
+    type and rubric commit, which every sub-run reads, with what queueing learnt of its pull
+    request (`learnt`). -/
+def begin (job : Job) (learnt : Job → Job) (plan : FanoutPlan) (rubricSha : Option String)
     (base : String) (charge : Sqlite.M (Except String Unit)) :
     IO (Except BeginError (Job × Array SubRun)) := do
   let now ← nowIso
@@ -422,7 +423,8 @@ def begin (job : Job) (learnt : Job → Job) (plan : FanoutPlan) (rubricVersion 
     for s in subs do HasModel.save s.toRow
     let next := { learnt j with
       statusRaw := JobStatus.queued.toString, queueEntry := none, attempts := j.attempts + 1
-      error := none, prType := plan.prType, rubricVersion := some rubricVersion
+      error := none, prType := plan.prType, rubricSha := rubricSha
+      rubricVersion := if rubricSha.isSome then none else some 0
       fanoutRound := some j.attempts
       version := j.version + 1, updatedAt := now }
     HasModel.save next.toRow

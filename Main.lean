@@ -42,6 +42,24 @@ USAGE:
       the job the agent's prompt gave it, and is required. --since prints an
       incremental re-review's diff of the changes since its earlier review.
 
+  diff-reviewer rubrics check <dir>
+      Check a checkout of the rubrics repository: every <owner>/<name>/
+      directory read as the platform reads it, and every error printed as
+      file:line: message. Exits 1 when there is one. For the rubrics
+      repository's CI.
+
+  diff-reviewer rubrics export --db <path> --out <dir> [--mapping <file>]
+                               [--branch <name>]
+      Write the rubrics and style notes a database kept before rubrics lived
+      in git as a new git repository at <dir> (on branch main, unless
+      --branch), one commit per version, dated when it was written, and the
+      mapping of each version to its commit to <file> (<dir>.mapping.json).
+
+  diff-reviewer rubrics import-mapping --db <path> <file>
+      Load an export's mapping into the database, so that the jobs and scores
+      of before find their rubric's commit. `serve` loads the file
+      $DIFF_REVIEWER_RUBRICS_MAPPING names on start-up too.
+
   diff-reviewer agent proposal show   <owner/repo> --job <id>
   diff-reviewer agent proposal submit <owner/repo> <proposal.json | -> --job <id>
       What a rubric proposal agent runs: what the proposal is written from (the
@@ -193,10 +211,33 @@ every request"
   let proposer := client proposerToken
   if orchestra.isSome && proposer.isNone then
     log "no DIFF_REVIEWER_ORCHESTRA_PROPOSER_TOKEN_FILE: rubric proposals stay pending"
-  let services ← Workers.Services.new github orchestra log cfg.limits proposer
+  let rubrics ← match ← Rubrics.Source.ofEnv with
+    | .ok r => pure r
+    | .error e =>
+      IO.eprintln s!"error: {e}"
+      IO.Process.exit 1
+  match rubrics with
+  | none => log "no DIFF_REVIEWER_RUBRICS_REPO: reviews have no rubric, and there are no rubric \
+proposals"
+  | some src =>
+    if github.isNone then
+      log s!"no DIFF_REVIEWER_GITHUB_TOKEN_FILE: the rubrics repository, {src.slug}, is not read"
+  let services ← Workers.Services.new github orchestra log cfg.limits proposer rubrics
   Store.setPath cfg.dbPath
   -- Open (and migrate) the database before listening, so a bad path fails at start-up.
   let _ ← Platform.listRepos
+  if let some path ← IO.getEnv "DIFF_REVIEWER_RUBRICS_MAPPING" then
+    unless path.isEmpty do
+      let j ← match Lean.Json.parse (← IO.FS.readFile path) with
+        | .ok j => pure j
+        | .error e =>
+          IO.eprintln s!"error: DIFF_REVIEWER_RUBRICS_MAPPING: {path} is not JSON: {e}"
+          IO.Process.exit 1
+      match ← Rubrics.importMapping j with
+      | .ok n => log s!"loaded the mapping of {n} old rubric version(s) to their commits"
+      | .error e =>
+        IO.eprintln s!"error: DIFF_REVIEWER_RUBRICS_MAPPING: {path}: {e}"
+        IO.Process.exit 1
   let (port, _) ← Server.serve cfg services
   IO.println s!"diff-reviewer: serving on http://{cfg.host}:{port} (database {cfg.dbPath})"
   (← IO.getStdout).flush
@@ -204,12 +245,31 @@ every request"
   -- The server runs on its own threads; this one only has to stay alive.
   repeat IO.sleep 3600000
 
+/-- `rubrics export`'s flags: the database, the directory, the mapping's file and the branch. -/
+private def exportFlags : List String →
+    (Option String × Option String × Option String × String) →
+    Option (Option String × Option String × Option String × String)
+  | [], acc => some acc
+  | "--db" :: v :: rest, (_, o, m, b) => exportFlags rest (some v, o, m, b)
+  | "--out" :: v :: rest, (d, _, m, b) => exportFlags rest (d, some v, m, b)
+  | "--mapping" :: v :: rest, (d, o, _, b) => exportFlags rest (d, o, some v, b)
+  | "--branch" :: v :: rest, (d, o, m, _) => exportFlags rest (d, o, m, v)
+  | _, _ => none
+
 def main (args : List String) : IO Unit := do
   match args with
   | ["github", repo, prNumber, jsonPath]             => cmdGitHub repo prNumber jsonPath true
   | ["github", repo, prNumber, jsonPath, "--submit"] => cmdGitHub repo prNumber jsonPath false
   | ["from-git", range]                  => cmdFromGit range
   | "serve" :: flags                     => cmdServe flags
+  | ["rubrics", "check", dir] => IO.Process.exit (← RubricCli.check dir).toUInt8
+  | "rubrics" :: "export" :: flags =>
+    match exportFlags flags (none, none, none, "main") with
+    | some (some db, some out, mapping, branch) =>
+      IO.Process.exit (← RubricCli.exportDb db out (mapping.map System.FilePath.mk) branch).toUInt8
+    | _ => IO.print usage; IO.Process.exit 1
+  | ["rubrics", "import-mapping", "--db", db, file] =>
+    IO.Process.exit (← RubricCli.importMapping db file).toUInt8
   | "agent" :: "show" :: repo :: pr :: rest =>
     let some job := Agent.jobFlag rest | IO.print usage; IO.Process.exit 1
     IO.Process.exit (← Agent.showPull repo pr job).toUInt8

@@ -5,5 +5,5 @@ def main : IO UInt32 := do
     DiffReviewerTest.Workers.all ++ DiffReviewerTest.Safety.all ++ DiffReviewerTest.Rubrics.all ++
     DiffReviewerTest.Calibration.all ++ DiffReviewerTest.Style.all ++
     DiffReviewerTest.Validity.all ++ DiffReviewerTest.Fanout.all ++
-    DiffReviewerTest.Incremental.all)
+    DiffReviewerTest.Incremental.all ++ DiffReviewerTest.GitRubrics.all)
   return if ok then 0 else 1

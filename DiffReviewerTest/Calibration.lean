@@ -655,7 +655,7 @@ def runsAreAggregated : Test := withTempDb do
   let missing ← route st (req .get s!"{repoPath}/calibration/runs/nope")
   let listed := (items runs).head?.getD .null
   let s := bodyJson summary
-  let byVersion := ((s.getObjVal? "byRubricVersion").toOption.bind (·.getArr?.toOption)).getD #[]
+  let byVersion := ((s.getObjVal? "byRubric").toOption.bind (·.getArr?.toOption)).getD #[]
   -- A draft that does not read.
   let bad ← runOf st [← sampleId st 201]
   let badJob := ((resultsOf bad).head?.bind (str · ["jobId"])).getD ""

@@ -144,6 +144,9 @@ def maxRubricNameLength : Nat := 100
 /-- The longest rubric, default or a type's, in bytes. -/
 def maxRubricBytes : Nat := 65536
 
+/-- The longest style notes, in bytes: a page of guidance, not a second rubric. -/
+def maxStyleNotesBytes : Nat := 16384
+
 /-- Why `r` is not a document to store, if it is not: a type or category without a name, or with
     one another has, or past the bounds above. -/
 def Rubric.validate (r : Rubric) : Except String Unit := do
@@ -222,5 +225,51 @@ def Rubric.checkPrType (r : Rubric) (prType : Option String) : Except String Uni
     if ts.any (·.name == t) then .ok ()
     else .error s!"'{t}' is not a pull request type of the repository's rubric; it is one of \
 {", ".intercalate (ts.map (·.name))}"
+
+/-! ## Changes -/
+
+private def change (before after : String) : Json :=
+  if before == after then .null else .mkObj [("before", before), ("after", after)]
+
+/-- `{"before", "after"}` of a flag, or `null` when it is the same. -/
+private def flagChange (before after : Bool) : Json :=
+  if before == after then .null else .mkObj [("before", before), ("after", after)]
+
+private def namesJson {α : Type} (f : α → String) (xs : List α) : Json :=
+  .arr (xs.map fun x => Json.str (f x)).toArray
+
+/-- What `after` changes of `before`: the default rubric's text and the document's `fanout`; the
+    pull request types added, removed and changed — a type by its name, changed in its
+    description, its rubric, its `fanout` or its categories (added, removed, or with another
+    description) — and the style notes, when `notes` has both: what a rubric proposal and a compare
+    of two commits of the rubrics repository show. Fan-out is shown on its own: turning
+    it on multiplies the runs a review is charged for, and turning it off drops what a person set,
+    so neither may pass unseen. -/
+def diffJson (before after : Rubric) (notes : Option (String × String) := none) : Json :=
+  let typeChange (b a : PrType) : Option Json :=
+    let added := a.categories.filter fun c => !b.categories.any (·.name == c.name)
+    let removed := b.categories.filter fun c => !a.categories.any (·.name == c.name)
+    let changed := a.categories.filterMap fun c => do
+      let old ← b.categories.find? (·.name == c.name)
+      if old.description == c.description then none
+      else some (Json.mkObj [("name", c.name), ("before", old.description),
+                             ("after", c.description)])
+    if b.description == a.description && b.rubric == a.rubric && b.fanout == a.fanout &&
+        added.isEmpty && removed.isEmpty && changed.isEmpty then none
+    else some (.mkObj [("name", a.name), ("description", change b.description a.description),
+                       ("rubric", change b.rubric a.rubric),
+                       ("fanout", flagChange b.fanout a.fanout),
+                       ("categoriesAdded", .arr (added.map Category.toJson).toArray),
+                       ("categoriesRemoved", namesJson (·.name) removed),
+                       ("categoriesChanged", .arr changed.toArray)])
+  let added := after.prTypes.filter fun t => (before.findType? t.name).isNone
+  let removed := before.prTypes.filter fun t => (after.findType? t.name).isNone
+  let changed := after.prTypes.filterMap fun t => do typeChange (← before.findType? t.name) t
+  .mkObj [("defaultRubric", change before.defaultRubric after.defaultRubric),
+          ("fanout", flagChange before.fanout after.fanout),
+          ("typesAdded", .arr (added.map PrType.toJson).toArray),
+          ("typesRemoved", namesJson (·.name) removed),
+          ("typesChanged", .arr changed.toArray),
+          ("styleNotes", (notes.map fun (b, a) => change b a).getD .null)]
 
 end DiffReviewer
