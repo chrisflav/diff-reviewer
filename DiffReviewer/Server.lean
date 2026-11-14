@@ -796,7 +796,8 @@ private def calibrationRun (st : State) (owner name body : String) : IO Reply :=
         .badRequest
     if ids.length > most then
       return .error s!"a run reviews at most {most} samples" .badRequest
-    match ← Calibration.createRun repo ids st.services.limits.maxCalibrationJobsPerDay split with
+    match ← Calibration.createRun repo ids st.services.limits.maxCalibrationJobsPerDay split
+        (rubricsConfigured := st.services.rubrics.isSome) with
     | .ok (run, _) => return .json (← Calibration.runJson run (detail := true)) .created
     | .error .notFound => return .error "not found" .notFound
     | .error (.invalid why) => return .error why .badRequest
@@ -814,9 +815,12 @@ private def createProposal (st : State) (owner name body : String) : IO Reply :=
     let some src := st.services.rubrics
       | return .error "a rubric proposal is a pull request on the rubrics repository, and none is \
 configured (DIFF_REVIEWER_RUBRICS_REPO)" .conflict
-    if (← Rubrics.pinFor repo.owner repo.name).isNone then
-      return .error s!"a rubric proposal is a pull request on {src.slug}, and no commit of it is \
-in use for {repo.slug}: {Rubrics.noBranchMessage src}, or it has not been read yet" .conflict
+    -- Read, and with no commit to make it over: refused. Not read yet: the job waits, as a review
+    -- does, until it is.
+    if let some h ← Rubrics.headOf repo.owner repo.name then
+      if h.readAt.isSome && h.goodSha.isNone then
+        return .error s!"a rubric proposal is a pull request on {src.slug}, and no commit of it \
+is in use for {repo.slug}: {Rubrics.errorsLine h.errors}" .conflict
     match ← Proposal.createJob repo st.services.limits.maxProposalsPerDay with
     | .ok job => return .json job.toJson .created
     | .error (.live why) => return .error why .conflict

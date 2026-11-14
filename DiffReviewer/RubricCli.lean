@@ -29,16 +29,16 @@ open RubricFiles (FileError)
 
 /-! ## Check -/
 
-/-- Every file under `dir`, by its path from `dir`, dotfiles and dot-directories left out. -/
+/-- Every file under `dir`, by its path from `dir`, dotfiles among them: the platform reads a
+    directory whole, and refuses a dotfile in `types/`. -/
 partial def filesUnder (dir : System.FilePath) (prefix_ : String := "") :
-    IO (List (String × System.FilePath)) := do
-  let mut out := []
+    IO (Array (String × System.FilePath)) := do
+  let mut out := #[]
   let entries := (← dir.readDir).qsort (·.fileName < ·.fileName)
   for e in entries do
-    if e.fileName.startsWith "." then continue
     let rel := if prefix_.isEmpty then e.fileName else s!"{prefix_}/{e.fileName}"
     if ← e.path.isDir then out := out ++ (← filesUnder e.path rel)
-    else out := out ++ [(rel, e.path)]
+    else out := out.push (rel, e.path)
   return out
 
 /-- What is wrong with the rubric directories of the checkout at `root`, and how many there are:
@@ -61,13 +61,13 @@ def checkDir (root : System.FilePath) : IO (Nat × Array FileError) := do
         errors := errors.push { file := dir, message := s!"the platform names repositories in \
 lower case: rename it {dir.toLower}" }
         continue
-      let mut files := []
+      let mut files := #[]
       for (rel, path) in ← filesUnder n.path do
         let wanted := rel == "rubric.md" || rel == "style.md" ||
           (rel.startsWith "types/" && rel.endsWith ".md")
-        files := files ++ [{ path := rel, content := ← if wanted then IO.FS.readFile path
-                                                        else pure "" : RubricFiles.File }]
-      match RubricFiles.parseDir files with
+        files := files.push ({ path := rel, content := ← if wanted then IO.FS.readFile path
+                                                        else pure "" } : RubricFiles.File)
+      match RubricFiles.parseDir files.toList with
       | .ok _ => pure ()
       | .error es => errors := errors ++ es.map (·.under dir)
   return (count, errors)
@@ -182,7 +182,16 @@ def exportDb (db out : System.FilePath) (mapping : Option System.FilePath) (bran
     let key := (v.owner, v.name)
     let st := (states.lookup key).getD {}
     let st ← match v.kind, v.rubric with
-      | "rubric", some (.ok r) => pure { st with rubric := r, rubricProv := v.derived }
+      | "rubric", some (.ok r) =>
+        -- A type whose name cannot be a file's is left out, and said so: the rest is kept.
+        let bad := r.prTypes.filter fun t => (RubricFiles.typeNameProblem t.name).isSome
+        for t in bad do
+          IO.eprintln s!"warning: {v.owner}/{v.name}'s rubric version {v.version} has a type \
+'{t.name}' that cannot be a file's name ({(RubricFiles.typeNameProblem t.name).getD ""}); it is \
+left out"
+        let r := { r with prTypes := r.prTypes.filter fun t =>
+          (RubricFiles.typeNameProblem t.name).isNone }
+        pure { st with rubric := r, rubricProv := v.derived }
       | "rubric", _ =>
         IO.eprintln s!"warning: {v.owner}/{v.name}'s rubric version {v.version} cannot be read \
 by this build; it is left out, and has no commit"
@@ -190,6 +199,13 @@ by this build; it is left out, and has no commit"
       | _, _ => pure { st with notes := v.notes, notesProv := v.derived }
     states := (key, st) :: states.filter (·.1 != key)
     writeDir out v.owner v.name st
+    -- What was written reads back, as the platform will read it.
+    let mut files : Array RubricFiles.File := #[]
+    for (rel, path) in ← filesUnder (out / v.owner / v.name) do
+      files := files.push { path := rel, content := ← IO.FS.readFile path }
+    if let .error es := RubricFiles.parseDir files.toList then
+      return ← fail s!"{v.owner}/{v.name}'s {v.kind} version {v.version}, written, does not \
+read: {Rubrics.errorsLine (es.map (·.under (Rubrics.directory v.owner v.name)))}"
     if let .error e ← git out #["add", "-A", "--", Rubrics.directory v.owner v.name] then
       return ← fail e
     let what := if v.kind == "rubric" then "rubric" else "style notes"

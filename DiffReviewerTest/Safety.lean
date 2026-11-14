@@ -360,11 +360,11 @@ def anAgentRunsOnlyItsOwnJob : Test := withTempDb do
   let st ← State.new cfg svc
   let first ← newJob st
   let second ← newJob st
+  let _ ← DiffReviewerTest.FakeGit.commitRubric "acme" "widgets" "{}"
   Workers.queuePending svc
   let a := (field first "id").getD ""
   let b := (field second "id").getD ""
   let unnamed ← route st (agentReq .get "")
-  let _ ← DiffReviewerTest.FakeGit.commitRubric "acme" "widgets" "{}"
   let proposal ← route st (req .post "/api/v1/repos/acme/widgets/proposals" "{}")
   let byProposal ← route st { agentReq .get "" with
     header := fun n => if n == "x-diff-reviewer-job" then field proposal "id" else

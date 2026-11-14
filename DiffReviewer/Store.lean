@@ -468,9 +468,29 @@ structure HeadRow where
   name : String
   head_sha : Option String
   good_sha : Option String
-  /-- As `{"file", "line", "message"}`. -/
+  /-- As a JSON array of `{"file", "line", "message"}`; one of no file is the rubrics
+      repository's own (it could not be read). -/
   error : Option String
   checked_at : String
+  /-- When the rubrics repository was last read for it, successfully; none before it ever was —
+      and until then its reviews wait. -/
+  read_at : Option String
+  deriving Repr
+
+/-- How a commit of the rubrics repository that was a head descends from the history before it,
+    for a repository's directory (`0009`): from the head before it (`parent_sha`), by the commits
+    between them (`commits`, a JSON array), or — the first head read, or one that does not descend
+    from the last (a force-push) — by the commits of the directory's history (`parent_sha` none).
+    What makes a commit's provenance the union of every commit before it that carries one
+    (`Rubrics.provenanceOf`). -/
+@[model (dbName := "rubric_lineage") (primaryKey := ["owner", "name", "commit_sha"]) reviewdb]
+structure LineageRow where
+  owner : String
+  name : String
+  commit_sha : String
+  parent_sha : Option String
+  commits : String
+  created_at : String
   deriving Repr
 
 /-- Which commit of the rubrics repository an old version of a repository's rubric, or of its
@@ -808,8 +828,10 @@ def migration0008 : Db.Migration.Migration where
 /-- `0009_rubrics_in_git`: rubrics live in a git repository — the commit each job, run and score
     reviewed by, a proposal's branch and pull request, what each commit of the rubrics repository
     holds for a repository, where each repository's rubric stands, the commits the old versions
-    were exported as, and what commits were derived from. The new columns are nullable: a job
-    before names its `rubric_version`, and a proposal before was decided on the platform. The old
+    were exported as, what commits were derived from and how heads descend from each other. The
+    new columns are nullable: a job before names its `rubric_version`, and a proposal before was
+    decided on the platform — one still pending is rejected, with why, since there is no pull
+    request to decide it by. The old
     tables, `repo_rubric` and `repo_notes`, are kept as they are: what the export reads, and what
     the jobs of before are judged by. -/
 def migration0009 : Db.Migration.Migration where
@@ -844,8 +866,18 @@ def migration0009 : Db.Migration.Migration where
            ("head_sha", { type := .text, nullable := true }),
            ("good_sha", { type := .text, nullable := true }),
            ("error", { type := .text, nullable := true }),
-           ("checked_at", { type := .text, nullable := false })],
+           ("checked_at", { type := .text, nullable := false }),
+           ("read_at", { type := .text, nullable := true })],
         primaryKey := ["owner", "name"] },
+    .createTable "rubric_lineage"
+      { columns := .ofList
+          [("owner", { type := .text, nullable := false }),
+           ("name", { type := .text, nullable := false }),
+           ("commit_sha", { type := .text, nullable := false }),
+           ("parent_sha", { type := .text, nullable := true }),
+           ("commits", { type := .text, nullable := false }),
+           ("created_at", { type := .text, nullable := false })],
+        primaryKey := ["owner", "name", "commit_sha"] },
     .createTable "rubric_mapping"
       { columns := .ofList
           [("owner", { type := .text, nullable := false }),
@@ -864,7 +896,13 @@ def migration0009 : Db.Migration.Migration where
            ("samples", { type := .text, nullable := false }),
            ("prs", { type := .text, nullable := false }),
            ("created_at", { type := .text, nullable := false })],
-        primaryKey := ["owner", "name", "commit_sha", "source"] }]
+        primaryKey := ["owner", "name", "commit_sha", "source"] },
+    -- A proposal waiting for a person's decision on the platform has nothing to follow now: it is
+    -- decided, so that the repository may ask again.
+    .sql "UPDATE rubric_proposal SET status = 'rejected', \
+decided_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), \
+pr_error = 'superseded by rubrics in git; ask again' \
+WHERE status = 'pending' AND base_sha IS NULL"]
 
 /-- The migrations, in the order they are applied. Appended to, never edited. -/
 def migrations : List Db.Migration.Migration :=

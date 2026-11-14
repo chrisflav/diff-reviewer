@@ -2,6 +2,8 @@ import Lean.Data.Json
 import DiffReviewer.Platform
 import DiffReviewer.GitHub
 import DiffReviewer.RubricFiles
+import Std.Data.HashMap
+import Std.Data.HashSet
 
 open Lean (Json)
 
@@ -20,7 +22,9 @@ commit it is read at.
     stays in use, and the errors, with their files and lines, are kept beside it for the API to
     show. A repository with no directory has no rubric; so has every repository while the rubrics
     repository has no such branch (an empty repository has none), which is said once and not
-    retried as an error.
+    retried as an error. But a rubrics repository that cannot be read — not found, or not to the
+    token, which GitHub answers alike — is never no rubric: until it has been read once, the jobs
+    of a repository wait (`pinOrWait`).
   * **Pinning.** A job is pinned to the commit in use when it is queued, and a calibration run's
     jobs all to one when the run is made (`Job.rubricSha`): its agent, its fan-out's sub-runs and
     the checks of its submission read the rubric at that commit (`ofJob`), whatever the branch has
@@ -30,10 +34,13 @@ commit it is read at.
     (`Store.SnapshotRow`). A directory whose tree was read already, at another commit, is not
     read again.
   * **Provenance** (`provenanceOf`). A rubric proposal's pull request, merged, records what the
-    proposal drew on on its merge commit (`DiffReviewer.Proposal`); so does each version the export
-    of the old database made (`importMapping`). A commit carries it when its directory is the tree
-    that commit left: the merge commit, and every later commit of the branch until another commit
-    changes the directory. A score of a job pinned to such a commit, of a sample of one of those
+    proposal drew on on its merge commit and on its own commit (`DiffReviewer.Proposal`); so does
+    each version the export of the old database made (`importMapping`). A commit carries the
+    provenance of every commit before it on the branch that carries one — whoever changed the
+    directory since, since a person's edit of a derived rubric keeps what it learned. Before it is
+    known cheaply: each head is recorded as descending from the head before it, by the commits
+    between (`recordLineage`), and a head that does not descend — a force-push — by the commits of
+    the directory's history. A score of a job pinned to such a commit, of a sample of one of those
     pull requests, is `derived` (`Calibration.derivedOf`).
   * **The old versions.** Jobs and scores from before name an integer `rubricVersion`; the export
     (`diff-reviewer rubrics export`) wrote each version as a commit and a mapping of versions to
@@ -199,7 +206,7 @@ def snapshot (gh : GitHub.Client) (src : Source) (commit owner name : String) :
   let wanted := entries.filter fun e =>
     e.type == "blob" &&
       (e.path == "rubric.md" || e.path == "style.md" || e.path.startsWith "types/")
-  let mut files : List RubricFiles.File := []
+  let mut files : Array RubricFiles.File := #[]
   for e in wanted do
     -- Only what is read is fetched: anything else under `types/` is an error by its name.
     let content ← if e.path.endsWith ".md" then
@@ -208,19 +215,23 @@ def snapshot (gh : GitHub.Client) (src : Source) (commit owner name : String) :
         | .error err =>
           return .error (ghError s!"reading {directory owner name}/{e.path} at {commit}" err)
       else pure ""
-    files := files ++ [{ path := e.path, content }]
-  let parsed := (RubricFiles.parseDir files).mapError (·.map (·.under (directory owner name)))
+    files := files.push { path := e.path, content }
+  let parsed := (RubricFiles.parseDir files.toList).mapError
+    (·.map (·.under (directory owner name)))
   save { commit, owner, name, tree := some dirTree, parsed }
 
 /-! ## Following the branch -/
 
-/-- Where `owner/name`'s rubric stands: the head last read, the commit in use, and why the head
-    is not it, or why there is none. -/
+/-- Where `owner/name`'s rubric stands: the head last read, the commit in use, why the head is not
+    it or why there is none — an error of no file is the rubrics repository's own: it could not be
+    read — and when it was last read. -/
 structure Head where
   headSha   : Option String := none
   goodSha   : Option String := none
   errors    : Array FileError := #[]
   checkedAt : Option String := none
+  /-- When the rubrics repository was last read for it; none before it ever was. -/
+  readAt    : Option String := none
 
 def fetchHead (owner name : String) : Sqlite.M (Option Head) := do
   let rows ← HasModel.fetch <| query% do
@@ -230,7 +241,8 @@ def fetchHead (owner name : String) : Sqlite.M (Option Head) := do
     select r
   return rows[0]?.map fun r =>
     { headSha := r.head_sha, goodSha := r.good_sha
-    , errors := (r.error.map errorsOfRaw).getD #[], checkedAt := some r.checked_at }
+    , errors := (r.error.map errorsOfRaw).getD #[], checkedAt := some r.checked_at
+    , readAt := r.read_at }
 
 def headOf (owner name : String) : IO (Option Head) := Store.run (fetchHead owner name)
 
@@ -238,12 +250,28 @@ def headOf (owner name : String) : IO (Option Head) := Store.run (fetchHead owne
 def pinFor (owner name : String) : IO (Option String) := do
   return (← headOf owner name).bind (·.goodSha)
 
+/-- What a job of `owner/name` is pinned to when it is queued, the rubrics repository `src` being
+    configured: the commit in use; none when the repository has been read and has no rubric for it
+    — the branch missing, or empty — or why the job waits: the rubrics repository has never been
+    read for it (not yet, or it cannot be: not found, or not readable with the token), which is
+    never taken for no rubric. -/
+def pinOrWait (src : Source) (owner name : String) : IO (Except String (Option String)) := do
+  let some h ← headOf owner name
+    | return .error s!"the rubrics repository {src.slug} has not been read yet; the job waits \
+for it"
+  if h.readAt.isNone then
+    let why := if h.errors.isEmpty then "it has not been read yet" else
+      s!"it cannot be read: {errorsLine h.errors}"
+    return .error s!"the rubrics repository {src.slug} has never been read for {owner}/{name} — \
+{why}; the job waits for it"
+  return .ok h.goodSha
+
 private def saveHead (owner name : String) (h : Head) : IO Unit := do
   let now ← nowIso
   Store.run <| HasModel.save
     ({ owner, name, head_sha := h.headSha, good_sha := h.goodSha
      , error := if h.errors.isEmpty then none else some (errorsJson h.errors)
-     , checked_at := now } : Store.HeadRow)
+     , checked_at := now, read_at := h.readAt } : Store.HeadRow)
 
 /-- The message of a rubrics repository without the branch. -/
 def noBranchMessage (src : Source) : String :=
@@ -257,38 +285,90 @@ private def provenanceCommits : IO (Array (String × String × String)) := do
     select r
   return rows.map fun r => (r.commit_sha, r.owner, r.name)
 
+private def fetchLineage (owner name commit : String) : IO (Option Store.LineageRow) := do
+  let rows ← Store.run <| HasModel.fetch <| query% do
+    let r ← from Store.LineageRow
+    guard r.owner = owner
+    guard r.name = name
+    guard r.commit_sha = commit
+    select r
+  return rows[0]?
+
+/-- The most commits of a directory's history read to know what a head descends from. -/
+def maxHistory : Nat := 1000
+
+/-- How head `h` of `owner/name` descends from the history before it, recorded once
+    (`Store.LineageRow`): from the head read before, `prev`, by the commits between them when it
+    descends from it (GitHub's compare says `ahead`, of at most 100 commits, or `identical`); and
+    otherwise — no head before, a force-push, a longer way — by the commits of the directory's
+    history at `h`. An error is GitHub not answering: nothing is recorded, and it is tried again. -/
+def recordLineage (gh : GitHub.Client) (src : Source) (owner name h : String)
+    (prev : Option String) : IO (Except String Unit) := do
+  if (← fetchLineage owner name h).isSome then return .ok ()
+  let now ← nowIso
+  let save (parent : Option String) (commits : Array String) : IO (Except String Unit) := do
+    Store.run <| HasModel.save
+      ({ owner, name, commit_sha := h, parent_sha := parent
+       , commits := rawOfStrings commits.toList, created_at := now } : Store.LineageRow)
+    return .ok ()
+  if let some p := prev then
+    if p == h then return ← save none #[]
+    match ← gh.compare src.owner src.name p h with
+    | .error e => return .error (ghError s!"comparing {p} with {h}" e)
+    | .ok c =>
+      if c.status == "identical" then return ← save (some p) #[]
+      if c.status == "ahead" && c.totalCommits ≤ c.commits.size then
+        return ← save (some p) (c.commits.map (·.1))
+  match ← gh.listCommits src.owner src.name h (directory owner name) maxHistory with
+  | .error e => return .error (ghError s!"reading the history of {directory owner name} at {h}" e)
+  | .ok cs => save none (cs.map (·.sha))
+
 /-- One pass of following the branch of `src`: see the module's description. `note key msg` says
     `msg` once for `key`. -/
 def refresh (gh : GitHub.Client) (src : Source) (note : String → String → IO Unit) :
     IO Unit := do
   let repos ← Platform.listRepos
+  let now ← nowIso
   match ← gh.branchHead src.owner src.name src.branch with
   | .error e =>
-    note s!"rubrics-head-{e.message}" s!"reading the head of {src.slug}'s {src.branch}: \
-{e.message}; the rubrics in use stay"
+    -- Not read: every repository keeps what it has in use, and says why — a review of one that
+    -- was never read waits rather than going without a rubric.
+    let why := s!"the rubrics repository {src.slug} cannot be read: {e.message}"
+    note s!"rubrics-head-{e.message}" s!"{why}; the rubrics in use stay"
+    for r in repos do
+      let cur := (← headOf r.owner r.name).getD {}
+      unless cur.errors.map (·.message) == #[why] do
+        saveHead r.owner r.name { cur with errors := #[{ file := "", message := why }] }
   | .ok none =>
     let why := noBranchMessage src
     note "rubrics-no-branch" why
     for r in repos do
       let cur := (← headOf r.owner r.name).getD {}
-      unless cur.headSha.isNone && cur.errors.map (·.message) == #[why] do
-        saveHead r.owner r.name
-          { cur with headSha := none, errors := #[{ file := "", message := why }] }
+      saveHead r.owner r.name
+        { cur with headSha := none, errors := #[{ file := "", message := why }], readAt := now }
   | .ok (some h) =>
     for r in repos do
       let cur := (← headOf r.owner r.name).getD {}
-      if cur.headSha == some h then continue
-      match ← snapshot gh src h r.owner r.name with
-      | .error why =>
-        note s!"rubrics-{r.slug}-{h}-{why}" s!"reading the rubric of {r.slug} at {h}: {why}"
-      | .ok snap => match snap.parsed with
-        | .ok _ => saveHead r.owner r.name { headSha := some h, goodSha := some h }
-        | .error es =>
-          saveHead r.owner r.name { headSha := some h, goodSha := cur.goodSha, errors := es }
-          let kept := match cur.goodSha with
-            | some g => s!"the last that did, {g}, stays in use"
-            | none => "there is no rubric in use until it reads"
-          note s!"rubrics-{r.slug}-{h}" s!"the rubric of {r.slug} at {h} does not read: \
+      if cur.headSha == some h && cur.readAt.isSome && cur.errors.all (!·.file.isEmpty) then
+        continue
+      let snap ← match ← snapshot gh src h r.owner r.name with
+        | .ok s => pure s
+        | .error why =>
+          note s!"rubrics-{r.slug}-{h}-{why}" s!"reading the rubric of {r.slug} at {h}: {why}"
+          continue
+      let prev := if cur.readAt.isSome then cur.headSha else none
+      if let .error why ← recordLineage gh src r.owner r.name h prev then
+        note s!"rubrics-lineage-{r.slug}-{h}-{why}" s!"reading what {h} descends from: {why}"
+        continue
+      match snap.parsed with
+      | .ok _ => saveHead r.owner r.name { headSha := some h, goodSha := some h, readAt := now }
+      | .error es =>
+        saveHead r.owner r.name
+          { headSha := some h, goodSha := cur.goodSha, errors := es, readAt := now }
+        let kept := match cur.goodSha with
+          | some g => s!"the last that did, {g}, stays in use"
+          | none => "there is no rubric in use until it reads"
+        note s!"rubrics-{r.slug}-{h}" s!"the rubric of {r.slug} at {h} does not read: \
 {errorsLine es}; {kept}"
   -- The commits provenance is recorded on are read too, so that their trees are known.
   for (c, o, n) in ← provenanceCommits do
@@ -420,9 +500,11 @@ def recordProvenanceIn (owner name commit source : String) (p : Provenance) : Sq
   HasModel.save ({ owner, name, commit_sha := commit, source, samples := rawOfStrings p.samples
                  , prs := rawOfStrings p.prs, created_at := ← nowIso } : Store.ProvenanceRow)
 
-/-- For `owner/name`, what each commit in `shas` was derived from: every provenance recorded on a
-    commit whose directory is the same tree — the commit itself, or one before it with nothing
-    changed in the directory since — or, its tree not known, on the commit itself. -/
+/-- For `owner/name`, what each commit in `shas` was derived from: every provenance recorded on it
+    or on a commit before it — a merged proposal's, an exported version's — whoever changed the
+    directory since. Before it is what its lineage says (`recordLineage`): the commits between it
+    and the head read before it, and before those, that head's; or the commits of the directory's
+    history. A commit no lineage was recorded for, never a head, carries only its own. -/
 def provenanceOf (owner name : String) (shas : List String) :
     IO (List (String × Provenance)) := do
   let rows ← Store.run <| HasModel.fetch <| query% do
@@ -431,14 +513,31 @@ def provenanceOf (owner name : String) (shas : List String) :
     guard r.name = name
     select r
   if rows.isEmpty then return shas.map (·, {})
-  let snaps ← snapshotsOf owner name
-  let treeOf (c : String) : Option String := (snaps.find? (·.commit == c)).bind (·.tree)
+  let lineage ← Store.run <| HasModel.fetch <| query% do
+    let r ← from Store.LineageRow
+    guard r.owner = owner
+    guard r.name = name
+    select r
+  let byCommit : Std.HashMap String Store.LineageRow :=
+    lineage.foldl (init := {}) fun m r => m.insert r.commit_sha r
+  let before (sha : String) : Std.HashSet String := Id.run do
+    let mut seen : Std.HashSet String := {}
+    let mut cur := some sha
+    -- Bounded, so that a cycle a force-push and its undoing could record cannot hold it.
+    for _ in [0:byCommit.size + 1] do
+      let some c := cur | break
+      if seen.contains c then break
+      seen := seen.insert c
+      let some row := byCommit[c]? | break
+      for x in stringsOfRaw (some row.commits) do seen := seen.insert x
+      cur := row.parent_sha
+    return seen
   return shas.map fun sha =>
-    let tree := treeOf sha
-    let hits := rows.filter fun r =>
-      r.commit_sha == sha || (tree.isSome && treeOf r.commit_sha == tree)
-    (sha, hits.foldl (init := {}) fun (acc : Provenance) r =>
-      acc.union { samples := stringsOfRaw (some r.samples), prs := stringsOfRaw (some r.prs) })
+    let set := before sha
+    (sha, rows.foldl (init := {}) fun (acc : Provenance) r =>
+      if set.contains r.commit_sha then
+        acc.union { samples := stringsOfRaw (some r.samples), prs := stringsOfRaw (some r.prs) }
+      else acc)
 
 /-! ## What the API shows -/
 
@@ -497,7 +596,7 @@ configured (DIFF_REVIEWER_RUBRICS_REPO): reviews have no rubric" }] none none no
   let snap ← match head.goodSha with
     | some g => cached g owner name
     | none => pure none
-  let errors := if head.checkedAt.isNone && head.errors.isEmpty then
+  let errors := if head.readAt.isNone && head.errors.isEmpty then
       #[{ file := "", message := s!"{s.slug} has not been read for {owner}/{name} yet; the \
 workers read it on their next pass" }]
     else head.errors

@@ -223,6 +223,7 @@ def aProposalBecomesAPullRequest : Test := withTempDb do
   let st ← State.new cfg svc
   let _ ← putRepo st "{}"
   let noRepo ← route (← State.new cfg (← Workers.Services.new)) (req .post proposalsPath "{}")
+  refresh svc
   let noBranch ← route st (req .post proposalsPath "{}")
   let base ← commitRubric fg svc rubricV1 (notes := "Be brief.")
   let unknownRepo ← route st (req .post "/api/v1/repos/acme/nope/proposals" "{}")
@@ -467,8 +468,8 @@ def aProposalReadsTheEvidence : Test := withTempDb do
   let edits := listOf ctx ["personEdits"]
   let change (k : String) := edits.find? (str · ["change"] == some k)
   -- Merged, its merge commit carries the sample its context drew on; a score of it under that
-  -- commit's rubric is derived — and under any later commit that leaves the directory as the merge
-  -- left it, but not once another commit has changed it.
+  -- commit's rubric is derived — and under every later commit, a person's change of the directory
+  -- among them, which may keep what the proposal learned.
   let submitted ← route st (agentProposalReq .post jobId (proposal))
   let pid := (field submitted "proposalId").getD ""
   let merge ← fg.merge 1
@@ -488,7 +489,7 @@ def aProposalReadsTheEvidence : Test := withTempDb do
       (submission jobHead agentReview (prType := "\"feature\"")) (pr := 13))
     return r
   let again ← scoreOnce
-  -- A person changes the directory: a new rubric, not the proposal's.
+  -- A person changes the directory: still descended from the proposal's.
   let edited ← fg.change [("acme/widgets/rubric.md", some "Check names, docstrings and tests.\n")]
   refresh svc
   let third ← scoreOnce
@@ -516,11 +517,11 @@ def aProposalReadsTheEvidence : Test := withTempDb do
       "derived, and marked in its run"
     ++ checkEq (thirdResult.bind (str · ["rubricSha"])) (some edited)
       "a run after a person changed the directory"
-    ++ checkEq (thirdResult.bind (·.getObjValAs? Bool "scoreDerived" |>.toOption)) (some false)
-      "is not derived"
-    ++ checkEq (num summary ["overall", "scored"]) (some 2)
-      "the scores under the first rubric and the person's count; the derived one does not"
-    ++ checkEq (num summary ["overall", "derivedScores"]) (some 1) "which is derived"
+    ++ checkEq (thirdResult.bind (·.getObjValAs? Bool "scoreDerived" |>.toOption)) (some true)
+      "is derived too"
+    ++ checkEq (num summary ["overall", "scored"]) (some 1)
+      "the score under the first rubric counts; the two after the merge do not"
+    ++ checkEq (num summary ["overall", "derivedScores"]) (some 2) "which are derived"
     ++ checkEq (num withDerived ["overall", "scored"]) (some 3) "and in when asked"
     ++ checkEq ((byRubric.filterMap (str · ["rubricSha"])).length) 3 "one aggregate per rubric"
     ++ checkEq (missed.map (num · ["end_line"])) [some 12] "the comment of alice's the agent missed"

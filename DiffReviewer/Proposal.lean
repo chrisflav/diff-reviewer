@@ -370,13 +370,27 @@ def openPull (gh : GitHub.Client) (src : Rubrics.Source) (p : Proposal) :
   let p0 := p
   match ← gh.createBranch src.owner src.name branch commit with
   | .ok () => pure ()
-  -- Made already, by an attempt whose answer was lost: the pull request is what is looked for.
+  -- There already: made by an attempt whose answer was lost — or by someone else, whose branch is
+  -- never taken for the proposal's.
   | .error (.definite why) =>
     unless why.startsWith "GitHub answered 422" do
       return ← fail p s!"making the branch {branch}: {why}"
+    match ← gh.branchHead src.owner src.name branch with
+    | .ok (some sha) =>
+      unless sha == commit do
+        return ← fail p s!"the branch {branch} exists already at {sha}, not at the proposal's \
+commit {commit}; it is not the proposal's, and nothing is opened from it — delete it, and the \
+workers open the proposal's"
+    | .ok none => return ← fail p s!"making the branch {branch}: {why}"
+    | .error e => return ← fail p s!"reading the branch {branch}: {e.message}"
   | .error e => return ← fail p s!"making the branch {branch}: {e.message}"
   let pull ← match ← gh.findPull src.owner src.name branch with
-    | .ok (some pr) => pure pr
+    | .ok (some pr) =>
+      unless pr.headSha == commit && pr.headRepo == src.slug do
+        return ← fail p s!"a pull request of {branch} exists already, #{pr.number}, and is not \
+the proposal's (its head is {pr.headSha} of {pr.headRepo}, not {commit} of {src.slug}); close it, \
+and the workers open the proposal's"
+      pure pr
     | .ok none =>
       match ← gh.createPull src.owner src.name s!"{p.owner}/{p.name}: rubric proposal {p.id}"
           branch src.branch (pullBody p) with
@@ -414,7 +428,11 @@ merged, and GitHub names no merge commit yet"
         Store.transact do
           HasModel.save { p with status := "accepted", decidedAt := some now, prState := "merged"
                                  mergeSha := some merge }.toRow
+          -- On the merge, and on the proposal's own commit, which a merge commit brings in and
+          -- a directory's history names in its place.
           Rubrics.recordProvenanceIn p.owner p.name merge s!"proposal:{p.id}" p.context
+          if let some c := p.commitSha then
+            Rubrics.recordProvenanceIn p.owner p.name c s!"proposal:{p.id}" p.context
       else
         saveProposal { p with status := "rejected", decidedAt := some now, prState := "closed" }
 

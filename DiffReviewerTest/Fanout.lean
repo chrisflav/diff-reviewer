@@ -536,6 +536,7 @@ def aRetiredJobsRunIsCancelled : Test := withTempDb do
   let svc ← DiffReviewerTest.FakeGit.withGit svc
   let st ← State.new cfg svc
   let _ ← newJob st
+  DiffReviewerTest.FakeGit.refresh svc
   Workers.queuePending svc
   let single ← orch.cancelled.get
   let _ ← fannedRepo st

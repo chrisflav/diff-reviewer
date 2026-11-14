@@ -45,11 +45,13 @@ structure FakeGit where
   counter : IO.Ref Nat
   /-- Every request, as `METHOD path`, in order. -/
   calls   : IO.Ref (Array String)
+  /-- Whether the token cannot read the repository: GitHub answers every request `404`. -/
+  hidden  : IO.Ref Bool
 
 def FakeGit.new : IO FakeGit := do
   return { blobs := ← IO.mkRef [], trees := ← IO.mkRef [], commits := ← IO.mkRef []
          , files := ← IO.mkRef [], refs := ← IO.mkRef [], pulls := ← IO.mkRef #[]
-         , counter := ← IO.mkRef 0, calls := ← IO.mkRef #[] }
+         , counter := ← IO.mkRef 0, calls := ← IO.mkRef #[], hidden := ← IO.mkRef false }
 
 /-- The tree of `files` (paths from it), every tree below it stored: its sha. -/
 partial def FakeGit.tree (fg : FakeGit) (files : List (String × String)) : IO String := do
@@ -151,6 +153,21 @@ def FakeGit.merge (fg : FakeGit) (n : Nat) : IO String := do
                                      mergeCommitSha := some sha } }
   return sha
 
+/-- Move `branch` to `sha`, whatever it was at: a force-push. -/
+def FakeGit.forcePush (fg : FakeGit) (sha : String) (branch := "main") : IO Unit :=
+  fg.refs.modify fun rs => (branch, sha) :: rs.filter (·.1 != branch)
+
+/-- Every commit `sha` descends from, itself among them. -/
+partial def FakeGit.ancestors (fg : FakeGit) (sha : String) : IO (List String) := do
+  let rec go (todo : List String) (seen : List String) : IO (List String) := do
+    match todo with
+    | [] => return seen
+    | c :: rest =>
+      if seen.contains c then go rest seen else
+      let ps := ((← fg.commitOf c).map (·.parents.toList)).getD []
+      go (ps ++ rest) (seen ++ [c])
+  go [sha] []
+
 /-- Close pull request `n` unmerged. -/
 def FakeGit.close (fg : FakeGit) (n : Nat) : IO Unit :=
   fg.pulls.modify fun ps => ps.modify (n - 1) fun fp =>
@@ -173,7 +190,19 @@ def FakeGit.client (fg : FakeGit) (base : GitHub.Client) : GitHub.Client :=
     branchHead := fun o n b => do
       unless mine o n do return ← base.branchHead o n b
       log s!"GET /repos/{o}/{n}/git/ref/heads/{b}"
+      if ← fg.hidden.get then
+        return .error (.definite s!"{o}/{n} was not found, or the token cannot read it \
+(GitHub answered 404: Not Found)")
       return .ok (← fg.head b)
+    compare := fun o n b h => do
+      unless mine o n do return ← base.compare o n b h
+      log s!"GET /repos/{o}/{n}/compare/{b}...{h}"
+      let ofHead ← fg.ancestors h
+      let ofBase ← fg.ancestors b
+      let status := if b == h then "identical" else if ofHead.contains b then "ahead"
+        else if ofBase.contains h then "behind" else "diverged"
+      let between := (ofHead.filter (!ofBase.contains ·)).reverse
+      return .ok { status, commits := (between.map (·, "")).toArray }
     getCommit := fun o n sha => do
       unless mine o n do return ← base.getCommit o n sha
       log s!"GET /repos/{o}/{n}/git/commits/{sha}"
@@ -199,7 +228,11 @@ def FakeGit.client (fg : FakeGit) (base : GitHub.Client) : GitHub.Client :=
       unless mine o n do return ← base.listCommits o n b path limit
       log s!"GET /repos/{o}/{n}/commits?sha={b}&path={path}"
       let mut out := #[]
-      let mut cur ← fg.head b
+      -- `sha=` names a branch or a commit.
+      let start ← match ← fg.head b with
+        | some h => pure (some h)
+        | none => pure (if (← fg.commitOf b).isSome then some b else none)
+      let mut cur := start
       while out.size < limit do
         let some sha := cur | break
         let some c ← fg.commitOf sha | break

@@ -738,7 +738,7 @@ private def Run.ofRow (r : Store.RunRow) : Run :=
     | .ok xs => xs.toList.filterMap (·.getStr?.toOption)
     | .error _ => []
   { id := r.id, owner := r.owner, name := r.name, sampleIds := ids, createdAt := r.created_at
-    split := r.split, rubricSha := r.rubric_sha }
+    split := r.split, rubricSha := r.rubric_sha.filter (!·.isEmpty) }
 
 /-- The runs of `owner/name`, newest first (ties broken by id). -/
 def runsOf (owner name : String) : IO (Array Run) := do
@@ -860,14 +860,21 @@ def chargeRetryIn (job : Job) (cap : Nat) : Sqlite.M (Except String Unit) := do
     sub-runs. Every sample must be of `split`: `eval`, what calibration measures by, unless the
     run is asked of the `pool`, whose scores give rubric proposals evidence and are never in an
     aggregate. -/
-def createRun (repo : Repo) (sampleIds : List String) (cap : Nat) (split := "eval") :
+def createRun (repo : Repo) (sampleIds : List String) (cap : Nat) (split := "eval")
+    (rubricsConfigured := false) :
     IO (Except RunError (Run × Array Job)) := do
   assignSplits repo
   let now ← nowIso
   let since := isoOfEpoch ((← nowEpoch) - 86400)
   let runId ← randomHex 8
   let ids ← sampleIds.mapM fun _ => randomHex 8
+  -- Pinned when the run is made — unless the rubrics repository has never been read for the
+  -- repository, when the jobs wait to be pinned, all to one commit, as they are queued (`pinRun`).
+  let unread ← if rubricsConfigured then
+      pure ((← Rubrics.headOf repo.owner repo.name).all (·.readAt.isNone))
+    else pure false
   let pin ← Rubrics.pinFor repo.owner repo.name
+  let pin := if unread then none else pin
   let doc ← match pin with
     | some sha => pure (((← Rubrics.cached sha repo.owner repo.name).bind
         (·.rubric?.toOption)).bind id)
@@ -899,7 +906,8 @@ which calibration does not measure by" else ""}")
        , prBody := some s.prBody, createdAt := now, updatedAt := now
        , kindRaw := some JobKind.calibration.toString, sampleId := some s.id
        , runId := some runId, rubricSha := pin
-       , rubricVersion := if pin.isSome then none else some 0 } : Job)) picked ids.toArray
+       , rubricVersion := if pin.isSome || unread then none else some 0 } : Job))
+       picked ids.toArray
     for j in jobs do
       HasModel.save j.toRow
       charge repo.owner repo.name j.id now
@@ -908,8 +916,25 @@ which calibration does not measure by" else ""}")
         split := some split, rubricSha := pin }
     HasModel.save ({ id := runId, owner := repo.owner, name := repo.name
                    , sample_ids := (Json.arr (sampleIds.map Json.str).toArray).compress
-                   , created_at := now, split := some split, rubric_sha := pin } : Store.RunRow)
+                   , created_at := now, split := some split
+                   , rubric_sha := if unread then none else some (pin.getD "") } : Store.RunRow)
     return .ok (run, jobs)
+
+/-- The commit run `runId` is pinned to, pinning it to `pin` when it is pinned to nothing yet: a
+    run made before the rubrics repository was read pins all its jobs to the one its first job is
+    queued under. `""` in the row is pinned to no rubric. One transaction. -/
+def pinRun (runId : String) (pin : Option String) : IO (Option String) := do
+  Store.transact do
+    let rows ← HasModel.fetch <| query% do
+      let r ← from Store.RunRow
+      guard r.id = runId
+      select r
+    let some row := rows[0]? | return pin
+    match row.rubric_sha with
+    | some s => return if s.isEmpty then none else some s
+    | none =>
+      HasModel.save { row with rubric_sha := some (pin.getD "") }
+      return pin
 
 /-- A person's `failed → pending` of calibration job `id`, read at `version`: run it again, which
     charges the repository's cap like a new job. Refused while another live job reviews the same

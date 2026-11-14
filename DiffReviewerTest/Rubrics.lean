@@ -538,6 +538,8 @@ def rubricEdgesAreHeld : Test := withTempDb do
   let svc := fg.attach (← services gh orch logs)
   let st ← State.new cfg svc
   putRepo st "{}"
+  -- An empty rubrics repository, read: no rubric.
+  refresh svc
   let created ← route st (req .post "/api/v1/jobs"
     s!"\{\"owner\": \"acme\", \"name\": \"widgets\", \"prNumber\": 7, \"headSha\": \"{headA}\"}")
   let id := (field created "id").getD ""

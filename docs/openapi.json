@@ -1410,7 +1410,7 @@
       ],
       "get": {
         "summary": "A repository's rubric",
-        "description": "The rubric in use, read from the rubrics repository at `sha`: the branch head, or the last commit that parses when the head does not (`error` says why, and `headSha` is the head). With no rubric at all — no rubrics repository configured (`repository` null), an empty repository, a missing branch — `sha` is null and `error` says why. `exists` is false when the repository's directory is not there at `sha`: then the rubric is empty. `404` for a repository that is not registered.",
+        "description": "The rubric in use, read from the rubrics repository at `sha`: the branch head, or the last commit that parses when the head does not (`error` says why, and `headSha` is the head). While the rubrics repository has never been read — or cannot be: not found, or not readable with the token — `sha` is null, `error` says why, and the repository's reviews wait rather than going without a rubric. With no rubric at all — no rubrics repository configured (`repository` null), an empty repository, a missing branch — `sha` is null and `error` says why. `exists` is false when the repository's directory is not there at `sha`: then the rubric is empty. `404` for a repository that is not registered.",
         "operationId": "getRubrics",
         "responses": {
           "200": {
@@ -1819,7 +1819,7 @@
       "post": {
         "summary": "Ask for a rubric proposal",
         "operationId": "createProposal",
-        "description": "A `pending` `proposal` job of the repository (`prNumber` 0), queued on orchestra as a task of the repository with no `issue_number`, through the client for proposals (`DIFF_REVIEWER_ORCHESTRA_PROPOSER_TOKEN_FILE`), with the kleis narrowing `github: only discover, fetch`. Never posted. `409` while the repository has a live proposal — a job pending, queued or running, or a proposal waiting for a decision (its pull request on the rubrics repository not yet merged or closed) — and when there is no rubrics repository to open its pull request on (none configured, or no branch of it read); `429` past `--max-proposals-per-day` (2 by default) for the repository.",
+        "description": "A `pending` `proposal` job of the repository (`prNumber` 0), queued on orchestra as a task of the repository with no `issue_number`, through the client for proposals (`DIFF_REVIEWER_ORCHESTRA_PROPOSER_TOKEN_FILE`), with the kleis narrowing `github: only discover, fetch`. Never posted. `409` while the repository has a live proposal — a job pending, queued or running, or a proposal waiting for a decision (its pull request on the rubrics repository not yet merged or closed) — and when there is no rubrics repository to open its pull request on (none configured, or one read that has no branch); while the rubrics repository has never been read, the job is made and waits, `pending`, with why in its `error`; `429` past `--max-proposals-per-day` (2 by default) for the repository.",
         "requestBody": {
           "required": true,
           "content": {

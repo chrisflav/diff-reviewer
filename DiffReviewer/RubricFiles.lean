@@ -1,5 +1,6 @@
 import Lean.Data.Json
 import DiffReviewer.Rubric
+import Std.Data.HashSet
 
 open Lean (Json)
 
@@ -21,8 +22,9 @@ category is written as a mapping, `name: {description: …, …}`) the category:
 reads passes through this one. A directory that is not there is no rubric; a `rubric.md` that is
 not there is an empty default rubric.
 
-Front matter is the YAML between a first line `---` and the next line `---`. This build reads the
-part of YAML front matter needs, and refuses the rest rather than guess: mappings and lists by
+Front matter is the YAML between a first line `---` and the next line `---` (a byte order mark
+before it is dropped), at most 64 KiB and 1000 keys and items. This build reads the part of YAML
+front matter needs, and refuses the rest rather than guess: mappings and lists by
 indentation, plain, single- and double-quoted scalars, `|` and `>` block scalars, and flow
 collections written as JSON. Anchors, aliases, tags and tabs are refused. Every error names the
 file and, where it has one, the line, so that the check (`diff-reviewer rubrics check`) can be
@@ -279,7 +281,7 @@ private partial def block (ls : Array Ln) (i ind : Nat) : Except YErr (Yaml × N
   if h : j < ls.size then
     let l := ls[j]
     if l.indent < ind then return (.null, j)
-    if isSeqItem l.text then seqAt ls j l.indent #[] else mapAt ls j l.indent #[]
+    if isSeqItem l.text then seqAt ls j l.indent #[] else mapAt ls j l.indent #[] {} none
   else return (.null, j)
 
 /-- What follows `key:` on line `j` of a mapping indented `ind`: `rest`, or the block after. -/
@@ -297,20 +299,25 @@ private partial def entryValue (ls : Array Ln) (j ind : Nat) (rest : String) :
   if rest.startsWith "|" || rest.startsWith ">" then return ← blockScalar ls j ind rest
   return (← scalar rest line, j + 1)
 
-private partial def mapAt (ls : Array Ln) (i ind : Nat) (acc : Array (String × Nat × Yaml)) :
-    Except YErr (Yaml × Nat) := do
+/-- The mapping at line `i` or after, indented `ind`; `first`, when given, stands in for its first
+    line — the rest of a `- key: value` line, its key lined up with the keys under it. `seen`, its
+    keys so far, for the check that none is given twice. -/
+private partial def mapAt (ls : Array Ln) (i ind : Nat) (acc : Array (String × Nat × Yaml))
+    (seen : Std.HashSet String) (first : Option (Nat × Ln)) : Except YErr (Yaml × Nat) := do
   let j := nextContent ls i
   if h : j < ls.size then
-    let l := ls[j]
+    let l := match first with
+      | some (f, fl) => if f == j then fl else ls[j]
+      | none => ls[j]
     if l.indent < ind then return (.map acc, j)
     if l.indent > ind then throw (l.num, "this line is indented more than the key before it")
     if isSeqItem l.text then throw (l.num, "a list item where a key was expected")
     let some (k, rest) ← splitKey l.text l.num
       | throw (l.num, "expected `key: value`")
     if k.isEmpty then throw (l.num, "a key is empty")
-    if acc.any (·.1 == k) then throw (l.num, s!"'{k}' is given twice")
+    if seen.contains k then throw (l.num, s!"'{k}' is given twice")
     let (v, next) ← entryValue ls j ind rest
-    mapAt ls next ind (acc.push (k, l.num, v))
+    mapAt ls next ind (acc.push (k, l.num, v)) (seen.insert k) none
   else return (.map acc, j)
 
 private partial def seqAt (ls : Array Ln) (i ind : Nat) (acc : Array (Nat × Yaml)) :
@@ -327,8 +334,8 @@ private partial def seqAt (ls : Array Ln) (i ind : Nat) (acc : Array (Nat × Yam
     if let some _ ← splitKey rest l.num then
       -- `- key: value`: a mapping whose keys line up with this one.
       let offset := l.text.length - rest.length
-      let ls' := ls.set! j { l with indent := ind + offset, text := rest }
-      let (v, next) ← mapAt ls' j (ind + offset) #[]
+      let (v, next) ← mapAt ls j (ind + offset) #[] {}
+        (some (j, { l with indent := ind + offset, text := rest }))
       return ← seqAt ls next ind (acc.push (l.num, v))
     seqAt ls (j + 1) ind (acc.push (l.num, ← scalar rest l.num))
   else return (.seq acc, j)
@@ -358,7 +365,23 @@ def normalizeBody (s : String) : String :=
   let lines := (lineSplit s).dropWhile fun l => l.trimAscii.isEmpty
   ("\n".intercalate lines).trimAsciiEnd.toString
 
+/-- The longest front matter, in bytes, and the most keys and items it may hold. -/
+def maxFrontMatterBytes : Nat := 65536
+
+def maxFrontMatterEntries : Nat := 1000
+
+/-- How many keys and items `y` holds, all the way down. -/
+partial def Yaml.entries : Yaml → Nat
+  | .seq xs => xs.foldl (fun n (_, x) => n + 1 + x.entries) 0
+  | .map kvs => kvs.foldl (fun n (_, _, x) => n + 1 + x.entries) 0
+  | _ => 0
+
+/-- `s` without the byte order mark an editor may start a file with. -/
+def stripBom (s : String) : String :=
+  if s.startsWith "\uFEFF" then (s.drop 1).toString else s
+
 def splitFile (content : String) : Except YErr Split := do
+  let content := stripBom content
   let lines := lineSplit content
   unless lines.head?.any (·.trimAsciiEnd.toString == "---") do
     return { body := normalizeBody content }
@@ -366,7 +389,12 @@ def splitFile (content : String) : Except YErr Split := do
   let some k := rest.findIdx? fun l => ["---", "..."].contains l.trimAsciiEnd.toString
     | throw (1, "the front matter that starts here is not closed by a line `---`")
   let yaml := "\n".intercalate (rest.take k)
-  let keys ← match ← parseYaml yaml 2 with
+  if yaml.utf8ByteSize > maxFrontMatterBytes then
+    throw (2, s!"the front matter is longer than {maxFrontMatterBytes} bytes")
+  let parsed ← parseYaml yaml 2
+  if parsed.entries > maxFrontMatterEntries then
+    throw (2, s!"the front matter holds more than {maxFrontMatterEntries} keys and items")
+  let keys ← match parsed with
     | .map kvs => pure kvs
     | .null => pure #[]
     | _ => throw (2, "the front matter must be a mapping of keys to values")
@@ -458,12 +486,13 @@ private def readCategory (file : String) (name : String) (line : Nat) (v : Yaml)
   | .str s | .json (.str s) => return { name, description := s }
   | .map kvs =>
     let mut c : Category := { name }
+    let mut extra := #[]
     for (k, l, x) in kvs do
       match k with
       | "description" => c := { c with description := ← asString file k l x }
       | "name" => fail file l "a category's name is its key; drop 'name'"
-      | _ => c := { c with extra := c.extra ++ [(k, x.toJson)] }
-    return c
+      | _ => extra := extra.push (k, x.toJson)
+    return { c with extra := extra.toList }
   | .json (.obj _) =>
     let j := v.toJson
     if (j.getObjVal? "name").isOk then fail file line "a category's name is its key; drop 'name'"
@@ -479,6 +508,7 @@ private def readType (file name content : String) : Except FileError PrType := d
   let sp ← splitOf file content
   bodySize file sp s!"the rubric of '{name}'"
   let mut t : PrType := { name, rubric := sp.body }
+  let mut extra := #[]
   for (k, line, v) in sp.keys do
     match k with
     | "description" => t := { t with description := ← asString file k line v }
@@ -492,8 +522,8 @@ private def readType (file name content : String) : Except FileError PrType := d
         fail file line s!"'{name}' names {cats.size} categories; at most {maxCategories}"
       t := { t with categories := cats.toList }
     | "name" => fail file line "a type's name is its file's; drop 'name'"
-    | _ => t := { t with extra := t.extra ++ [(k, v.toJson)] }
-  return t
+    | _ => extra := extra.push (k, v.toJson)
+  return { t with extra := extra.toList }
 
 /-- The rubric directory of `files` (paths within the directory), or everything wrong with it,
     each placed in the file it is in. Files other than `rubric.md`, `style.md` and `types/*.md`
@@ -513,7 +543,10 @@ def parseDir (files : List File) (maxNotesBytes : Nat := maxStyleNotesBytes) :
   for f in files do
     unless f.path.startsWith "types/" do continue
     let base := (f.path.drop 6).toString
-    if base.startsWith "." || base.contains '/' && base.startsWith "." then continue
+    if base.startsWith "." then
+      errors := errors.push { file := f.path, message := "types/ holds one file per type, \
+types/<type>.md, and nothing else: drop this one" }
+      continue
     if base.contains '/' then
       errors := errors.push { file := f.path, message := "types/ holds one file per type, \
 types/<type>.md, and no directories" }
@@ -529,6 +562,13 @@ types/<type>.md" }
     match readType f.path name f.content with
     | .ok t => types := types.push t
     | .error e => errors := errors.push e
+  -- Two names one case-insensitive file system would take for one file.
+  let mut lower : Std.HashSet String := {}
+  for t in types do
+    if lower.contains t.name.toLower then
+      errors := errors.push { file := s!"types/{t.name}.md", message := s!"another type's name \
+differs from '{t.name}' only in case: names must differ in more, for every file system" }
+    lower := lower.insert t.name.toLower
   if types.size > maxPrTypes then
     errors := errors.push { file := "types", message := s!"the rubric names {types.size} pull \
 request types; at most {maxPrTypes}" }
@@ -549,7 +589,7 @@ types/{n}.md" }
   if let some f := files.find? (·.path == "style.md") then
     match splitOf f.path f.content with
     | .ok sp =>
-      let text := if sp.keys.isEmpty then normalizeBody f.content else sp.body
+      let text := if sp.keys.isEmpty then normalizeBody (stripBom f.content) else sp.body
       if text.utf8ByteSize > maxNotesBytes then
         errors := errors.push { file := f.path, message := s!"the style notes are longer than \
 {maxNotesBytes} bytes" }

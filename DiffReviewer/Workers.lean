@@ -984,21 +984,31 @@ reviewed in full"))
     | .error e => return .error s!"reading the diff since the last posted review: {e.message}"
 
 /-- The commit of the rubrics repository `job` is to be reviewed by, as it is queued: the one in
-    use for its repository now (`Rubrics.pinFor`) — for a calibration job, the one its run was
-    pinned to, which it keeps — or why a review waits: its repository's rubric does not read, and
-    none that did is there to keep. -/
+    use for its repository now — for a calibration job, the one its run was pinned to, which it
+    keeps — or why a job waits: the rubrics repository has never been read for its repository
+    (`Rubrics.pinOrWait`), or, for a review, its rubric does not read, and none that did is there
+    to keep. -/
 private def pinOf (s : Services) (job : Job) : IO (Except String (Option String)) := do
-  if job.kind? == some .calibration then return .ok job.rubricSha
-  if s.rubrics.isNone then return .ok none
-  let head ← Rubrics.headOf job.owner job.name
-  match head with
+  let calibration := job.kind? == some .calibration
+  -- A calibration job keeps its run's commit: pinned when the run was made, or, when the rubrics
+  -- repository had not been read then, by the first of its jobs queued once it has.
+  if calibration && (job.rubricSha.isSome || job.rubricVersion.isSome) then
+    return .ok job.rubricSha
+  let some src := s.rubrics | return .ok none
+  let pin ← match ← Rubrics.pinOrWait src job.owner job.name with
+    | .ok p => pure p
+    | .error why => return .error why
+  if calibration then
+    let some runId := job.runId | return .ok pin
+    return .ok (← Calibration.pinRun runId pin)
+  match ← Rubrics.headOf job.owner job.name with
   | some h =>
     if h.goodSha.isNone && h.headSha.isSome && !h.errors.isEmpty && job.isReview then
       return .error s!"the rubric of {job.owner}/{job.name} does not read \
 ({Rubrics.errorsLine h.errors}), and none that did is there to review by; the review waits for \
 it to be fixed"
-    return .ok h.goodSha
-  | none => return .ok none
+    return .ok pin
+  | none => return .ok pin
 
 /-- Queue every `pending` sub-run of fan-out job `job` on orchestra, each a task of its own under
     `<base>.<key>`, with a prompt narrowed to its category. A failure is recorded on the sub-run,

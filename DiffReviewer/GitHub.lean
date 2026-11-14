@@ -45,6 +45,8 @@ structure Pull where
   mergeCommitSha : Option String := none
   /-- The pull request on github.com. -/
   htmlUrl : String := ""
+  /-- The repository its head branch is of, `owner/name`, in lower case. -/
+  headRepo : String := ""
   deriving Repr, BEq
 
 def Pull.ofJson (j : Json) : Except String Pull := do
@@ -62,8 +64,10 @@ def Pull.ofJson (j : Json) : Except String Pull := do
     (j.getObjValAs? String "merged_at").toOption.isSome
   let mergeCommitSha := (j.getObjValAs? String "merge_commit_sha").toOption.map String.toLower
   let htmlUrl := (j.getObjValAs? String "html_url").toOption.getD ""
+  let headRepo := (((j.getObjVal? "head").bind (·.getObjVal? "repo")).bind
+    (·.getObjValAs? String "full_name")).toOption.getD ""
   return { number, title, body, headSha := headSha.toLower, baseSha := baseSha.toLower, draft
-         , author, state, merged, mergeCommitSha, htmlUrl }
+         , author, state, merged, mergeCommitSha, htmlUrl, headRepo := headRepo.toLower }
 
 /-- A commit, as the git data API gives it (`GET /repos/{o}/{n}/git/commits/{sha}`) — or as a
     listing of commits does (`GET /repos/{o}/{n}/commits`), which nests it. -/
@@ -332,8 +336,9 @@ structure Client where
     fun _ _ _ _ => return .error (.definite "comparing commits is not supported")
   /-- What GitHub last said of the rate limit, if it has said anything. -/
   rateLimit : IO (Option RateLimit) := pure none
-  /-- The commit branch `branch` of `owner/name` is at; `none` when it has no such branch, an
-      empty repository among them. -/
+  /-- The commit branch `branch` of `owner/name` is at; `none` when the repository has no such
+      branch, an empty repository among them. A repository not found — or one the token cannot
+      read, which GitHub answers the same — is an error, never `none`. -/
   branchHead : (owner name branch : String) → IO (Except Error (Option String)) :=
     fun _ _ _ => return .error (.definite "reading branches is not supported")
   getCommit : (owner name sha : String) → IO (Except Error GitCommit) :=
@@ -474,12 +479,20 @@ def Client.curl (token : String) (api : String) (maxDiffBytes : Nat := defaultMa
           (parse Comparison.ofJson)
     rateLimit := lastRateLimit.get
     branchHead := fun owner name branch => do
-      -- An empty repository answers 409, a branch it does not have 404: neither has a head.
+      -- An empty repository answers 409, a branch it does not have 404: neither has a head. But a
+      -- repository the token cannot see answers 404 too, so a 404 asks after the repository.
       match ← call "GET" s!"/repos/{owner}/{name}/git/ref/heads/{branch}" with
       | .error (.definite why) =>
-        if why.startsWith "GitHub answered 404" || why.startsWith "GitHub answered 409" then
-          return .ok none
-        return .error (.definite why)
+        if why.startsWith "GitHub answered 409" then return .ok none
+        unless why.startsWith "GitHub answered 404" do return .error (.definite why)
+        match ← call "GET" s!"/repos/{owner}/{name}" with
+        | .ok _ => return .ok none
+        | .error (.definite w) =>
+          if w.startsWith "GitHub answered 404" then
+            return .error (.definite s!"{owner}/{name} was not found, or the token cannot read \
+it ({w})")
+          return .error (.definite w)
+        | .error e => return .error e
       | .error e => return .error e
       | .ok r => return (parse (fun j => do
           return some (← (← j.getObjVal? "object").getObjValAs? String "sha").toLower) r)
